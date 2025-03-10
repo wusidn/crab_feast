@@ -1,0 +1,9 @@
+[package]
+name = "crab_feast_library"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy.workspace                      = true
+bevy_replicon.workspace             = true
+bevy_replicon_renet.workspace       = true

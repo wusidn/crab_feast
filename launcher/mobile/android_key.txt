@@ -1,0 +1,31 @@
+keytool -genkeypair -v -keystore game_mobile.jks -keyalg RSA -keysize 2048 -validity 10000 -alias haha
+输入密钥库口令:
+再次输入新口令:
+您的名字与姓氏是什么?
+  [Unknown]:  wu
+您的组织单位名称是什么?
+  [Unknown]:  leam_game
+您的组织名称是什么?
+  [Unknown]:  leam
+您所在的城市或区域名称是什么?
+  [Unknown]:  beijing
+您所在的省/市/自治区名称是什么?
+  [Unknown]:  beijing
+该单位的双字母国家/地区代码是什么?
+  [Unknown]:  cn
+CN=wu, OU=leam_game, O=leam, L=beijing, ST=beijing, C=cn是否正确?
+  [否]:  y
+
+正在为以下对象生成 2,048 位RSA密钥对和自签名证书 (SHA256withRSA) (有效期为 10,000 天):
+         CN=wu, OU=leam_game, O=leam, L=beijing, ST=beijing, C=cn
+输入 <haha> 的密钥口令
+        (如果和密钥库口令相同, 按回车):
+[正在存储game_mobile.jks]
+
+Warning:
+JKS 密钥库使用专用格式。建议使用 "keytool -importkeystore -srckeystore game_mobile.jks -destkeystore game_mobile.jks -deststoretype pkcs12" 迁移到行业标准格式 PKCS12。
+
+# path = "./game_mobile.jks"
+# key_alias = "haha"
+# keystore_password = "wusi930208"
+# key_password = "wusi930208"

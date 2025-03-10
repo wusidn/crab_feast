@@ -1,0 +1,19 @@
+[package]
+name = "mobile"
+# Version is required by `cargo-apk`, though this value will never change.
+version = "0.0.0"
+edition = "2021"
+description = "crab_feast for building an iOS or Android app"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "crab_feast_mobile"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+bevy.workspace = true
+crab_feast = {path = "../../crab_feast"}
+
+[target.aarch64-apple-ios-sim.dependencies]
+bevy = { workspace = true, features = ["ios_simulator"] }

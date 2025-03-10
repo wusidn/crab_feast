@@ -1,0 +1,8 @@
+[package]
+name = "crab_feast_pc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy.workspace = true
+crab_feast = {path = "../../crab_feast"}
