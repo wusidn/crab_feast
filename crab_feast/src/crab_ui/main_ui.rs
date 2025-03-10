@@ -14,7 +14,7 @@ impl MainUI {
         asset_server: Res<AssetServer>,
     ) {
 
-        let font = asset_server.load("../../../assets/fonts/PingFang-SC-Light.ttf");
+        let font = asset_server.load("fonts/PingFang-SC-Light.ttf");
 
         commands.spawn(Node{
             width: Val::Vw(100.0),
