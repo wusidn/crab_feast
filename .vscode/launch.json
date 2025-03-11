@@ -1,0 +1,26 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Bevy Project",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=crab_feast_pc"  // 替换为你的项目名称
+                ],
+                "filter": {
+                    "name": "crab_feast_pc",  // 替换为你的项目名称
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CARGO_MANIFEST_DIR": "${workspaceFolder}",  // 设置项目根目录
+                "RUST_BACKTRACE": "1"  // 启用 Rust 的回溯功能
+            }
+        }
+    ]
+}
