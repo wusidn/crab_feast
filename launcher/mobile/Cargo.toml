@@ -9,11 +9,9 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 name = "crab_feast_mobile"
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
 bevy.workspace = true
 crab_feast = {path = "../../crab_feast"}
 
-[target.aarch64-apple-ios-sim.dependencies]
-bevy = { workspace = true, features = ["ios_simulator"] }
