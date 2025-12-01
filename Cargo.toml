@@ -9,10 +9,10 @@ resolver = "2"
 default-members = ["launcher/pc"]
 
 [workspace.dependencies]
-bevy                    = "0.16.0"
-bevy_rapier2d           = "0.28.0"
-bevy_replicon           = "0.29.2"
+bevy                    = "0.17.0"
+bevy_rapier2d           = "0.29.0"
+bevy_replicon           = "0.36.0"
 bytes                   = "1.9.0"
 rand                    = "0.8.5"
 serde                   = "1.0.216"
-bevy_replicon_renet     = "0.6.0"
+bevy_replicon_renet     = "0.12.0"

@@ -6,7 +6,8 @@ pub struct MainUI;
 impl Plugin for MainUI {
     fn build(&self, app: &mut App) {
         app.add_plugins(JoystickPlugin)
-        .add_systems(Startup, Self::setup);
+        .add_systems(Startup, Self::setup)
+        .add_systems(Update, update);
     }
 }
 
@@ -42,12 +43,24 @@ impl MainUI {
                     },
                     TextColor(Color::WHITE),
                     TextLayout {
-                        justify: JustifyText::Center,
+                        justify: Justify::Center,
                         linebreak: LineBreak::AnyCharacter,
                     },
                     Joystick
                 )
             ]
         ));
+    }
+}
+
+fn update(
+    mut commands: Commands,
+    joystick_query: Query<(Entity, &Joystick)>,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+) {
+    if keyboard_input.just_pressed(KeyCode::KeyA) {
+        joystick_query.iter().for_each(|(entity, Joystick)| {
+            commands.entity(entity).remove::<Joystick>();
+        });
     }
 }

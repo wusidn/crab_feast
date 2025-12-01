@@ -7,10 +7,10 @@ use bevy::prelude::*;
 pub struct Joystick;
 
 #[derive(Component)]
-pub struct JoystickBase;
+struct JoystickBase;
 
 #[derive(Component)]
-pub struct JoystickStick;
+struct JoystickThumb;
 
 
 pub struct JoystickPlugin;
@@ -19,20 +19,20 @@ impl Plugin for JoystickPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(joystick_on_add)
         .add_observer(joystick_on_remove)
-        .add_observer(joystick_base_on_add);
+        .add_systems(Update, joystick_system);
     }
 }
 
 
 fn joystick_on_add(
-    trigger: Trigger<OnAdd, Joystick>, 
+    on_add: On<Add, Joystick>, 
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_base_query: Query<&JoystickBase>,
 ) {
     println!("Joystick added");
 
-    let joystick_entity = trigger.target();
+    let joystick_entity = on_add.event_target();
     let children = children_query.get(joystick_entity);
 
     if children.map_or(true, |children| {
@@ -52,19 +52,30 @@ fn joystick_on_add(
             BackgroundColor(Color::hsl(310.0, 0.6, 0.8)),
             JoystickBase,
             ChildOf(joystick_entity),
+            children![
+                (
+                    Node {
+                        width: Val::Px(50.0),
+                        height: Val::Px(50.0),
+                        ..Default::default()
+                    },
+                    BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
+                    JoystickThumb,
+                )
+            ]
         ));
     }
 }
 
 
 fn joystick_on_remove(
-    trigger: Trigger<OnRemove, Joystick>, 
+    on_remove: On<Remove, Joystick>, 
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_base_query: Query<&JoystickBase>,
 ) {
     println!("Joystick removed");
-    if let Ok(children) = children_query.get(trigger.target()) {
+    if let Ok(children) = children_query.get(on_remove.event_target()) {
         children.iter().for_each(|child| {
             if joystick_base_query.get(child).is_ok() {
                 commands.entity(child).despawn();
@@ -73,32 +84,10 @@ fn joystick_on_remove(
     }
 }
 
-
-fn joystick_base_on_add(
-    trigger: Trigger<OnAdd, JoystickBase>, 
-    mut commands: Commands,
-    children_query: Query<&Children>,
-    joystick_stick_query: Query<&JoystickStick>,
+fn joystick_system(
+    // joystick_base_query: Query<&JoystickBase>,
+    // joystick_thumb_query: Query<&JoystickThumb>,
 ) {
-    println!("Joystick base added");
-    let base_entity = trigger.target();
-    let children = children_query.get(base_entity);
+    
 
-    if children.map_or(true, |children| {
-        children.iter().find(|child| {
-            joystick_stick_query.get(*child).is_ok()
-        }).is_none()
-    }) {
-        commands.spawn((
-            Node {
-                width: Val::Px(50.0),
-                height: Val::Px(50.0),
-                ..Default::default()
-            },
-            BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
-            JoystickStick,
-            ChildOf(base_entity),
-        ));
-    }
 }
-
