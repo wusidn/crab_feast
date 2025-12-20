@@ -1,5 +1,13 @@
 
-mod crab_main;
-mod crab_ui;
+use bevy::prelude::*;
 
-pub use crab_main::entry;
+mod scene;
+mod ui;
+
+pub fn build_app() -> App {
+	let mut app = App::new();
+	app.add_plugins(scene::ScenePlugin)
+		.add_plugins(ui::UiPlugin);
+
+	app
+}

@@ -1,17 +1,19 @@
 
 
-use bevy::prelude::*;
+use bevy::{prelude::*, window::PrimaryWindow};
 
 
 #[derive(Component)]
 pub struct Joystick;
 
-#[derive(Component)]
-struct JoystickBase;
+#[derive(Component, Default)]
+struct JoystickBase {
+    start: Vec2,
+    touch_id: Option<u64>,
+}
 
 #[derive(Component)]
 struct JoystickThumb;
-
 
 pub struct JoystickPlugin;
 
@@ -19,6 +21,7 @@ impl Plugin for JoystickPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(joystick_on_add)
         .add_observer(joystick_on_remove)
+        // .add_observer(joystick_on_touch)
         .add_systems(Update, joystick_system);
     }
 }
@@ -50,7 +53,8 @@ fn joystick_on_add(
                 ..Default::default()
             },
             BackgroundColor(Color::hsl(310.0, 0.6, 0.8)),
-            JoystickBase,
+            JoystickBase::default(),
+            Interaction::default(),
             ChildOf(joystick_entity),
             children![
                 (
@@ -60,7 +64,7 @@ fn joystick_on_add(
                         ..Default::default()
                     },
                     BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
-                    JoystickThumb,
+                    JoystickThumb
                 )
             ]
         ));
@@ -84,10 +88,47 @@ fn joystick_on_remove(
     }
 }
 
+
+// fn joystick_on_touch(interaction: On<Changed<Interaction>, JoystickBase>) {
+//     println!("Pointer event on interaction: {:?}", interaction.event_target());
+// }
+
 fn joystick_system(
-    // joystick_base_query: Query<&JoystickBase>,
-    // joystick_thumb_query: Query<&JoystickThumb>,
+    mut interaction_query: Query<(Entity, &mut JoystickBase, &Interaction, &ComputedNode, &GlobalTransform), Changed<Interaction>>,
+    touches: Res<Touches>,
+    windows: Query<&Window, With<PrimaryWindow>>,
 ) {
     
+    for (entity, mut joystick_base, interaction, computed_node, global_transform) in &mut interaction_query {
+        match interaction {
+            Interaction::Pressed => {
+                println!("JoystickBase pressed: {:?}", entity);
+                if touches.any_just_pressed() {
+                    let physical_pos = global_transform.translation().truncate() * computed_node.inverse_scale_factor();
+                    let physical_dimensions = computed_node.size() * computed_node.inverse_scale_factor();
+                    let physical_bounds = Rect::from_center_size(physical_pos,physical_dimensions);
 
+                    for touch in touches.iter_just_pressed() {
+                        println!("Touch just pressed: {:?}", touch);
+                        if physical_bounds.contains(touch.position()) {
+                            println!("Touch is inside joystick: {:?}", touch);
+                            joystick_base.touch_id = Some(touch.id());
+                            joystick_base.start = touch.position();
+                        }
+                    }
+                } else {
+                    let window = windows.single().unwrap();
+                    window.cursor_position().map(|pos| {
+                        println!("Cursor position: {:?}", pos);
+                    });
+                }
+            }
+            Interaction::Hovered => {
+                println!("JoystickBase hovered: {:?}", entity);
+            }
+            Interaction::None => {
+                println!("JoystickBase released: {:?}", entity);
+            }
+        }
+    }
 }

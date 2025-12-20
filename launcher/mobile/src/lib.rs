@@ -9,7 +9,7 @@ use bevy::{
 // the `bevy_main` proc_macro generates the required boilerplate for iOS and Android
 #[bevy_main]
 fn main() {
-    let mut app = App::new();
+    let mut app = crab_feast::build_app();
 
     app.add_plugins(
         DefaultPlugins
@@ -37,6 +37,5 @@ fn main() {
     // This can help reduce cpu usage on mobile devices
     .insert_resource(WinitSettings::mobile());
 
-    crab_feast::entry(&mut app);
     app.run();
 }

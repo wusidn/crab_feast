@@ -1,6 +1,5 @@
 use bevy::{
-    prelude::*,
-    utils::HashMap
+    platform::collections::HashMap, prelude::*
 };
 
 
@@ -82,7 +81,7 @@ impl JoysticksPlugin {
         children_query: Query<&Children>,
         mut node_query: Query<&mut Node>,
         touch_inputs: Res<Touches>,
-        mut cursor_moved_events: EventReader<CursorMoved>,
+        mut cursor_moved_events: MessageReader<CursorMoved>,
         mut cursor_pos: ResMut<CursorPosition>,
     ) {
         for event in cursor_moved_events.read() {
@@ -119,52 +118,57 @@ impl JoysticksPlugin {
         );
 
         joystick_query.iter_mut().for_each(|(joystick, mut status, mut input)| {
-            let (_, interaction, cn, transform) = interaction_query.get(joystick).unwrap();
-            match *status {
-                JoystickState::Idle => {
-                    touchid_entities_map.iter().find(|(_, pressed_info)| pressed_info.entity == joystick)
-                    .map(|(touch_id, pressed_info)| {
-                        let node_rect = Rect::from_center_size(transform.translation().truncate() * cn.inverse_scale_factor(), cn.size() * cn.inverse_scale_factor());
-                        let mut radius = 1.0;
+            let interaction_data = interaction_query.get(joystick);
+            if let Ok((_, interaction, cn, transform)) = interaction_data {
+                match *status {
+                    JoystickState::Idle => {
+                        touchid_entities_map.iter().find(|(_, pressed_info)| pressed_info.entity == joystick)
+                        .map(|(touch_id, pressed_info)| {
+                            let node_rect = Rect::from_center_size(transform.translation().truncate() * cn.inverse_scale_factor(), cn.size() * cn.inverse_scale_factor());
+                            let mut radius = 1.0;
+                            children_query.get(joystick).iter()
+                            .for_each(|children|
+                                children.iter().filter_map(|child| ring_query.get(child).ok())
+                                .for_each(|(ring, ring_node)|{
+                                    let ring_size = ring_node.size() * ring_node.inverse_scale_factor();
+                                    let ring_half_size = (ring_size.length() == 0.0).then(|| Vec2::ZERO).unwrap_or(ring_size / 2.0);
+                                    let left_top = pressed_info.start - node_rect.min - ring_half_size;
+                                    let _ = node_query.get_mut(ring).map(|mut node| {
+                                        node.left = Val::Px(left_top.x);
+                                        node.top = Val::Px(left_top.y);
+                                    });
+                                    radius = ring_half_size.x.min(ring_half_size.y);
+                                    children_query.get(ring).iter().for_each(|children|{
+                                        update_joystick!(children.iter().filter_map(|child| dot_query.get(child).ok()), node_query, input.0, radius);
+                                    });
+                                })
+                            );
+                            input.0 = Vec2::ZERO;
+                            *status = JoystickState::Running(pressed_info.start, radius, *touch_id);
+                        });
+                    }
+
+                    JoystickState::Running(start, radius, touch_id) => {
+                        input.0 = touch_id.is_some()
+                        .then(||touch_inputs.get_pressed(touch_id.unwrap()).map(|touch| touch.position() - start))
+                        .or_else(||(interaction == &Interaction::Pressed).then(|| Some(cursor_pos.0 - start))).flatten()
+                        .map(|distance|if distance.length_squared() >= 0.0001 {distance.normalize() * (distance.length() / radius).min(1.0)} else {Vec2::ZERO})
+                        .or_else(||{*status = JoystickState::Idle; Some(Vec2::ZERO)})
+                        .unwrap();
+
                         children_query.get(joystick).iter()
                         .for_each(|children|
-                            children.iter().filter_map(|child| ring_query.get(*child).ok())
-                            .for_each(|(ring, ring_node)|{
-                                let ring_size = ring_node.size() * ring_node.inverse_scale_factor();
-                                let ring_half_size = (ring_size.length() == 0.0).then(|| Vec2::ZERO).unwrap_or(ring_size / 2.0);
-                                let left_top = pressed_info.start - node_rect.min - ring_half_size;
-                                let _ = node_query.get_mut(ring).map(|mut node| {
-                                    node.left = Val::Px(left_top.x);
-                                    node.top = Val::Px(left_top.y);
-                                });
-                                radius = ring_half_size.x.min(ring_half_size.y);
+                            children.iter().filter_map(|child| ring_query.get(child).ok())
+                            .for_each(|(ring, ..)|{
                                 children_query.get(ring).iter().for_each(|children|{
-                                    update_joystick!(children.iter().filter_map(|child| dot_query.get(*child).ok()), node_query, input.0, radius);
+                                    update_joystick!(children.iter().filter_map(|child| dot_query.get(child).ok()), node_query, input.0, radius);
                                 });
                             })
                         );
-                        input.0 = Vec2::ZERO;
-                        *status = JoystickState::Running(pressed_info.start, radius, *touch_id);
-                    });
-                },
-                JoystickState::Running(start, radius, touch_id) => {
-                    input.0 = touch_id.is_some()
-                    .then(||touch_inputs.get_pressed(touch_id.unwrap()).map(|touch| touch.position() - start))
-                    .or_else(||(interaction == &Interaction::Pressed).then(|| Some(cursor_pos.0 - start))).flatten()
-                    .map(|distance|if distance.length_squared() >= 0.0001 {distance.normalize() * (distance.length() / radius).min(1.0)} else {Vec2::ZERO})
-                    .or_else(||{*status = JoystickState::Idle; Some(Vec2::ZERO)})
-                    .unwrap();
-
-                    children_query.get(joystick).iter()
-                    .for_each(|children|
-                        children.iter().filter_map(|child| ring_query.get(*child).ok())
-                        .for_each(|(ring, ..)|{
-                            children_query.get(ring).iter().for_each(|children|{
-                                update_joystick!(children.iter().filter_map(|child| dot_query.get(*child).ok()), node_query, input.0, radius);
-                            });
-                        })
-                    );
-                },
+                    }
+                }
+            } else {
+                return;
             }
         });
     }
