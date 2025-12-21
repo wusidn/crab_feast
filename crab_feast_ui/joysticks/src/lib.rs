@@ -1,19 +1,35 @@
 
 
-use bevy::{prelude::*, window::PrimaryWindow};
+use bevy::{math::VectorSpace, prelude::*, ui::FocusPolicy, window::PrimaryWindow, ui::ui_layout_system};
 
 
 #[derive(Component)]
 pub struct Joystick;
 
 #[derive(Component, Default)]
-struct JoystickBase {
-    start: Vec2,
-    touch_id: Option<u64>,
-}
+#[require(Node, FocusPolicy::Block, Interaction)]
+struct JoystickBase;
 
 #[derive(Component)]
 struct JoystickThumb;
+
+#[derive(Debug)]
+struct TouchInfo {
+    touch_id: u64,
+    start: Vec2,
+}
+
+#[derive(Component, Default, Debug)]
+struct JoystickReady {
+    cursor_pos: Option<Vec2>,
+    touches: Option<Vec<TouchInfo>>
+}
+
+#[derive(Component, Default)]
+struct JustifyActived {
+    start: Option<Vec2>,
+    touch_id:  Option<u64>
+}
 
 pub struct JoystickPlugin;
 
@@ -22,7 +38,7 @@ impl Plugin for JoystickPlugin {
         app.add_observer(joystick_on_add)
         .add_observer(joystick_on_remove)
         // .add_observer(joystick_on_touch)
-        .add_systems(Update, joystick_system);
+        .add_systems(Update, (joystick_idle_system, joystick_setup_system.after(ui_layout_system)));
     }
 }
 
@@ -88,40 +104,29 @@ fn joystick_on_remove(
     }
 }
 
-
-// fn joystick_on_touch(interaction: On<Changed<Interaction>, JoystickBase>) {
-//     println!("Pointer event on interaction: {:?}", interaction.event_target());
-// }
-
-fn joystick_system(
-    mut interaction_query: Query<(Entity, &mut JoystickBase, &Interaction, &ComputedNode, &GlobalTransform), Changed<Interaction>>,
+fn joystick_idle_system(
+    mut commands: Commands,
+    interaction_query: Query<
+                            (Entity, &Interaction), 
+                            (Changed<Interaction>, With<JoystickBase>, Without<JustifyActived>)
+                            > ,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
 ) {
     
-    for (entity, mut joystick_base, interaction, computed_node, global_transform) in &mut interaction_query {
+    for (entity, interaction) in interaction_query {
         match interaction {
             Interaction::Pressed => {
                 println!("JoystickBase pressed: {:?}", entity);
-                if touches.any_just_pressed() {
-                    let physical_pos = global_transform.translation().truncate() * computed_node.inverse_scale_factor();
-                    let physical_dimensions = computed_node.size() * computed_node.inverse_scale_factor();
-                    let physical_bounds = Rect::from_center_size(physical_pos,physical_dimensions);
 
-                    for touch in touches.iter_just_pressed() {
-                        println!("Touch just pressed: {:?}", touch);
-                        if physical_bounds.contains(touch.position()) {
-                            println!("Touch is inside joystick: {:?}", touch);
-                            joystick_base.touch_id = Some(touch.id());
-                            joystick_base.start = touch.position();
-                        }
-                    }
-                } else {
-                    let window = windows.single().unwrap();
-                    window.cursor_position().map(|pos| {
-                        println!("Cursor position: {:?}", pos);
-                    });
-                }
+
+                commands.entity(entity).insert(JoystickReady{
+                    cursor_pos: windows.single().map_or(None, |window| window.cursor_position()),
+                    touches: touches.any_just_pressed().then(|| touches.iter_just_pressed().map(|touch| TouchInfo{
+                        touch_id: touch.id(),
+                        start: touch.position()
+                    }).collect::<Vec<_>>())
+                });
             }
             Interaction::Hovered => {
                 println!("JoystickBase hovered: {:?}", entity);
@@ -131,4 +136,18 @@ fn joystick_system(
             }
         }
     }
+}
+
+fn joystick_setup_system(
+    mut commands: Commands,
+    mut joystick_ready_query: Query<(Entity, &JoystickReady, &ComputedNode)>,
+) {
+
+    println!("Joystick setup system");
+
+    for (entity, ready, cn) in joystick_ready_query.iter_mut() { 
+        println!("Joystick setup system: {:?}", cn)
+    }
+
+
 }
