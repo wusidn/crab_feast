@@ -1,6 +1,6 @@
 
 
-use bevy::{math::VectorSpace, prelude::*, ui::FocusPolicy, window::PrimaryWindow, ui::ui_layout_system};
+use bevy::{prelude::*, ui::FocusPolicy, window::PrimaryWindow};
 
 
 #[derive(Component)]
@@ -38,7 +38,7 @@ impl Plugin for JoystickPlugin {
         app.add_observer(joystick_on_add)
         .add_observer(joystick_on_remove)
         // .add_observer(joystick_on_touch)
-        .add_systems(Update, (joystick_idle_system, joystick_setup_system.after(ui_layout_system)));
+        .add_systems(Update, (joystick_idle_system, joystick_setup_system));
     }
 }
 
@@ -71,6 +71,7 @@ fn joystick_on_add(
             BackgroundColor(Color::hsl(310.0, 0.6, 0.8)),
             JoystickBase::default(),
             Interaction::default(),
+            Transform::default(),
             ChildOf(joystick_entity),
             children![
                 (
@@ -108,7 +109,7 @@ fn joystick_idle_system(
     mut commands: Commands,
     interaction_query: Query<
                             (Entity, &Interaction), 
-                            (Changed<Interaction>, With<JoystickBase>, Without<JustifyActived>)
+                            (Changed<Interaction>, With<JoystickBase>, Without<JoystickReady>, Without<JustifyActived>)
                             > ,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -119,12 +120,11 @@ fn joystick_idle_system(
             Interaction::Pressed => {
                 println!("JoystickBase pressed: {:?}", entity);
 
-
                 commands.entity(entity).insert(JoystickReady{
-                    cursor_pos: windows.single().map_or(None, |window| window.cursor_position()),
+                    cursor_pos: windows.single().map_or(None, |window| window.physical_cursor_position()),
                     touches: touches.any_just_pressed().then(|| touches.iter_just_pressed().map(|touch| TouchInfo{
                         touch_id: touch.id(),
-                        start: touch.position()
+                        start: touch.position(),
                     }).collect::<Vec<_>>())
                 });
             }
@@ -140,14 +140,32 @@ fn joystick_idle_system(
 
 fn joystick_setup_system(
     mut commands: Commands,
-    mut joystick_ready_query: Query<(Entity, &JoystickReady, &ComputedNode)>,
+    mut joystick_ready_query: Query<(Entity, &JoystickReady, &ComputedNode, &UiGlobalTransform)>,
 ) {
+    for (entity, ready, cn, gt) in joystick_ready_query.iter_mut() { 
+        
+        let mut touch_id: Option<u64> = None;
+        let start_pos = if ready.cursor_pos.is_some() {
+            ready.cursor_pos
+        } else {
+            ready.touches.as_ref().unwrap().iter().find(|touch| {
+                cn.contains_point(*gt, touch.start)
+            }).map(|touch| {
+                touch_id = Some(touch.touch_id);
+                touch.start
+            })
+        };
+        commands.entity(entity).remove::<JoystickReady>();
 
-    println!("Joystick setup system");
+        if start_pos.is_none() {
+            return;
+        }
 
-    for (entity, ready, cn) in joystick_ready_query.iter_mut() { 
-        println!("Joystick setup system: {:?}", cn)
+        println!("click in joystick: {:?}", start_pos);
+        commands.entity(entity).insert(JustifyActived{
+            start: start_pos,
+            touch_id: touch_id
+        });
+
     }
-
-
 }
