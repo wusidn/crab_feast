@@ -1,7 +1,4 @@
-
-
-use bevy::{prelude::*, ui::FocusPolicy, window::PrimaryWindow};
-
+use bevy::{input::mouse::MouseButtonInput, prelude::*, ui::FocusPolicy, window::PrimaryWindow};
 
 #[derive(Component)]
 pub struct Joystick;
@@ -13,22 +10,13 @@ struct JoystickBase;
 #[derive(Component)]
 struct JoystickThumb;
 
-#[derive(Debug)]
-struct TouchInfo {
-    touch_id: u64,
-    start: Vec2,
-}
-
-#[derive(Component, Default, Debug)]
-struct JoystickReady {
-    cursor_pos: Option<Vec2>,
-    touches: Option<Vec<TouchInfo>>
-}
+#[derive(Component, Default)]
+struct JoystickDisabled;
 
 #[derive(Component, Default)]
 struct JustifyActived {
     start: Option<Vec2>,
-    touch_id:  Option<u64>
+    touch_id: Option<u64>,
 }
 
 pub struct JoystickPlugin;
@@ -36,28 +24,28 @@ pub struct JoystickPlugin;
 impl Plugin for JoystickPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(joystick_on_add)
-        .add_observer(joystick_on_remove)
-        // .add_observer(joystick_on_touch)
-        .add_systems(Update, (joystick_idle_system, joystick_setup_system));
+            .add_observer(joystick_on_remove)
+            // .add_observer(joystick_on_touch)
+            .add_systems(Update, (joystick_idle_system, joystick_setup_system));
     }
 }
 
-
 fn joystick_on_add(
-    on_add: On<Add, Joystick>, 
+    on_add: On<Add, Joystick>,
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_base_query: Query<&JoystickBase>,
 ) {
-    println!("Joystick added");
+    info!("Joystick added");
 
     let joystick_entity = on_add.event_target();
     let children = children_query.get(joystick_entity);
 
     if children.map_or(true, |children| {
-        children.iter().find(|child| {
-            joystick_base_query.get(*child).is_ok()
-        }).is_none()
+        children
+            .iter()
+            .find(|child| joystick_base_query.get(*child).is_ok())
+            .is_none()
     }) {
         commands.spawn((
             Node {
@@ -70,32 +58,28 @@ fn joystick_on_add(
             },
             BackgroundColor(Color::hsl(310.0, 0.6, 0.8)),
             JoystickBase::default(),
-            Interaction::default(),
             Transform::default(),
             ChildOf(joystick_entity),
-            children![
-                (
-                    Node {
-                        width: Val::Px(50.0),
-                        height: Val::Px(50.0),
-                        ..Default::default()
-                    },
-                    BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
-                    JoystickThumb
-                )
-            ]
+            children![(
+                Node {
+                    width: Val::Px(50.0),
+                    height: Val::Px(50.0),
+                    ..Default::default()
+                },
+                BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
+                JoystickThumb
+            )],
         ));
     }
 }
 
-
 fn joystick_on_remove(
-    on_remove: On<Remove, Joystick>, 
+    on_remove: On<Remove, Joystick>,
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_base_query: Query<&JoystickBase>,
 ) {
-    println!("Joystick removed");
+    info!("Joystick removed");
     if let Ok(children) = children_query.get(on_remove.event_target()) {
         children.iter().for_each(|child| {
             if joystick_base_query.get(child).is_ok() {
@@ -107,65 +91,68 @@ fn joystick_on_remove(
 
 fn joystick_idle_system(
     mut commands: Commands,
-    interaction_query: Query<
-                            (Entity, &Interaction), 
-                            (Changed<Interaction>, With<JoystickBase>, Without<JoystickReady>, Without<JustifyActived>)
-                            > ,
+    joystick_query: Query<
+        (Entity, &ComputedNode, &UiGlobalTransform),
+        (
+            With<JoystickBase>,
+            Without<JoystickDisabled>,
+            Without<JustifyActived>,
+        ),
+    >,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
 ) {
-    
-    for (entity, interaction) in interaction_query {
-        match interaction {
-            Interaction::Pressed => {
-                println!("JoystickBase pressed: {:?}", entity);
+    let window = windows.single().unwrap();
+    let window_size = window.physical_size().as_vec2();
+    let logic_size = window.size();
+    let scale_factor = window.scale_factor();
+    joystick_query
+        .iter()
+        .for_each(|(entity, cn, global_transform)| {
+            let mut joystick_actived = JustifyActived::default();
+            
 
-                commands.entity(entity).insert(JoystickReady{
-                    cursor_pos: windows.single().map_or(None, |window| window.physical_cursor_position()),
-                    touches: touches.any_just_pressed().then(|| touches.iter_just_pressed().map(|touch| TouchInfo{
-                        touch_id: touch.id(),
-                        start: touch.position(),
-                    }).collect::<Vec<_>>())
-                });
+            // Check mouse cursor
+            if let Some(cursor_pos) = window.physical_cursor_position() {
+                mouse_button_input_reader
+                    .read()
+                    .for_each(|mouse_button_input| {
+                        if mouse_button_input.button == MouseButton::Left
+                            && mouse_button_input.state.is_pressed()
+                        {
+                            if cn.contains_point(*global_transform, cursor_pos) {
+                                joystick_actived.start = Some(cursor_pos);
+                            }
+                        }
+                    });
             }
-            Interaction::Hovered => {
-                println!("JoystickBase hovered: {:?}", entity);
+
+            // Check touches
+            for touch in touches.iter_just_pressed() {
+                info!("window_size: {:?} logic_size: {:?} scale_factor: {:?}", window_size, logic_size, scale_factor);
+                let touch_pos = touch.start_position();
+                info!("Touch at position: {:?} Correction: {:?}", touch.start_position(), touch_pos);
+                if cn.contains_point(*global_transform, touch_pos) {
+                    joystick_actived.start = Some(touch_pos);
+                    joystick_actived.touch_id = Some(touch.id());
+                }
             }
-            Interaction::None => {
-                println!("JoystickBase released: {:?}", entity);
+            if joystick_actived.start.is_some() {
+                commands.entity(entity).insert(joystick_actived);
             }
-        }
-    }
+        });
 }
 
 fn joystick_setup_system(
     mut commands: Commands,
-    mut joystick_ready_query: Query<(Entity, &JoystickReady, &ComputedNode, &UiGlobalTransform)>,
+    mut joystick_ready_query: Query<(Entity, &JustifyActived, &ComputedNode, &UiGlobalTransform)>,
 ) {
-    for (entity, ready, cn, gt) in joystick_ready_query.iter_mut() { 
-        
-        let mut touch_id: Option<u64> = None;
-        let start_pos = if ready.cursor_pos.is_some() {
-            ready.cursor_pos
-        } else {
-            ready.touches.as_ref().unwrap().iter().find(|touch| {
-                cn.contains_point(*gt, touch.start)
-            }).map(|touch| {
-                touch_id = Some(touch.touch_id);
-                touch.start
-            })
-        };
-        commands.entity(entity).remove::<JoystickReady>();
-
-        if start_pos.is_none() {
-            return;
-        }
-
-        println!("click in joystick: {:?}", start_pos);
-        commands.entity(entity).insert(JustifyActived{
-            start: start_pos,
-            touch_id: touch_id
-        });
-
+    for (entity, ready, _cn, _gt) in joystick_ready_query.iter_mut() {
+        info!(
+            "Joystick actived at position: {:?}, touch_id: {:?}",
+            ready.start, ready.touch_id
+        );
+        commands.entity(entity).remove::<JustifyActived>();
     }
 }

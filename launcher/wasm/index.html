@@ -13,15 +13,72 @@
           white 100%
         ) repeat;
         background-size: 20px 20px;
+        margin: 0;
+        /* 针对移动端的滚动禁用 */
+        overflow: hidden;
+        -webkit-overflow-scrolling: auto; /* 禁用惯性滚动 */
+        overscroll-behavior: none;
+        touch-action: none;
       }
       canvas {
         background-color: white;
+        display: block; /* 避免底部出现空白 */
+        /* 去除焦点时的白边/轮廓 */
+        outline: none;
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
       }
     </style>
     <title>WASM Example</title>
   </head>
   <script type="module">
     import init from '../target/crab_feast_wasm.js'
-    init()
+
+
+    window.onload = () => {
+
+      const canvas = document.getElementById('bevy');
+
+      const processEvents = ["pointerout", "pointerover", "pointermove", "pointerdown", "pointerup", "pointercancel"];
+
+      processEvents.forEach(eventName => {
+        canvas.addEventListener(eventName, function(originalEvent) {
+          if (originalEvent.intercepted) return;
+          // console.log('pointerdown pos:', originalEvent.offsetX, originalEvent.offsetY);
+          originalEvent.stopImmediatePropagation();
+            
+          // 将浏览器坐标转换为 canvas 坐标
+          const rect = canvas.getBoundingClientRect();
+          const scaleX = canvas.width / rect.width;
+          const scaleY = canvas.height / rect.height;
+          
+          // 创建具有新坐标的事件
+          const newEvent = new PointerEvent(eventName, {
+              ...originalEvent,
+              pointerId: originalEvent.pointerId,
+              pointerType: originalEvent.pointerType,
+              isPrimary: originalEvent.isPrimary,
+          });
+
+          Object.defineProperties(newEvent, {
+              offsetX: { value: originalEvent.offsetX * scaleX },
+              offsetY: { value: originalEvent.offsetY * scaleY },
+          });
+
+          newEvent.intercepted = true; // 标记事件已被处理
+
+          // console.log('pointerdown new pos:', newEvent.offsetX, newEvent.offsetY);
+          
+          // 触发到 canvas
+          canvas.dispatchEvent(newEvent);
+        });   
+      });
+
+      init()
+    };
+
   </script>
+  <body>
+      <canvas id="bevy" width="1280" height="720"></canvas>
+  </body>
 </html>

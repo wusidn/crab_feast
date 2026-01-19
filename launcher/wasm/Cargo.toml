@@ -1,0 +1,21 @@
+[package]
+name = "crab_feast_wasm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy.workspace = true
+log.workspace = true
+crab_feast = {path = "../../crab_feast"}
+wasm-logger = "0.2.0"
+console_error_panic_hook = "0.1.7"
+wasm-bindgen = { version = "0.2", features = ["serde-serialize"] }
+web-sys = { version = "0.3", features = [
+    "console",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "Window",
+    "CssStyleDeclaration",
+] }

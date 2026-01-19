@@ -13,6 +13,8 @@
             android:exported="true"
             android:theme="@style/Theme.AppCompat.NoActionBar"
             android:screenOrientation="landscape"
+            android:touchscreenBlocksFocus="false"
+            android:windowSoftInputMode="adjustPan"
             >
             <meta-data
                 android:name="android.app.lib_name"
