@@ -34,7 +34,7 @@ impl UiPlugin {
                         ..Default::default()
                     },
                     BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
-                    Text("你好，Bevy!".to_string()),
+                    Text("".to_string()),
                     TextFont{
                         font,
                         font_size: 32.0,
@@ -45,7 +45,9 @@ impl UiPlugin {
                         justify: Justify::Center,
                         linebreak: LineBreak::AnyCharacter,
                     },
-                    Joystick
+                    Joystick {
+                        ..Default::default()
+                    }
                 )
             ]
         ));

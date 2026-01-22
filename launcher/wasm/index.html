@@ -35,7 +35,51 @@
     import init from '../target/crab_feast_wasm.js'
 
 
-    window.onload = () => {
+    let bevy_window_size_buffer;
+
+    let initlizeWindowSizeBuffer;
+
+    function getWindowSize() {
+      if (!bevy_window_size_buffer) {
+        initlizeWindowSizeBuffer();
+      }
+      return {
+        width: bevy_window_size_buffer[0],
+        height: bevy_window_size_buffer[1]
+      };
+    }
+
+    function getPhysicalWindowSize() {
+      if (!bevy_window_size_buffer) {
+        initlizeWindowSizeBuffer();
+      }
+      return {
+        width: bevy_window_size_buffer[2],
+        height: bevy_window_size_buffer[3]
+      };
+    }
+
+    function getWindowScaleFactor() {
+      if (!bevy_window_size_buffer) {
+        initlizeWindowSizeBuffer();
+      }
+      return bevy_window_size_buffer[4];
+    }
+
+
+    window.onload = async () => {
+
+      const wasm = await init();
+
+      console.log(Object.keys(wasm)); // 列出所有可用属性
+      console.log(wasm); // 查看完整对象
+
+      initlizeWindowSizeBuffer = function() {
+        if (!bevy_window_size_buffer) {
+          bevy_window_size_buffer = new Float32Array(wasm.memory.buffer, wasm.get_window_size_buffer_ptr(), wasm.get_window_size_buffer_len())
+          console.log(bevy_window_size_buffer);
+        }
+      }
 
       const canvas = document.getElementById('bevy');
 
@@ -47,10 +91,11 @@
           // console.log('pointerdown pos:', originalEvent.offsetX, originalEvent.offsetY);
           originalEvent.stopImmediatePropagation();
             
-          // 将浏览器坐标转换为 canvas 坐标
+          // 将css坐标系转换到bevy逻辑坐标系
           const rect = canvas.getBoundingClientRect();
-          const scaleX = canvas.width / rect.width;
-          const scaleY = canvas.height / rect.height;
+          const windowSize = getWindowSize();
+          const scaleX = windowSize.width / rect.width;
+          const scaleY = windowSize.height / rect.height;
           
           // 创建具有新坐标的事件
           const newEvent = new PointerEvent(eventName, {
@@ -73,8 +118,6 @@
           canvas.dispatchEvent(newEvent);
         });   
       });
-
-      init()
     };
 
   </script>

@@ -1,32 +1,85 @@
-use bevy::{input::mouse::MouseButtonInput, prelude::*, ui::FocusPolicy, window::PrimaryWindow};
+use bevy::{input::mouse::MouseButtonInput, prelude::*, window::PrimaryWindow};
+
+pub struct JoystickPlugin;
 
 #[derive(Component)]
-pub struct Joystick;
+pub struct Joystick {
+    pub radius: f32,
+    pub thumb_radius: f32,
+    pub enable_elastic_rebound: bool,
+    pub elastic_rebound_duration: f32,
+}
 
 #[derive(Component, Default)]
-#[require(Node, FocusPolicy::Block, Interaction)]
-struct JoystickBase;
+pub struct JoystickBase;
 
 #[derive(Component)]
-struct JoystickThumb;
+pub struct JoystickThumb;
 
 #[derive(Component, Default)]
-struct JoystickDisabled;
+pub struct JoystickDisabled;
+
+#[derive(Message)]
+pub struct JoystickActivate {
+    pub entity: Entity,
+    pub start_pos: Vec2,
+}
+
+#[derive(Message)]
+pub struct JoystickMove {
+    pub entity: Entity,
+    pub pos: Vec2,
+}
+
+ #[derive(Message)]
+ pub struct JoystickDeactivate {
+    pub entity: Entity,
+}
 
 #[derive(Component, Default)]
-struct JustifyActived {
-    start: Option<Vec2>,
+struct Activated  {
+    center: Vec2,
     touch_id: Option<u64>,
 }
 
-pub struct JoystickPlugin;
+// #[derive(Component)]
+// struct ElasticRebound {
+//     start_pos: Vec2,
+//     target_pos: Vec2,
+//     duration: f32,
+// }
+
+
+impl Default for Joystick {
+    fn default() -> Self {
+        Self {
+            radius: 100.0,
+            thumb_radius: 50.0,
+            enable_elastic_rebound: true,
+            elastic_rebound_duration: 0.2,
+        }
+    }
+}
+
+// impl Default for ElasticRebound {
+//     fn default() -> Self {
+//         Self {
+//             start_pos: Vec2::ZERO,
+//             target_pos: Vec2::ZERO,
+//             duration: 0.0,
+//         }
+//     }
+// }
+
 
 impl Plugin for JoystickPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(joystick_on_add)
             .add_observer(joystick_on_remove)
-            // .add_observer(joystick_on_touch)
-            .add_systems(Update, (joystick_idle_system, joystick_setup_system));
+            .add_systems(First, (joystick_idle_system, joystick_activate_system))
+            .add_message::<JoystickActivate>()
+            .add_message::<JoystickMove>()
+            .add_message::<JoystickDeactivate>();
     }
 }
 
@@ -34,6 +87,7 @@ fn joystick_on_add(
     on_add: On<Add, Joystick>,
     mut commands: Commands,
     children_query: Query<&Children>,
+    joystick_query: Query<&Joystick>,
     joystick_base_query: Query<&JoystickBase>,
 ) {
     info!("Joystick added");
@@ -47,13 +101,19 @@ fn joystick_on_add(
             .find(|child| joystick_base_query.get(*child).is_ok())
             .is_none()
     }) {
+
+        let joystick_component = joystick_query.get(joystick_entity).unwrap();
+        let joystick_base_radius = joystick_component.radius;
+        let joystick_thumb_radius = joystick_component.thumb_radius;
+
         commands.spawn((
             Node {
-                width: Val::Px(100.0),
-                height: Val::Px(100.0),
+                width: Val::Px(joystick_base_radius*2.0),
+                height: Val::Px(joystick_base_radius*2.0),
                 display: Display::Flex,
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(Val::Percent(50.0)),
                 ..Default::default()
             },
             BackgroundColor(Color::hsl(310.0, 0.6, 0.8)),
@@ -62,8 +122,9 @@ fn joystick_on_add(
             ChildOf(joystick_entity),
             children![(
                 Node {
-                    width: Val::Px(50.0),
-                    height: Val::Px(50.0),
+                    width: Val::Px(joystick_thumb_radius*2.0),
+                    height: Val::Px(joystick_thumb_radius*2.0),
+                    border_radius: BorderRadius::all(Val::Percent(50.0)),
                     ..Default::default()
                 },
                 BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
@@ -96,33 +157,38 @@ fn joystick_idle_system(
         (
             With<JoystickBase>,
             Without<JoystickDisabled>,
-            Without<JustifyActived>,
+            Without<Activated>,
         ),
     >,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
+    mut joystick_activate_writer: MessageWriter<JoystickActivate>,
 ) {
-    let window = windows.single().unwrap();
-    let window_size = window.physical_size().as_vec2();
-    let logic_size = window.size();
-    let scale_factor = window.scale_factor();
-    joystick_query
-        .iter()
-        .for_each(|(entity, cn, global_transform)| {
-            let mut joystick_actived = JustifyActived::default();
-            
 
+    if joystick_query.is_empty() {
+        return;
+    }
+
+    let window = windows.single().unwrap();
+    let cursor_pos = window.cursor_position();
+    let physical_cursor_pos = window.physical_cursor_position();
+    let physical_scaler = window.scale_factor();
+    joystick_query.iter()
+        .for_each(|(entity, computed_node, global_transform)| {
+
+            let mut start_pos: Option<Vec2> = None;
+            let mut touch_id: Option<u64> = None;
             // Check mouse cursor
-            if let Some(cursor_pos) = window.physical_cursor_position() {
+            if let (Some(cursor_pos), Some(physical_cursor_pos)) = (cursor_pos, physical_cursor_pos) {
                 mouse_button_input_reader
                     .read()
                     .for_each(|mouse_button_input| {
                         if mouse_button_input.button == MouseButton::Left
                             && mouse_button_input.state.is_pressed()
                         {
-                            if cn.contains_point(*global_transform, cursor_pos) {
-                                joystick_actived.start = Some(cursor_pos);
+                            if computed_node.contains_point(*global_transform, physical_cursor_pos) {
+                                start_pos = Some(cursor_pos);
                             }
                         }
                     });
@@ -130,29 +196,94 @@ fn joystick_idle_system(
 
             // Check touches
             for touch in touches.iter_just_pressed() {
-                info!("window_size: {:?} logic_size: {:?} scale_factor: {:?}", window_size, logic_size, scale_factor);
                 let touch_pos = touch.start_position();
-                info!("Touch at position: {:?} Correction: {:?}", touch.start_position(), touch_pos);
-                if cn.contains_point(*global_transform, touch_pos) {
-                    joystick_actived.start = Some(touch_pos);
-                    joystick_actived.touch_id = Some(touch.id());
+                if computed_node.contains_point(*global_transform, touch_pos * physical_scaler) {
+                    start_pos = Some(touch_pos);
+                    touch_id = Some(touch.id());
+                    info!("window physical_size: {:?} size: {:?}", windows.single().unwrap().physical_size(), windows.single().unwrap().size());
                 }
             }
-            if joystick_actived.start.is_some() {
-                commands.entity(entity).insert(joystick_actived);
-            }
+
+            start_pos.map(|start_pos|{
+                commands.entity(entity).insert(Activated{
+                    center: global_transform.translation.xy() / physical_scaler,
+                    touch_id,
+                });
+                joystick_activate_writer.write(JoystickActivate{
+                    entity,
+                    start_pos,
+                });
+                info!("Joystick activated start: {:?} center: {:?}", start_pos, global_transform.affine().translation.xy());
+            });
         });
 }
 
-fn joystick_setup_system(
+fn joystick_activate_system(
     mut commands: Commands,
-    mut joystick_ready_query: Query<(Entity, &JustifyActived, &ComputedNode, &UiGlobalTransform)>,
+    mut joystick_activate_query: Query<(Entity, &Activated, &ComputedNode, &UiGlobalTransform, &Children)>,
+    mut ui_transform_query: Query<&mut UiTransform>,
+    mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
+    touches: Res<Touches>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut joystick_move_writer: MessageWriter<JoystickMove>,
+    mut joystick_deactivate_writer: MessageWriter<JoystickDeactivate>,
 ) {
-    for (entity, ready, _cn, _gt) in joystick_ready_query.iter_mut() {
-        info!(
-            "Joystick actived at position: {:?}, touch_id: {:?}",
-            ready.start, ready.touch_id
-        );
-        commands.entity(entity).remove::<JustifyActived>();
+
+    if joystick_activate_query.is_empty() {
+        return;
+    }
+
+    let window = windows.single().unwrap();
+    let cursor_pos = window.cursor_position();
+
+    for (entity, active_info, .., children) in joystick_activate_query.iter_mut() {
+        let mut pointer_pos: Option<Vec2> = None;
+        match active_info.touch_id {
+            Some(touch_id) => {
+                touches.iter().find(|touch| touch.id() == touch_id).map(|touch|{
+                    pointer_pos = Some(touch.position());
+                    joystick_move_writer.write(JoystickMove{
+                        entity,
+                        pos: touch.position() - active_info.center,
+                    });
+                    // info!("Touch {:?} {:?}", touch_id, touch.position() - active_info.center);
+                });
+
+                if touches.just_released(touch_id) {
+                    commands.entity(entity).remove::<Activated>();
+                    joystick_deactivate_writer.write(JoystickDeactivate{
+                        entity,
+                    });
+                    // info!("Touch released");
+                }
+            },
+            None => {
+                pointer_pos = cursor_pos;
+                if let Some(cursor_pos) = cursor_pos {
+                    joystick_move_writer.write(JoystickMove{
+                        entity,
+                        pos: cursor_pos - active_info.center,
+                    });
+                    // info!("output: {:?}", cursor_pos - active_info.center);
+                }
+
+                // 鼠标释放检查
+                let mouse_released = mouse_button_input_reader.read()
+                    .any(|input| input.button == MouseButton::Left && !input.state.is_pressed());
+                
+                if mouse_released {
+                    commands.entity(entity).remove::<Activated>();
+                    joystick_deactivate_writer.write(JoystickDeactivate { entity });
+                }
+            }
+        }
+        if let Some(pointer_pos) = pointer_pos { 
+            children.iter().for_each(|child| {
+                if let Ok(mut transform) = ui_transform_query.get_mut(child) {
+                    transform.translation = Val2::new(Val::Px(pointer_pos.x - active_info.center.x), Val::Px(pointer_pos.y - active_info.center.y));
+                }
+            });
+        }
+
     }
 }
