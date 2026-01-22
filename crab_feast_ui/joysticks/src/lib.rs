@@ -6,6 +6,7 @@ pub struct JoystickPlugin;
 pub struct Joystick {
     pub radius: f32,
     pub thumb_radius: f32,
+    pub thumb_max_distance: f32,
     pub enable_elastic_rebound: bool,
     pub elastic_rebound_duration: f32,
 }
@@ -42,12 +43,15 @@ struct Activated  {
     touch_id: Option<u64>,
 }
 
-// #[derive(Component)]
-// struct ElasticRebound {
-//     start_pos: Vec2,
-//     target_pos: Vec2,
-//     duration: f32,
-// }
+#[derive(Component)]
+struct MaxDistance(f32);
+
+#[derive(Component)]
+struct ElasticRebound {
+    start_pos: Vec2,
+    duration: f32,
+    time: f32,
+}
 
 
 impl Default for Joystick {
@@ -55,31 +59,34 @@ impl Default for Joystick {
         Self {
             radius: 100.0,
             thumb_radius: 50.0,
+            thumb_max_distance: 75.0,
             enable_elastic_rebound: true,
             elastic_rebound_duration: 0.2,
         }
     }
 }
 
-// impl Default for ElasticRebound {
-//     fn default() -> Self {
-//         Self {
-//             start_pos: Vec2::ZERO,
-//             target_pos: Vec2::ZERO,
-//             duration: 0.0,
-//         }
-//     }
-// }
+impl Default for ElasticRebound {
+    fn default() -> Self {
+        Self {
+            start_pos: Vec2::ZERO,
+            duration: 0.0,
+            time: 0.0,
+        }
+    }
+}
 
 
 impl Plugin for JoystickPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(joystick_on_add)
-            .add_observer(joystick_on_remove)
-            .add_systems(First, (joystick_idle_system, joystick_activate_system))
-            .add_message::<JoystickActivate>()
-            .add_message::<JoystickMove>()
-            .add_message::<JoystickDeactivate>();
+        app
+        .add_observer(joystick_on_add)
+        .add_observer(joystick_on_remove)
+        .add_systems(First, joystick_idle_system)
+        .add_systems(PostUpdate, (joystick_activate_system, joystick_thumb_elastic_rebound_system))
+        .add_message::<JoystickActivate>()
+        .add_message::<JoystickMove>()
+        .add_message::<JoystickDeactivate>();
     }
 }
 
@@ -116,9 +123,9 @@ fn joystick_on_add(
                 border_radius: BorderRadius::all(Val::Percent(50.0)),
                 ..Default::default()
             },
+            MaxDistance(joystick_component.thumb_max_distance),
             BackgroundColor(Color::hsl(310.0, 0.6, 0.8)),
             JoystickBase::default(),
-            Transform::default(),
             ChildOf(joystick_entity),
             children![(
                 Node {
@@ -127,7 +134,7 @@ fn joystick_on_add(
                     border_radius: BorderRadius::all(Val::Percent(50.0)),
                     ..Default::default()
                 },
-                BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
+                BackgroundColor(Color::hsl(30.0, 0.6, 0.8)),
                 JoystickThumb
             )],
         ));
@@ -220,7 +227,7 @@ fn joystick_idle_system(
 
 fn joystick_activate_system(
     mut commands: Commands,
-    mut joystick_activate_query: Query<(Entity, &Activated, &ComputedNode, &UiGlobalTransform, &Children)>,
+    mut joystick_activate_query: Query<(Entity, &Activated, &UiGlobalTransform, &MaxDistance, &Children)>,
     mut ui_transform_query: Query<&mut UiTransform>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
     touches: Res<Touches>,
@@ -236,8 +243,9 @@ fn joystick_activate_system(
     let window = windows.single().unwrap();
     let cursor_pos = window.cursor_position();
 
-    for (entity, active_info, .., children) in joystick_activate_query.iter_mut() {
+    for (entity, active_info, .., max_distance, children) in joystick_activate_query.iter_mut() {
         let mut pointer_pos: Option<Vec2> = None;
+        let mut deactivated = false;
         match active_info.touch_id {
             Some(touch_id) => {
                 touches.iter().find(|touch| touch.id() == touch_id).map(|touch|{
@@ -250,11 +258,7 @@ fn joystick_activate_system(
                 });
 
                 if touches.just_released(touch_id) {
-                    commands.entity(entity).remove::<Activated>();
-                    joystick_deactivate_writer.write(JoystickDeactivate{
-                        entity,
-                    });
-                    // info!("Touch released");
+                    deactivated = true;
                 }
             },
             None => {
@@ -265,25 +269,61 @@ fn joystick_activate_system(
                         pos: cursor_pos - active_info.center,
                     });
                     // info!("output: {:?}", cursor_pos - active_info.center);
-                }
 
-                // 鼠标释放检查
-                let mouse_released = mouse_button_input_reader.read()
-                    .any(|input| input.button == MouseButton::Left && !input.state.is_pressed());
-                
-                if mouse_released {
-                    commands.entity(entity).remove::<Activated>();
-                    joystick_deactivate_writer.write(JoystickDeactivate { entity });
+                    // 鼠标释放检查
+                    deactivated = mouse_button_input_reader.read()
+                        .any(|input| input.button == MouseButton::Left && !input.state.is_pressed());
+                    
+
                 }
             }
         }
-        if let Some(pointer_pos) = pointer_pos { 
+        if let Some(pointer_pos) = pointer_pos {
+            let direction = (pointer_pos - active_info.center).normalize_or_zero();
+            let distance = (pointer_pos - active_info.center).length().min(max_distance.0);
+            let offset = direction * distance;
             children.iter().for_each(|child| {
                 if let Ok(mut transform) = ui_transform_query.get_mut(child) {
-                    transform.translation = Val2::new(Val::Px(pointer_pos.x - active_info.center.x), Val::Px(pointer_pos.y - active_info.center.y));
+                    transform.translation = Val2::new(Val::Px(offset.x), Val::Px(offset.y));
                 }
             });
+
+            if deactivated {
+                commands.entity(entity).remove::<Activated>().insert(ElasticRebound{
+                    start_pos: offset,
+                    duration: 0.1,
+                    ..Default::default()
+                });
+                joystick_deactivate_writer.write(JoystickDeactivate { entity });
+            }
         }
 
+    }
+}
+
+fn joystick_thumb_elastic_rebound_system(
+    mut commands: Commands,
+    mut joystick_thumb_elastic_rebound_query: Query<(Entity, &mut ElasticRebound, &Children)>,
+    mut ui_transform_query: Query<&mut UiTransform>,
+    time: Res<Time>,
+) {
+    for (entity, mut elastic_rebound, children) in joystick_thumb_elastic_rebound_query.iter_mut() { 
+        elastic_rebound.time += time.delta_secs();
+        let t = (elastic_rebound.time / elastic_rebound.duration).min(1.0);
+        // 弹性插值公式：使用指数衰减和余弦函数模拟弹性效果
+        // 参数调整：k控制衰减速度，w控制振动频率
+        let k = 5.0;
+        let w = 6.0;
+        let elastic_factor = (-k * t).exp() * (w * t).cos();
+        // 计算当前位置：起始位置 * 弹性因子
+        let pos = elastic_rebound.start_pos * elastic_factor;
+        children.iter().for_each(|child| {
+            if let Ok(mut transform) = ui_transform_query.get_mut(child) {
+                transform.translation = Val2::new(Val::Px(pos.x), Val::Px(pos.y));
+            }
+        });
+        if t >= 1.0 {
+            commands.entity(entity).remove::<ElasticRebound>();
+        }
     }
 }
