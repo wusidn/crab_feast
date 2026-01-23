@@ -14,4 +14,6 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 bevy.workspace = true
 crab_feast = {path = "../../crab_feast"}
-
+log.workspace = true
+android_logger = "0.12"  # 用于将Rust日志输出到Android Logcat
+cfg-if = "1.0"           # 用于跨平台条件编译

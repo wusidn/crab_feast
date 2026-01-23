@@ -10,7 +10,7 @@ resolver = "2"
 default-members = ["launcher/pc"]
 
 [workspace.dependencies]
-bevy                    = { version = "0.18.0-rc.1", features = ["debug"] }
+bevy                    = { version = "0.18.0-rc.1" }
 bevy_rapier2d           = "0.29.0"
 bevy_replicon           = "0.36.0"
 bytes                   = "1.9.0"

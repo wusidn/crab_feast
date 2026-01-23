@@ -35,14 +35,13 @@
     import init from '../target/crab_feast_wasm.js'
 
 
+    /**
+     * [width, height, physical_width, physical_height, scale_factor]
+     */
     let bevy_window_size_buffer;
 
-    let initlizeWindowSizeBuffer;
-
     function getWindowSize() {
-      if (!bevy_window_size_buffer) {
-        initlizeWindowSizeBuffer();
-      }
+      initlizeWindowSizeBuffer();
       return {
         width: bevy_window_size_buffer[0],
         height: bevy_window_size_buffer[1]
@@ -50,9 +49,7 @@
     }
 
     function getPhysicalWindowSize() {
-      if (!bevy_window_size_buffer) {
-        initlizeWindowSizeBuffer();
-      }
+      initlizeWindowSizeBuffer();
       return {
         width: bevy_window_size_buffer[2],
         height: bevy_window_size_buffer[3]
@@ -60,64 +57,63 @@
     }
 
     function getWindowScaleFactor() {
-      if (!bevy_window_size_buffer) {
-        initlizeWindowSizeBuffer();
-      }
+      initlizeWindowSizeBuffer();
       return bevy_window_size_buffer[4];
     }
 
+    function initlizeWindowSizeBuffer () {
+      if (!bevy_window_size_buffer || bevy_window_size_buffer.length === 0) {
+        const bufferPtr = wasm.get_window_size_buffer_ptr();
+        const bufferLen = wasm.get_window_size_buffer_len();
+        if (bufferPtr === 0 || bufferLen === 0) {
+          throw new Error("Failed to get Bevy window size buffer from WASM.");
+        }
+        bevy_window_size_buffer = new Float32Array(wasm.memory.buffer, bufferPtr, bufferLen);
+        console.log(bevy_window_size_buffer);
+      }
+    };
+
+    let wasm;
 
     window.onload = async () => {
-
-      const wasm = await init();
-
-      console.log(Object.keys(wasm)); // 列出所有可用属性
-      console.log(wasm); // 查看完整对象
-
-      initlizeWindowSizeBuffer = function() {
-        if (!bevy_window_size_buffer) {
-          bevy_window_size_buffer = new Float32Array(wasm.memory.buffer, wasm.get_window_size_buffer_ptr(), wasm.get_window_size_buffer_len())
-          console.log(bevy_window_size_buffer);
-        }
-      }
 
       const canvas = document.getElementById('bevy');
 
       const processEvents = ["pointerout", "pointerover", "pointermove", "pointerdown", "pointerup", "pointercancel"];
 
       processEvents.forEach(eventName => {
-        canvas.addEventListener(eventName, function(originalEvent) {
-          if (originalEvent.intercepted) return;
-          // console.log('pointerdown pos:', originalEvent.offsetX, originalEvent.offsetY);
-          originalEvent.stopImmediatePropagation();
-            
+        canvas.addEventListener(eventName, function(event) {
           // 将css坐标系转换到bevy逻辑坐标系
           const rect = canvas.getBoundingClientRect();
           const windowSize = getWindowSize();
           const scaleX = windowSize.width / rect.width;
           const scaleY = windowSize.height / rect.height;
-          
-          // 创建具有新坐标的事件
-          const newEvent = new PointerEvent(eventName, {
-              ...originalEvent,
-              pointerId: originalEvent.pointerId,
-              pointerType: originalEvent.pointerType,
-              isPrimary: originalEvent.isPrimary,
+
+          const postion = {x: event.offsetX * scaleX, y: event.offsetY * scaleY};
+          console.log(`event ${eventName} old pos: ${event.offsetX}, ${event.offsetY} new pos: ${postion.x}, ${postion.y}`);
+
+          const getCoalescedEvents = event.getCoalescedEvents;
+
+          Object.defineProperties(event, {
+              offsetX: { value: postion.x },
+              offsetY: { value: postion.y },
+              getCoalescedEvents: {
+                value: function() {
+                  return Array.from(getCoalescedEvents.call(event)).map(e => ({
+                    ...e,
+                    offsetX: e.offsetX * scaleX,
+                    offsetY: e.offsetY * scaleY
+                  }));
+                }
+              }
           });
-
-          Object.defineProperties(newEvent, {
-              offsetX: { value: originalEvent.offsetX * scaleX },
-              offsetY: { value: originalEvent.offsetY * scaleY },
-          });
-
-          newEvent.intercepted = true; // 标记事件已被处理
-
-          // console.log('pointerdown new pos:', newEvent.offsetX, newEvent.offsetY);
-          
-          // 触发到 canvas
-          canvas.dispatchEvent(newEvent);
         });   
       });
+    
+      wasm = await init();
+
+      console.log(Object.keys(wasm)); // 列出所有可用属性
+      console.log(wasm); // 查看完整对象
     };
 
   </script>

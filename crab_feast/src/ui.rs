@@ -1,6 +1,10 @@
 use bevy::prelude::*;
 use crab_feast_ui_joysticks::{Joystick, JoystickPlugin};
+
+use crate::assets::DefaultAssets;
 pub struct UiPlugin;
+
+
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
@@ -13,11 +17,8 @@ impl Plugin for UiPlugin {
 impl UiPlugin {
     fn setup(
         mut commands: Commands,
-        asset_server: Res<AssetServer>,
+        assets: Res<DefaultAssets>,
     ) {
-
-        let font = asset_server.load("fonts/PingFang-SC-Light.ttf");
-
         commands.spawn((
             Node{
                 width: Val::Vw(100.0),
@@ -36,7 +37,7 @@ impl UiPlugin {
                     BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
                     Text("".to_string()),
                     TextFont{
-                        font,
+                        font: assets.font.clone(),
                         font_size: 32.0,
                         ..Default::default()
                     },
@@ -51,6 +52,7 @@ impl UiPlugin {
                 )
             ]
         ));
+
     }
 }
 
