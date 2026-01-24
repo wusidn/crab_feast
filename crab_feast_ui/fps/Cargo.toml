@@ -1,0 +1,7 @@
+[package]
+name = "crab_feast_ui_fps"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy.workspace = true

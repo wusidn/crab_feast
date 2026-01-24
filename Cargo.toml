@@ -5,7 +5,7 @@ members = [
     "launcher/wasm",
     "crab_feast",
     "crab_feast_library"
-]
+, "crab_feast_ui/fps"]
 resolver = "2"
 default-members = ["launcher/pc"]
 

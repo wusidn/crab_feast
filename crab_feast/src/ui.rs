@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 use crab_feast_ui_joysticks::{Joystick, JoystickPlugin};
 
-use crate::assets::DefaultAssets;
 pub struct UiPlugin;
 
 
@@ -17,7 +16,6 @@ impl Plugin for UiPlugin {
 impl UiPlugin {
     fn setup(
         mut commands: Commands,
-        assets: Res<DefaultAssets>,
     ) {
         commands.spawn((
             Node{
@@ -37,7 +35,6 @@ impl UiPlugin {
                     BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
                     Text("".to_string()),
                     TextFont{
-                        font: assets.font.clone(),
                         font_size: 32.0,
                         ..Default::default()
                     },

@@ -10,7 +10,11 @@ pub struct Joystick {
     pub enable_elastic_rebound: bool,
     pub elastic_rebound_duration: f32,
 }
-
+#[derive(Component, Default)]
+pub struct JoystickState {
+    pub direction: Vec2,
+    pub force: f32,
+}
 #[derive(Component, Default)]
 pub struct JoystickBase;
 
@@ -23,18 +27,23 @@ pub struct JoystickDisabled;
 #[derive(Message)]
 pub struct JoystickActivate {
     pub entity: Entity,
-    pub start_pos: Vec2,
+}
+
+pub struct JoystickStateChanged {
+    pub entity: Entity,
+    pub direction: Vec2,
+    pub force: f32,
+}
+
+ pub struct JoystickDeactivate {
+    pub entity: Entity,
 }
 
 #[derive(Message)]
-pub struct JoystickMove {
-    pub entity: Entity,
-    pub pos: Vec2,
-}
-
- #[derive(Message)]
- pub struct JoystickDeactivate {
-    pub entity: Entity,
+pub enum JoystickEvent {
+    Activate(JoystickActivate),
+    Changed(JoystickStateChanged),
+    Deactivate(JoystickDeactivate),
 }
 
 #[derive(Component, Default)]
@@ -53,7 +62,6 @@ struct ElasticRebound {
     duration: f32,
     time: f32,
 }
-
 
 impl Default for Joystick {
     fn default() -> Self {
@@ -77,7 +85,6 @@ impl Default for ElasticRebound {
     }
 }
 
-
 impl Plugin for JoystickPlugin {
     fn build(&self, app: &mut App) {
         app
@@ -85,9 +92,7 @@ impl Plugin for JoystickPlugin {
         .add_observer(joystick_on_remove)
         .add_systems(First, joystick_idle_system)
         .add_systems(PostUpdate, (joystick_activate_system, joystick_thumb_elastic_rebound_system))
-        .add_message::<JoystickActivate>()
-        .add_message::<JoystickMove>()
-        .add_message::<JoystickDeactivate>();
+        .add_message::<JoystickEvent>();
     }
 }
 
@@ -139,6 +144,8 @@ fn joystick_on_add(
                 JoystickThumb
             )],
         ));
+
+        commands.entity(joystick_entity).insert(JoystickState::default());
     }
 }
 
@@ -161,7 +168,7 @@ fn joystick_on_remove(
 fn joystick_idle_system(
     mut commands: Commands,
     joystick_query: Query<
-        (Entity, &ComputedNode, &UiGlobalTransform),
+        (Entity, &ComputedNode, &UiGlobalTransform, &ChildOf),
         (
             With<JoystickBase>,
             Without<JoystickDisabled>,
@@ -171,7 +178,7 @@ fn joystick_idle_system(
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
-    mut joystick_activate_writer: MessageWriter<JoystickActivate>,
+    mut joystick_event_writer: MessageWriter<JoystickEvent>,
 ) {
 
     if joystick_query.is_empty() {
@@ -183,7 +190,7 @@ fn joystick_idle_system(
     let physical_cursor_pos = window.physical_cursor_position();
     let physical_scaler = window.scale_factor();
     joystick_query.iter()
-        .for_each(|(entity, computed_node, global_transform)| {
+        .for_each(|(entity, computed_node, global_transform, child_of)| {
 
             let mut start_pos: Option<Vec2> = None;
             let mut touch_id: Option<u64> = None;
@@ -213,15 +220,13 @@ fn joystick_idle_system(
             }
 
             start_pos.map(|start_pos|{
+                let joystick_entity = child_of.0;
                 commands.entity(entity).insert(Activated{
                     center: global_transform.translation.xy() / physical_scaler,
                     touch_id,
                     offset: Vec2::ZERO,
                 });
-                joystick_activate_writer.write(JoystickActivate{
-                    entity,
-                    start_pos,
-                });
+                joystick_event_writer.write( JoystickEvent::Activate(JoystickActivate{entity: joystick_entity}));
                 info!("Joystick activated start: {:?} center: {:?}", start_pos, global_transform.affine().translation.xy());
             });
         });
@@ -229,13 +234,13 @@ fn joystick_idle_system(
 
 fn joystick_activate_system(
     mut commands: Commands,
-    mut joystick_activate_query: Query<(Entity, &mut Activated, &UiGlobalTransform, &MaxDistance, &Children)>,
+    mut joystick_activate_query: Query<(Entity, &mut Activated, &UiGlobalTransform, &MaxDistance, &Children, &ChildOf)>,
+    mut joystick_state_query: Query<&mut JoystickState>,
     mut ui_transform_query: Query<&mut UiTransform>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut joystick_move_writer: MessageWriter<JoystickMove>,
-    mut joystick_deactivate_writer: MessageWriter<JoystickDeactivate>,
+    mut joystick_event_writer: MessageWriter<JoystickEvent>,
 ) {
 
     if joystick_activate_query.is_empty() {
@@ -245,36 +250,24 @@ fn joystick_activate_system(
     let window = windows.single().unwrap();
     let cursor_pos = window.cursor_position();
 
-    for (entity, mut active_info, .., max_distance, children) in joystick_activate_query.iter_mut() {
+    for (entity, mut active_info, .., max_distance, children, child_of) in joystick_activate_query.iter_mut() {
         let mut pointer_pos: Option<Vec2> = None;
         let mut deactivated = false;
+        let joystick_entity = child_of.0;
         match active_info.touch_id {
             Some(touch_id) => {
                 match touches.iter().find(|touch| touch.id() == touch_id) {
                     Some(touch) => {
                         pointer_pos = Some(touch.position());
-                        joystick_move_writer.write(JoystickMove{
-                            entity,
-                            pos: touch.position() - active_info.center,
-                        });
-                        info!("Touch {:?} pos: {:?} offset: {:?}", touch_id, touch.position(), active_info.offset);
                     },
                     None => {deactivated = true;},
                 }
             },
             None => {
                 pointer_pos = cursor_pos;
-                if let Some(cursor_pos) = cursor_pos {
-                    joystick_move_writer.write(JoystickMove{
-                        entity,
-                        pos: cursor_pos - active_info.center,
-                    });
-                    // info!("output: {:?}", cursor_pos - active_info.center);
-
-                    // 鼠标释放检查
-                    deactivated = mouse_button_input_reader.read()
-                        .any(|input| input.button == MouseButton::Left && !input.state.is_pressed());
-                }
+                // 鼠标释放检查
+                deactivated = mouse_button_input_reader.read()
+                    .any(|input| input.button == MouseButton::Left && !input.state.is_pressed());
             }
         }
         if deactivated {
@@ -283,18 +276,43 @@ fn joystick_activate_system(
                 duration: 0.1,
                 ..Default::default()
             });
-            joystick_deactivate_writer.write(JoystickDeactivate { entity });
+            if let Ok(mut joystick_state) = joystick_state_query.get_mut(joystick_entity) {
+                joystick_state.direction = Vec2::ZERO;
+                joystick_state.force = 0.0;
+            }
+            joystick_event_writer.write(JoystickEvent::Changed(JoystickStateChanged {
+                entity: joystick_entity,
+                direction: Vec2::ZERO,
+                force: 0.0,
+            }));
+            joystick_event_writer.write( JoystickEvent::Deactivate(JoystickDeactivate { entity: joystick_entity }));
         }
         else if let Some(pointer_pos) = pointer_pos {
             let direction = (pointer_pos - active_info.center).normalize_or_zero();
             let distance = (pointer_pos - active_info.center).length().min(max_distance.0);
             let offset = direction * distance;
+            let force = match distance {
+                0.0 => 0.0,
+                _ => distance / max_distance.0,
+            };
             active_info.offset = offset;
             children.iter().for_each(|child| {
                 if let Ok(mut transform) = ui_transform_query.get_mut(child) {
                     transform.translation = Val2::new(Val::Px(offset.x), Val::Px(offset.y));
                 }
             });
+            if let Ok(mut joystick_state) = joystick_state_query.get_mut(joystick_entity) {
+                if (joystick_state.direction - direction).length() < 0.01 && (joystick_state.force - force).abs() < 0.01 {
+                    continue;
+                }
+                joystick_state.direction = direction;
+                joystick_state.force = force;
+                joystick_event_writer.write( JoystickEvent::Changed(JoystickStateChanged {
+                    entity: joystick_entity,
+                    direction,
+                    force,
+                }));
+            }
         }
 
     }

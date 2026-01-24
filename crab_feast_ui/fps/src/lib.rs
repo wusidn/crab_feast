@@ -1,5 +1,4 @@
 use bevy::prelude::*;
-use crate::assets::DefaultAssets;
 
 /// FPS显示资源
 #[derive(Resource)]
@@ -55,7 +54,6 @@ impl Plugin for FPSPlugin {
 
 fn fps_setup(
     mut commands: Commands,
-    assets: Res<DefaultAssets>,
 ) { 
     // FPS显示节点
     commands.spawn((
@@ -71,7 +69,6 @@ fn fps_setup(
             (
                 Text("FPS: --".to_string()), // 初始显示占位符
                 TextFont{
-                    font: assets.font.clone(),
                     font_size: 18.0,
                     ..Default::default()
                 },
