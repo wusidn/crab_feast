@@ -28,8 +28,8 @@ impl UiPlugin {
             children![
                 (
                     Node{
-                        width: Val::Vw(60.0),
-                        height: Val::Px(200.0),
+                        width: Val::Vw(20.0),
+                        height: Val::Vw(20.0),
                         ..Default::default()
                     },
                     BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),

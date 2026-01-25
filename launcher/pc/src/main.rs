@@ -1,4 +1,4 @@
-use bevy::prelude::*;
+use bevy::{prelude::*, winit::WinitSettings};
 
 fn main() {
     let mut app = crab_feast::build_app();
@@ -15,6 +15,10 @@ fn main() {
                 }),
                 ..Default::default()
             })
-    );
+    ) // 配置WinitSettings，禁用后台帧率限制
+    .insert_resource(WinitSettings {
+        focused_mode: bevy::winit::UpdateMode::Continuous,
+        ..Default::default()
+    });
     app.run();
 }
