@@ -10,7 +10,7 @@ use cfg_if::cfg_if;
 
 // the `bevy_main` proc_macro generates the required boilerplate for iOS and Android
 #[bevy_main]
-fn main() {
+pub fn main() {
 
     // 初始化日志系统（仅在Android平台）
     cfg_if! {

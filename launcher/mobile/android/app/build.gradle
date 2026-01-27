@@ -6,6 +6,24 @@ android {
     namespace 'org.crab_feast.mobile'
     compileSdk 34
 
+    // 添加签名配置
+    signingConfigs {
+        release {
+            storeFile file("../../game_mobile.jks") // 签名文件路径
+            storePassword "wusi930208" // 密钥库密码
+            keyAlias "haha" // 密钥别名
+            keyPassword "wusi930208" // 密钥密码
+        }
+    }
+    
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release // 应用签名配置
+        }
+    }
+
     defaultConfig {
         applicationId "org.crab_feast.mobile"
         minSdk 29

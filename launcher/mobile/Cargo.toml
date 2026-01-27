@@ -11,9 +11,9 @@ license = "MIT OR Apache-2.0"
 name = "crab_feast_mobile"
 crate-type = ["lib", "cdylib"]
 
-[[bin]]
-name = "crab_feast_mobile"
-path = "src/lib.rs"
+# [[bin]]
+# name = "crab_feast_mobile"
+# path = "src/lib.rs"
 
 [dependencies]
 bevy.workspace = true
