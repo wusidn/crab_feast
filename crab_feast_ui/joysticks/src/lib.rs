@@ -4,9 +4,8 @@ pub struct JoystickPlugin;
 
 #[derive(Component)]
 pub struct Joystick {
-    pub radius: f32,
-    pub thumb_radius: f32,
-    pub thumb_max_distance: f32,
+    pub thumb_radius_percent: f32,
+    pub thumb_max_distance_percent: f32,
     pub enable_elastic_rebound: bool,
     pub elastic_rebound_duration: f32,
 }
@@ -15,8 +14,6 @@ pub struct JoystickState {
     pub direction: Vec2,
     pub force: f32,
 }
-#[derive(Component, Default)]
-pub struct JoystickBase;
 
 #[derive(Component)]
 pub struct JoystickThumb;
@@ -66,9 +63,8 @@ struct ElasticRebound {
 impl Default for Joystick {
     fn default() -> Self {
         Self {
-            radius: 100.0,
-            thumb_radius: 50.0,
-            thumb_max_distance: 90.0,
+            thumb_radius_percent: 50.0,
+            thumb_max_distance_percent: 80.0,
             enable_elastic_rebound: true,
             elastic_rebound_duration: 0.2,
         }
@@ -101,7 +97,7 @@ fn joystick_on_add(
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_query: Query<&Joystick>,
-    joystick_base_query: Query<&JoystickBase>,
+    joystick_thumb_query: Query<&JoystickThumb>,
 ) {
     info!("Joystick added");
 
@@ -111,38 +107,22 @@ fn joystick_on_add(
     if children.map_or(true, |children| {
         children
             .iter()
-            .find(|child| joystick_base_query.get(*child).is_ok())
+            .find(|child| joystick_thumb_query.get(*child).is_ok())
             .is_none()
     }) {
 
         let joystick_component = joystick_query.get(joystick_entity).unwrap();
-        let joystick_base_radius = joystick_component.radius;
-        let joystick_thumb_radius = joystick_component.thumb_radius;
 
         commands.spawn((
             Node {
-                width: Val::Px(joystick_base_radius*2.0),
-                height: Val::Px(joystick_base_radius*2.0),
-                display: Display::Flex,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
+                width: Val::Percent(joystick_component.thumb_radius_percent),
+                height: Val::Percent(joystick_component.thumb_radius_percent),
                 border_radius: BorderRadius::all(Val::Percent(50.0)),
                 ..Default::default()
             },
-            MaxDistance(joystick_component.thumb_max_distance),
-            BackgroundColor(Color::hsl(310.0, 0.6, 0.8)),
-            JoystickBase::default(),
+            BackgroundColor(Color::hsl(30.0, 0.6, 0.8)),
+            JoystickThumb,
             ChildOf(joystick_entity),
-            children![(
-                Node {
-                    width: Val::Px(joystick_thumb_radius*2.0),
-                    height: Val::Px(joystick_thumb_radius*2.0),
-                    border_radius: BorderRadius::all(Val::Percent(50.0)),
-                    ..Default::default()
-                },
-                BackgroundColor(Color::hsl(30.0, 0.6, 0.8)),
-                JoystickThumb
-            )],
         ));
 
         commands.entity(joystick_entity).insert(JoystickState::default());
@@ -153,12 +133,12 @@ fn joystick_on_remove(
     on_remove: On<Remove, Joystick>,
     mut commands: Commands,
     children_query: Query<&Children>,
-    joystick_base_query: Query<&JoystickBase>,
+    joystick_thumb_query: Query<&JoystickThumb>,
 ) {
     info!("Joystick removed");
     if let Ok(children) = children_query.get(on_remove.event_target()) {
         children.iter().for_each(|child| {
-            if joystick_base_query.get(child).is_ok() {
+            if joystick_thumb_query.get(child).is_ok() {
                 commands.entity(child).despawn();
             }
         });
@@ -168,13 +148,14 @@ fn joystick_on_remove(
 fn joystick_idle_system(
     mut commands: Commands,
     joystick_query: Query<
-        (Entity, &ComputedNode, &UiGlobalTransform, &ChildOf),
+        (Entity, &ComputedNode, &UiGlobalTransform, &Joystick),
         (
-            With<JoystickBase>,
+            With<Joystick>,
             Without<JoystickDisabled>,
             Without<Activated>,
         ),
     >,
+    mut max_distance_query: Query<&mut MaxDistance>,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
@@ -190,7 +171,7 @@ fn joystick_idle_system(
     let physical_cursor_pos = window.physical_cursor_position();
     let physical_scaler = window.scale_factor();
     joystick_query.iter()
-        .for_each(|(entity, computed_node, global_transform, child_of)| {
+        .for_each(|(joystick_entity, computed_node, global_transform, joystick_component)| {
 
             let mut start_pos: Option<Vec2> = None;
             let mut touch_id: Option<u64> = None;
@@ -220,12 +201,20 @@ fn joystick_idle_system(
             }
 
             start_pos.map(|start_pos|{
-                let joystick_entity = child_of.0;
-                commands.entity(entity).insert(Activated{
+                commands.entity(joystick_entity).insert(Activated{
                     center: global_transform.translation.xy() / physical_scaler,
                     touch_id,
                     offset: Vec2::ZERO,
                 });
+                let max_distance = computed_node.size().xy().length() * joystick_component.thumb_max_distance_percent / 100.0 / 2.0 / physical_scaler;
+                match max_distance_query.get_mut(joystick_entity) {
+                    Ok(mut max_distance_component) => {
+                        max_distance_component.0 = max_distance;
+                    },
+                    Err(_) => {
+                        commands.entity(joystick_entity).insert(MaxDistance(max_distance));
+                    },
+                }
                 joystick_event_writer.write( JoystickEvent::Activate(JoystickActivate{entity: joystick_entity}));
                 info!("Joystick activated start: {:?} center: {:?}", start_pos, global_transform.affine().translation.xy());
             });
@@ -234,9 +223,9 @@ fn joystick_idle_system(
 
 fn joystick_activate_system(
     mut commands: Commands,
-    mut joystick_activate_query: Query<(Entity, &mut Activated, &UiGlobalTransform, &MaxDistance, &Children, &ChildOf)>,
+    mut joystick_activate_query: Query<(Entity, &mut Activated, &UiGlobalTransform, &MaxDistance, &Children)>,
     mut joystick_state_query: Query<&mut JoystickState>,
-    mut ui_transform_query: Query<&mut UiTransform>,
+    mut ui_transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -250,10 +239,9 @@ fn joystick_activate_system(
     let window = windows.single().unwrap();
     let cursor_pos = window.cursor_position();
 
-    for (entity, mut active_info, .., max_distance, children, child_of) in joystick_activate_query.iter_mut() {
+    for (joystick_entity, mut active_info, .., max_distance, children) in joystick_activate_query.iter_mut() {
         let mut pointer_pos: Option<Vec2> = None;
         let mut deactivated = false;
-        let joystick_entity = child_of.0;
         match active_info.touch_id {
             Some(touch_id) => {
                 match touches.iter().find(|touch| touch.id() == touch_id) {
@@ -271,7 +259,7 @@ fn joystick_activate_system(
             }
         }
         if deactivated {
-            commands.entity(entity).remove::<Activated>().insert(ElasticRebound{
+            commands.entity(joystick_entity).remove::<Activated>().insert(ElasticRebound{
                 offset: active_info.offset,
                 duration: 0.1,
                 ..Default::default()

@@ -21,8 +21,10 @@ impl UiPlugin {
             Node{
                 width: Val::Vw(100.0),
                 height: Val::Vh(100.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
+                padding: UiRect::all(Val::Vw(10.0)),
+                display: Display::Flex,
+                justify_content: JustifyContent::FlexStart,
+                align_items: AlignItems::FlexEnd,
                 ..Default::default()
             },
             children![
@@ -30,19 +32,13 @@ impl UiPlugin {
                     Node{
                         width: Val::Vw(20.0),
                         height: Val::Vw(20.0),
+                        display: Display::Flex,
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border_radius: BorderRadius::all(Val::Percent(50.0)),
                         ..Default::default()
                     },
                     BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
-                    Text("".to_string()),
-                    TextFont{
-                        font_size: 32.0,
-                        ..Default::default()
-                    },
-                    TextColor(Color::WHITE),
-                    TextLayout {
-                        justify: Justify::Center,
-                        linebreak: LineBreak::AnyCharacter,
-                    },
                     Joystick {
                         ..Default::default()
                     }
