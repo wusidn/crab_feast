@@ -12,7 +12,7 @@ wasm-bindgen --out-name crab_feast_wasm --out-dir launcher/wasm/target --target 
 
 
 # run
-http-server launcher/wasm --cors -p 8080
+# http-server launcher/wasm --cors -p 8080
 
 # run on basic http server
 basic-http-server launcher/wasm

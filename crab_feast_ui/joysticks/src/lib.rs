@@ -64,7 +64,7 @@ impl Default for Joystick {
     fn default() -> Self {
         Self {
             thumb_radius_percent: 50.0,
-            thumb_max_distance_percent: 80.0,
+            thumb_max_distance_percent: 100.0,
             enable_elastic_rebound: true,
             elastic_rebound_duration: 0.2,
         }
@@ -206,7 +206,7 @@ fn joystick_idle_system(
                     touch_id,
                     offset: Vec2::ZERO,
                 });
-                let max_distance = computed_node.size().xy().length() * joystick_component.thumb_max_distance_percent / 100.0 / 2.0 / physical_scaler;
+                let max_distance = computed_node.size().xy().length() * joystick_component.thumb_max_distance_percent / (100.0 + joystick_component.thumb_radius_percent) / 2.0 / physical_scaler;
                 match max_distance_query.get_mut(joystick_entity) {
                     Ok(mut max_distance_component) => {
                         max_distance_component.0 = max_distance;

@@ -30,15 +30,15 @@ impl UiPlugin {
             children![
                 (
                     Node{
-                        width: Val::Vw(20.0),
-                        height: Val::Vw(20.0),
+                        width: Val::Vw(10.0),
+                        height: Val::Vw(10.0),
                         display: Display::Flex,
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
                         border_radius: BorderRadius::all(Val::Percent(50.0)),
                         ..Default::default()
                     },
-                    BackgroundColor(Color::hsl(160.0, 0.6, 0.8)),
+                    BackgroundColor(Color::hsla(160.0, 0., 0., 0.)),
                     Joystick {
                         ..Default::default()
                     }
