@@ -1,8 +1,7 @@
+use std::{env, time::Duration};
+
 use bevy::{
-    prelude::*, 
-    window::WindowMode, 
-    winit::WinitSettings,
-    log::{Level, LogPlugin},
+    log::{Level, LogPlugin}, prelude::*, window::{PresentMode, WindowMode}, winit::WinitSettings
 };
 
 use cfg_if::cfg_if;
@@ -25,7 +24,17 @@ pub fn main() {
 
     let mut app = crab_feast::build_app();
 
-    app.add_plugins(
+    app
+    .insert_resource(WinitSettings{
+        focused_mode: bevy::winit::UpdateMode::Reactive { 
+            wait: Duration::from_secs_f32(1.0/120.0), 
+            react_to_device_events: true, 
+            react_to_user_events: true, 
+            react_to_window_events: true 
+        },
+        ..Default::default()
+    })
+    .add_plugins(
         DefaultPlugins
             .set(LogPlugin {
                 // This will show some log events from Bevy to the native logger.
@@ -41,15 +50,12 @@ pub fn main() {
                     // on iOS, gestures must be enabled.
                     // This doesn't work on Android
                     recognize_rotation_gesture: true,
+                    present_mode: PresentMode::Immediate,
                     ..default()
                 }),
                 ..default()
             }),
     )
-
-    // Make the winit loop wait more aggressively when no user input is received
-    // This can help reduce cpu usage on mobile devices
-    .insert_resource(WinitSettings::mobile())
     // 测试日志输出的系统
     .add_systems(Startup, print_info_log);
 
@@ -60,8 +66,7 @@ pub fn main() {
 // 测试用的系统，输出info日志
 fn print_info_log() {
     // 输出不同级别的日志，验证Info级别是否生效
-    info!("=== Bevy Android Info Log ===");
-    info!("应用启动成功，当前平台：Android");
+    info!("=== Bevy Info Log ===");
     info!("自定义数据：{}", 12345);
     warn!("这是警告日志（会同时输出）");
     error!("这是错误日志（会同时输出）");

@@ -138,11 +138,16 @@ fn update_fps(
             }
         }
 
-        let new_fps = if let (Some(first_time), Some(last_time)) = (first_time, last_time) && frame_count > 1 {
-             // 使用实际收集到的帧间隔计算FPS
-            let total_time = last_time - first_time;
-            if total_time > 0.0 {
-                ((frame_count - 1) as f64 / total_time) as f32
+        // 修复语法错误：if let语句的正确写法
+        let new_fps = if let (Some(first_time), Some(last_time)) = (first_time, last_time) {
+            if frame_count > 1 {
+                // 使用实际收集到的帧间隔计算FPS
+                let total_time = last_time - first_time;
+                if total_time > 0.0 {
+                    ((frame_count - 1) as f64 / total_time) as f32
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             }
