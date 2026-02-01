@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::time::Duration;
 
 use bevy::{
     log::{Level, LogPlugin}, prelude::*, window::{PresentMode, WindowMode}, winit::WinitSettings

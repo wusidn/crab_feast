@@ -38,9 +38,10 @@ pub struct JoystickStateChanged {
 
 #[derive(Message)]
 pub enum JoystickEvent {
-    Activate(JoystickActivate),
+    Activate(Entity),
     Changed(JoystickStateChanged),
-    Deactivate(JoystickDeactivate),
+    Deactivate(Entity),
+    ThumbReset(Entity),
 }
 
 #[derive(Component, Default)]
@@ -215,7 +216,7 @@ fn joystick_idle_system(
                         commands.entity(joystick_entity).insert(MaxDistance(max_distance));
                     },
                 }
-                joystick_event_writer.write( JoystickEvent::Activate(JoystickActivate{entity: joystick_entity}));
+                joystick_event_writer.write( JoystickEvent::Activate(joystick_entity));
                 info!("Joystick activated start: {:?} center: {:?}", start_pos, global_transform.affine().translation.xy());
             });
         });
@@ -273,7 +274,7 @@ fn joystick_activate_system(
                 direction: Vec2::ZERO,
                 force: 0.0,
             }));
-            joystick_event_writer.write( JoystickEvent::Deactivate(JoystickDeactivate { entity: joystick_entity }));
+            joystick_event_writer.write( JoystickEvent::Deactivate(joystick_entity));
         }
         else if let Some(pointer_pos) = pointer_pos {
             let direction = (pointer_pos - active_info.center).normalize_or_zero();
@@ -310,6 +311,7 @@ fn joystick_thumb_elastic_rebound_system(
     mut commands: Commands,
     mut joystick_thumb_elastic_rebound_query: Query<(Entity, &mut ElasticRebound, &Children)>,
     mut ui_transform_query: Query<&mut UiTransform>,
+    mut joystick_event_writer: MessageWriter<JoystickEvent>,
     time: Res<Time>,
 ) {
     for (entity, mut elastic_rebound, children) in joystick_thumb_elastic_rebound_query.iter_mut() { 
@@ -329,6 +331,7 @@ fn joystick_thumb_elastic_rebound_system(
         });
         if t >= 1.0 {
             commands.entity(entity).remove::<ElasticRebound>();
+            joystick_event_writer.write(JoystickEvent::ThumbReset(entity));
         }
     }
 }
