@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use bevy::{
     log::{Level, LogPlugin}, prelude::*, window::{PresentMode, WindowMode}, winit::WinitSettings
 };
@@ -26,12 +24,13 @@ pub fn main() {
 
     app
     .insert_resource(WinitSettings{
-        focused_mode: bevy::winit::UpdateMode::Reactive { 
-            wait: Duration::from_secs_f32(1.0/120.0), 
-            react_to_device_events: true, 
-            react_to_user_events: true, 
-            react_to_window_events: true 
-        },
+        // focused_mode: bevy::winit::UpdateMode::Reactive { 
+        //     wait: Duration::from_secs_f32(1.0/120.0), 
+        //     react_to_device_events: true, 
+        //     react_to_user_events: true, 
+        //     react_to_window_events: true 
+        // },
+        focused_mode: bevy::winit::UpdateMode::Continuous,
         ..Default::default()
     })
     .add_plugins(

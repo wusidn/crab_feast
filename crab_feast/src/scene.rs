@@ -1,10 +1,13 @@
 use bevy::prelude::*;
 
+use crate::event::InputState;
+
 pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, Self::setup);
+        app.add_systems(Startup, Self::setup)
+        .add_systems(Update, camera_react_to_input.run_if(resource_exists::<InputState>));
     }
 }
 
@@ -37,7 +40,33 @@ impl ScenePlugin {
         // camera
         commands.spawn((
             Camera3d::default(),
-            Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
+            Transform::from_xyz(-2.5, 4.5, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
         ));
+    }
+}
+
+fn camera_react_to_input(
+    mut camera: Query<(&mut Transform, &mut Camera3d)>,
+    input: Res<InputState>,
+    time: Res<Time>,
+) {
+
+    let move_speed = 3.;
+    if let Some((dir, force)) = input.move_direction {
+        camera.iter_mut().for_each(|(mut transform, _)| {
+            let local_move_direction = Vec3::new(dir.x, 0.0, dir.y);
+            let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
+            let move_distance = world_move_direction * force * move_speed * time.delta_secs();
+            transform.translation += move_distance;
+        });
+    }
+
+    let rotate_speed_angle = 0.1;
+
+    if let Some(rot) = input.rotate_direction {
+        camera.iter_mut().for_each(|(mut transform, _)| {
+            transform.rotate_local_x(rot.x * rotate_speed_angle);
+            transform.rotate_local_y(rot.y * rotate_speed_angle);
+        });
     }
 }

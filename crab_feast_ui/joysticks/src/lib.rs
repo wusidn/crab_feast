@@ -26,12 +26,6 @@ pub struct JoystickActivate {
     pub entity: Entity,
 }
 
-pub struct JoystickStateChanged {
-    pub entity: Entity,
-    pub direction: Vec2,
-    pub force: f32,
-}
-
  pub struct JoystickDeactivate {
     pub entity: Entity,
 }
@@ -39,7 +33,7 @@ pub struct JoystickStateChanged {
 #[derive(Message)]
 pub enum JoystickEvent {
     Activate(Entity),
-    Changed(JoystickStateChanged),
+    Changed(Entity, Vec2, f32),
     Deactivate(Entity),
     ThumbReset(Entity),
 }
@@ -121,7 +115,7 @@ fn joystick_on_add(
                 border_radius: BorderRadius::all(Val::Percent(50.0)),
                 ..Default::default()
             },
-            BackgroundColor(Color::hsl(30.0, 0.6, 0.8)),
+            BackgroundColor(Color::hsl(30.0, 0.3, 0.7)),
             JoystickThumb,
             ChildOf(joystick_entity),
         ));
@@ -269,11 +263,7 @@ fn joystick_activate_system(
                 joystick_state.direction = Vec2::ZERO;
                 joystick_state.force = 0.0;
             }
-            joystick_event_writer.write(JoystickEvent::Changed(JoystickStateChanged {
-                entity: joystick_entity,
-                direction: Vec2::ZERO,
-                force: 0.0,
-            }));
+            joystick_event_writer.write(JoystickEvent::Changed(joystick_entity, Vec2::ZERO, 0.0));
             joystick_event_writer.write( JoystickEvent::Deactivate(joystick_entity));
         }
         else if let Some(pointer_pos) = pointer_pos {
@@ -296,11 +286,7 @@ fn joystick_activate_system(
                 }
                 joystick_state.direction = direction;
                 joystick_state.force = force;
-                joystick_event_writer.write( JoystickEvent::Changed(JoystickStateChanged {
-                    entity: joystick_entity,
-                    direction,
-                    force,
-                }));
+                joystick_event_writer.write( JoystickEvent::Changed(joystick_entity, direction, force));
             }
         }
 
