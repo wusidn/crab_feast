@@ -108,8 +108,7 @@ fn update_fps(
     
     // 每0.1秒更新一次FPS显示
     if current_time - fps_data.last_update_time >= 0.1 {
-        let time_window_ago = current_time - 1.0; // 使用1秒的时间窗口收集数据
-
+        let time_window_ago = current_time - 0.2; // 200ms时间窗口
         let mut first_time: Option<f64> = None;
         let mut last_time: Option<f64> = None;
         let mut frame_count = 0;
@@ -138,7 +137,6 @@ fn update_fps(
             }
         }
 
-        // 修复语法错误：if let语句的正确写法
         let new_fps = if let (Some(first_time), Some(last_time)) = (first_time, last_time) {
             if frame_count > 1 {
                 // 使用实际收集到的帧间隔计算FPS
