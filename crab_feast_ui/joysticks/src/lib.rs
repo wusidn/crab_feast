@@ -1,4 +1,4 @@
-use bevy::{input::mouse::MouseButtonInput, prelude::*, window::PrimaryWindow};
+use bevy::{camera, input::mouse::MouseButtonInput, math::VectorSpace, prelude::*, ui::UiStack, window::PrimaryWindow};
 
 pub struct JoystickPlugin;
 
@@ -143,18 +143,20 @@ fn joystick_on_remove(
 fn joystick_idle_system(
     mut commands: Commands,
     joystick_query: Query<
-        (Entity, &ComputedNode, &UiGlobalTransform, &Joystick),
+        (Entity, &ComputedNode, &UiGlobalTransform, &Joystick, &ComputedUiTargetCamera),
         (
             With<Joystick>,
             Without<JoystickDisabled>,
             Without<Activated>,
         ),
     >,
+    camera_query: Query<&Camera>,
     mut max_distance_query: Query<&mut MaxDistance>,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
     mut joystick_event_writer: MessageWriter<JoystickEvent>,
+    ui_stack: Res<UiStack>, //todo: 检查是否被遮挡
 ) {
 
     if joystick_query.is_empty() {
@@ -166,7 +168,11 @@ fn joystick_idle_system(
     let physical_cursor_pos = window.physical_cursor_position();
     let physical_scaler = window.scale_factor();
     joystick_query.iter()
-        .for_each(|(joystick_entity, computed_node, global_transform, joystick_component)| {
+        .for_each(|(joystick_entity, computed_node, global_transform, joystick_component, target_camera)| {
+            
+            let viewport_offset: Vec2 = target_camera.get().map_or(None, |camera| {
+                camera_query.get(camera).map_or(None, |camera| camera.physical_viewport_rect().map(|rect| rect.min.as_vec2()))
+            }).map_or(Vec2::ZERO, |offset| offset);
 
             let mut start_pos: Option<Vec2> = None;
             let mut touch_id: Option<u64> = None;
@@ -178,7 +184,7 @@ fn joystick_idle_system(
                         if mouse_button_input.button == MouseButton::Left
                             && mouse_button_input.state.is_pressed()
                         {
-                            if computed_node.contains_point(*global_transform, physical_cursor_pos) {
+                            if computed_node.contains_point(*global_transform, physical_cursor_pos - viewport_offset) {
                                 start_pos = Some(cursor_pos);
                             }
                         }
@@ -188,7 +194,7 @@ fn joystick_idle_system(
             // Check touches
             for touch in touches.iter_just_pressed() {
                 let touch_pos = touch.start_position();
-                if computed_node.contains_point(*global_transform, touch_pos * physical_scaler) {
+                if computed_node.contains_point(*global_transform, touch_pos * physical_scaler - viewport_offset) {
                     start_pos = Some(touch_pos);
                     touch_id = Some(touch.id());
                     info!("window physical_size: {:?} size: {:?}", windows.single().unwrap().physical_size(), windows.single().unwrap().size());
@@ -196,6 +202,9 @@ fn joystick_idle_system(
             }
 
             start_pos.map(|start_pos|{
+
+                // check z-index todo iterator ui task
+
                 commands.entity(joystick_entity).insert(Activated{
                     center: global_transform.translation.xy() / physical_scaler,
                     touch_id,
@@ -218,13 +227,14 @@ fn joystick_idle_system(
 
 fn joystick_activate_system(
     mut commands: Commands,
-    mut joystick_activate_query: Query<(Entity, &mut Activated, &UiGlobalTransform, &MaxDistance, &Children)>,
+    mut joystick_activate_query: Query<(Entity, &mut Activated, &UiGlobalTransform, &MaxDistance, &Children, &ComputedUiTargetCamera)>,
     mut joystick_state_query: Query<&mut JoystickState>,
     mut ui_transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
     mut mouse_button_input_reader: MessageReader<MouseButtonInput>,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut joystick_event_writer: MessageWriter<JoystickEvent>,
+    camera_query: Query<&Camera>,
 ) {
 
     if joystick_activate_query.is_empty() {
@@ -234,20 +244,25 @@ fn joystick_activate_system(
     let window = windows.single().unwrap();
     let cursor_pos = window.cursor_position();
 
-    for (joystick_entity, mut active_info, .., max_distance, children) in joystick_activate_query.iter_mut() {
+    for (joystick_entity, mut active_info, .., max_distance, children, target_camera) in joystick_activate_query.iter_mut() {
         let mut pointer_pos: Option<Vec2> = None;
         let mut deactivated = false;
+
+        let logical_viewport_offset: Vec2 = target_camera.get().map_or(None, |camera| {
+                    camera_query.get(camera).map_or(None, |camera| camera.logical_viewport_rect().map(|rect| rect.min))
+                }).map_or(Vec2::ZERO, |offset| offset);
+
         match active_info.touch_id {
             Some(touch_id) => {
                 match touches.iter().find(|touch| touch.id() == touch_id) {
                     Some(touch) => {
-                        pointer_pos = Some(touch.position());
+                        pointer_pos = Some(touch.position() - logical_viewport_offset);
                     },
                     None => {deactivated = true;},
                 }
             },
             None => {
-                pointer_pos = cursor_pos;
+                pointer_pos = cursor_pos.map(|pos| pos - logical_viewport_offset);
                 // 鼠标释放检查
                 deactivated = mouse_button_input_reader.read()
                     .any(|input| input.button == MouseButton::Left && !input.state.is_pressed());
@@ -267,12 +282,13 @@ fn joystick_activate_system(
             joystick_event_writer.write( JoystickEvent::Deactivate(joystick_entity));
         }
         else if let Some(pointer_pos) = pointer_pos {
-            let direction = (pointer_pos - active_info.center).normalize_or_zero();
-            let distance = (pointer_pos - active_info.center).length().min(max_distance.0);
-            let offset = direction * distance;
-            let force = match distance {
+            let distance = pointer_pos - active_info.center;
+            let direction = distance.normalize_or_zero();
+            let capped_distance = distance.length().min(max_distance.0);
+            let offset = direction * capped_distance;
+            let force = match capped_distance {
                 0.0 => 0.0,
-                _ => distance / max_distance.0,
+                _ => capped_distance / max_distance.0,
             };
             active_info.offset = offset;
             children.iter().for_each(|child| {

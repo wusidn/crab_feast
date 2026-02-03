@@ -3,7 +3,7 @@ use std::any::TypeId;
 use bevy::{animation::{AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId}, prelude::*};
 use crab_feast_ui_joysticks::{Joystick, JoystickEvent, JoystickPlugin};
 
-use crate::event::InputState;
+use crate::event::MoveInputState;
 
 pub struct UiPlugin;
 
@@ -159,10 +159,7 @@ fn move_control_activate(
         animation_player.play(joystick_fade_animate_player.fade_in_index);
     }
 
-    commands.insert_resource(InputState {
-        move_direction: None,
-        rotate_direction: None,
-    });
+    commands.insert_resource(MoveInputState(Vec2::ZERO, 0.0));
 }
 
 fn move_control_deactivate(
@@ -174,22 +171,20 @@ fn move_control_deactivate(
         // 播放淡出动画
         animation_player.play(joystick_fade_animate_player.fade_out_index);
     }
-    commands.remove_resource::<InputState>();
+    commands.remove_resource::<MoveInputState>();
 }
 
 fn move_control_update(
     commands: &mut Commands,
-    mut input_state: Option<&mut ResMut<InputState>>,
+    mut input_state: Option<&mut ResMut<MoveInputState>>,
     direction: &Vec2,
     force: &f32,
 ) {
     if let Some(input_state) = input_state.as_mut() {
-        input_state.move_direction = Some((*direction, *force));
+        input_state.0 = *direction;
+        input_state.1 = *force;
     } else {
-        commands.insert_resource(InputState {
-            move_direction: Some((*direction, *force)),
-            rotate_direction: None,
-        });
+        commands.insert_resource(MoveInputState(*direction, *force));
     }
 }
 
@@ -198,7 +193,7 @@ fn on_joystick_event(
     mut event_reader: MessageReader<JoystickEvent>,
     mut joystick_fade_animate_player_query: Query<(&mut AnimationPlayer, &JoystickFadeAnimatePlayer)>,
     move_control_query: Query<Entity, With<MoveControl>>,
-    mut input_state: Option<ResMut<InputState>>,
+    mut input_state: Option<ResMut<MoveInputState>>,
 ) {
     for event in event_reader.read() {
         match event {
@@ -212,7 +207,7 @@ fn on_joystick_event(
                 println!("Joystick state changed: {:?}", direction);
 
                 if let Ok(_) = move_control_query.get(*entity) {
-                    move_control_update(&mut commands, input_state.as_mut(), direction, force);
+                    move_control_update(&mut commands, input_state.as_mut(), &direction, &force);
                 }
             }
             JoystickEvent::ThumbReset(entity) => {
