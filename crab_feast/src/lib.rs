@@ -2,8 +2,8 @@
 use bevy::prelude::*;
 
 mod scene;
-mod ui;
 mod event;
+mod ui;
 pub fn build_app() -> App {
 	let mut app = App::new();
 	app.add_plugins(scene::ScenePlugin)

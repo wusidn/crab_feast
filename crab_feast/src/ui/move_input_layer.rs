@@ -1,20 +1,11 @@
 use std::any::TypeId;
 
 use bevy::{animation::{AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId}, prelude::*};
-use crab_feast_ui_joysticks::{Joystick, JoystickEvent, JoystickPlugin};
+use crab_feast_ui_joysticks::{Joystick, JoystickPlugin};
 
 use crate::event::MoveInputState;
 
-pub struct UiPlugin;
-
-impl Plugin for UiPlugin {
-    fn build(&self, app: &mut App) {
-        app
-            .add_plugins(JoystickPlugin)
-            .add_systems(Startup, Self::setup)
-            .add_systems(Update, on_joystick_event);
-    }
-}
+pub struct JoystickMoveInputPlugin;
 
 #[derive(Clone)]
 struct BackgroundColorProperty;
@@ -31,25 +22,21 @@ struct MoveControl;
 #[derive(Component)]
 struct RotateControl;
 
-impl UiPlugin {
+
+impl Plugin for JoystickMoveInputPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .add_plugins(JoystickPlugin)
+            .add_systems(Startup, Self::setup);
+    }
+}
+
+impl JoystickMoveInputPlugin {
     fn setup(
         mut commands: Commands,
         mut animation_graphs: ResMut<Assets<AnimationGraph>>,
         mut animation_clips: ResMut<Assets<AnimationClip>>,
     ) {
-
-        commands.spawn((
-            Node{
-                width: Val::Vw(100.0),
-                height: Val::Vh(100.0),
-                left: Val::Vw(0.0),
-                ..Default::default()
-            },
-            // BackgroundColor(Color::hsla(0.0, 0.6, 0.8, 0.5)),
-            Interaction::default(),
-            RotateControl,
-        ));
-
         let joystick_idle_color = Color::hsla(160.0, 0.5, 0.6, 0.03);
         let joystick_active_color = Color::hsla(160.0, 0.5, 0.7, 0.08);
 
@@ -121,6 +108,7 @@ impl UiPlugin {
                 align_items: AlignItems::FlexEnd,
                 ..Default::default()
             },
+            ZIndex(2),
             children![
                 (
                     Node{
@@ -188,38 +176,38 @@ fn move_control_update(
     }
 }
 
-fn on_joystick_event(
-    mut commands: Commands,
-    mut event_reader: MessageReader<JoystickEvent>,
-    mut joystick_fade_animate_player_query: Query<(&mut AnimationPlayer, &JoystickFadeAnimatePlayer)>,
-    move_control_query: Query<Entity, With<MoveControl>>,
-    mut input_state: Option<ResMut<MoveInputState>>,
-) {
-    for event in event_reader.read() {
-        match event {
-            JoystickEvent::Activate(entity) => {
-                println!("Joystick activated: {:?}", entity);
-                if let Ok(_) = move_control_query.get(*entity) {
-                    move_control_activate(&mut commands, joystick_fade_animate_player_query.iter_mut().next());
-                }
-            }
-            JoystickEvent::Changed(entity, direction, force) => {
-                println!("Joystick state changed: {:?}", direction);
+// fn on_joystick_event(
+//     mut commands: Commands,
+//     mut event_reader: MessageReader<JoystickEvent>,
+//     mut joystick_fade_animate_player_query: Query<(&mut AnimationPlayer, &JoystickFadeAnimatePlayer)>,
+//     move_control_query: Query<Entity, With<MoveControl>>,
+//     mut input_state: Option<ResMut<MoveInputState>>,
+// ) {
+//     for event in event_reader.read() {
+//         match event {
+//             JoystickEvent::Activate(entity) => {
+//                 println!("Joystick activated: {:?}", entity);
+//                 if let Ok(_) = move_control_query.get(*entity) {
+//                     move_control_activate(&mut commands, joystick_fade_animate_player_query.iter_mut().next());
+//                 }
+//             }
+//             JoystickEvent::Changed(entity, direction, force) => {
+//                 println!("Joystick state changed: {:?}", direction);
 
-                if let Ok(_) = move_control_query.get(*entity) {
-                    move_control_update(&mut commands, input_state.as_mut(), &direction, &force);
-                }
-            }
-            JoystickEvent::ThumbReset(entity) => {
-                println!("Joystick thumb reset: {:?}", entity);
-                if let Ok(_) = move_control_query.get(*entity) {
-                    move_control_deactivate(&mut commands, joystick_fade_animate_player_query.iter_mut().next());
-                }
-            }
-            _ => {}
-        }
-    }
-}
+//                 if let Ok(_) = move_control_query.get(*entity) {
+//                     move_control_update(&mut commands, input_state.as_mut(), &direction, &force);
+//                 }
+//             }
+//             JoystickEvent::ThumbReset(entity) => {
+//                 println!("Joystick thumb reset: {:?}", entity);
+//                 if let Ok(_) = move_control_query.get(*entity) {
+//                     move_control_deactivate(&mut commands, joystick_fade_animate_player_query.iter_mut().next());
+//                 }
+//             }
+//             _ => {}
+//         }
+//     }
+// }
 
 impl AnimatableProperty for BackgroundColorProperty {
     type Property = Srgba;

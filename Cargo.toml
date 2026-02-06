@@ -1,11 +1,16 @@
 [workspace]
 members = [
+    # Launchers
     "launcher/mobile",
     "launcher/pc",
     "launcher/wasm",
+    # Game
     "crab_feast",
-    "crab_feast_library"
-, "crab_feast_ui/fps"]
+    # Game Library
+    "crab_feast_library",
+    # UI Components
+    "crab_feast_ui/joysticks",
+    "crab_feast_ui/fps"]
 resolver = "2"
 default-members = ["launcher/pc"]
 
