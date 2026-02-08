@@ -67,20 +67,21 @@ fn auto_camera_react_to_input(
     time: Res<Time>,
 ) {
 
-    let move_speed = 3.;
+    let move_speed = 0.3;
     camera.iter_mut().for_each(|(mut transform, _)| {
-        let local_move_direction = Vec3::new(input.0.x, 0.0, input.0.y);
+        let local_move_direction = Vec3::new(input.direction.x, 0.0, input.direction.y);
         let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
-        let move_distance = world_move_direction * input.1 * move_speed * time.delta_secs();
+        let move_distance = world_move_direction * input.force * move_speed * time.delta_secs();
         transform.translation += move_distance;
     });
+
 }
 
 fn auto_camera_rotate(
     trigger: On<RotateInput>,
     mut camera: Query<(&mut Transform, &mut Camera3d), With<AutoCamera>>,
 ) {
-    let rotate_speed = 0.002;
+    let rotate_speed = 0.001;
     camera.iter_mut().for_each(|(mut transform, _)| {
         // 计算绕世界Y轴的旋转（yaw）
         let yaw = Quat::from_rotation_y(-trigger.event().0.x * rotate_speed);

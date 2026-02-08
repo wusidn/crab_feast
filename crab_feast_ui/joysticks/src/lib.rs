@@ -17,11 +17,11 @@ pub struct JoystickState {
     pub force: f32,
 }
 
-#[derive(Component)]
-struct Activated {
-    pointer: PointerId,
-    center_position: Vec2,
-    max_distance: f32,
+#[derive(Component, Debug, Clone, Reflect)]
+pub struct Activated {
+    pub pointer: PointerId,
+    pub center_position: Vec2,
+    pub max_distance: f32,
 }
 
 #[derive(Component)]
@@ -35,6 +35,20 @@ struct ElasticRebound {
     offset: Vec2,
     duration: f32,
     time: f32,
+}
+
+#[derive(Reflect, Clone, Debug, PartialEq)]
+pub enum JoystickInteraction {
+    Activated(PointerId),
+    Moved(Vec2, f32),
+    Deactivated,
+    Rebound,
+}
+
+#[derive(Message, EntityEvent, Clone, PartialEq, Debug, Reflect)]
+pub struct JoystickEvent {
+    pub entity: Entity,
+    pub event: JoystickInteraction,
 }
 
 impl Default for Joystick {
@@ -173,11 +187,15 @@ fn joystick_on_press(
         joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query);
     }
 
-    // todo: emit event
+    commands.trigger(JoystickEvent {
+        entity: joystick_entity,
+        event: JoystickInteraction::Activated(event.pointer_id),
+    });
 }
 
 fn joystick_on_drag(
     event: On<Pointer<Drag>>,
+    mut commands: Commands,
     mut joystick_state_query: Query<(&mut JoystickState, &Activated, &Children)>,
     mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
 ) {
@@ -192,6 +210,11 @@ fn joystick_on_drag(
 
         // 更新 Thumb 位置
         joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query);
+
+        commands.trigger(JoystickEvent {
+            entity: joystick_entity,
+            event: JoystickInteraction::Moved(joystick_state.direction, joystick_state.force),
+        });
     }
 }
 
@@ -203,6 +226,10 @@ fn joystick_on_release(
     mut deactivated_entities: Local<Vec<Entity>>,
     mut joystick_state_query: Query<&mut JoystickState>,
 ) {
+
+    if joystick_activated_query.iter().count() == 0 {
+        return;
+    }
     
     mouse_button_input_reader.read().for_each(|event| {
         if event.button != MouseButton::Left || event.state != ButtonState::Released {
@@ -246,6 +273,10 @@ fn joystick_on_release(
             joystick_state.direction = Vec2::ZERO;
             joystick_state.force = 0.0;
         }
+        commands.trigger(JoystickEvent {
+            entity: *entity,
+            event: JoystickInteraction::Deactivated,
+        });
     });
     deactivated_entities.clear();
 
@@ -289,7 +320,10 @@ fn joystick_thumb_elastic_rebound_system(
         });
         if t >= 1.0 {
             commands.entity(entity).remove::<ElasticRebound>();
-            // joystick_event_writer.write(JoystickEvent::ThumbReset(entity));
+            commands.trigger(JoystickEvent {
+                entity: entity,
+                event: JoystickInteraction::Rebound,
+            });
         }
     }
 }
