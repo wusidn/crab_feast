@@ -46,9 +46,10 @@ pub fn main() {
                     title: "crab_feast".to_string(),
                     resizable: false,
                     mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
-                    // on iOS, gestures must be enabled.
-                    // This doesn't work on Android
-                    recognize_rotation_gesture: true,
+                    // 显式禁用不需要的系统手势（缩放、旋转、滑动、点击、拖拽）目前仅支持旋转
+                    recognize_rotation_gesture: false,
+                    // 阻止iOS系统处理默认的触摸事件，确保游戏获得完整的触摸控制权
+                    prevent_default_event_handling: true,
                     present_mode: PresentMode::Immediate,
                     ..default()
                 }),

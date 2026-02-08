@@ -1,3 +1,3 @@
 pushd launcher/mobile/ios
-make
+make xcodebuild-simulator
 popd
