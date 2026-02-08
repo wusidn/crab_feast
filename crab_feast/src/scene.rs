@@ -73,14 +73,25 @@ fn auto_camera_rotate(
     trigger: On<RotateInput>,
     mut camera: Query<(&mut Transform, &mut Camera3d), With<AutoCamera>>,
 ) {
-    let rotate_speed = 0.02;
+    let rotate_speed = 10.0;
     camera.iter_mut().for_each(|(mut transform, _)| {
-        // 计算绕世界Y轴的旋转（yaw）
-        let yaw = Quat::from_rotation_y(-trigger.event().0.x * rotate_speed);
-        // 计算绕局部X轴的旋转（pitch）
-        let pitch = Quat::from_rotation_x(-trigger.event().0.y * rotate_speed);
+        // 获取当前向上向量（通常是Y轴）
+        let current_up = transform.rotation.mul_vec3(Vec3::Y);
         
-        // 应用旋转到当前旋转上
-        transform.rotation = (transform.rotation * yaw * pitch).normalize();
+        // 计算绕世界Y轴的旋转（yaw），保持向上向量不变
+        let yaw = Quat::from_axis_angle(current_up, -trigger.event().0.x * rotate_speed);
+        
+        // 计算绕本地X轴的旋转（pitch）
+        let current_right = transform.rotation.mul_vec3(Vec3::X);
+        let pitch = Quat::from_axis_angle(current_right, -trigger.event().0.y * rotate_speed);
+        
+        // 组合旋转：先应用yaw，再应用pitch
+        let rotation_change = yaw * pitch;
+        
+        // 更新相机旋转
+        transform.rotation = rotation_change * transform.rotation;
+        
+        // 确保四元数标准化
+        transform.rotation = transform.rotation.normalize();
     });
 }

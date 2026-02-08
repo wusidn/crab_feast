@@ -112,7 +112,7 @@ impl InputPlugin {
                     ..Default::default()
                 },
             )
-            .observe(on_drag)
+            .observe(on_rotate_plane_drag)
             .id();
 
         commands.spawn((
@@ -216,13 +216,28 @@ impl AnimatableProperty for BackgroundColorProperty {
     }
 }
 
-fn on_drag(
+fn on_rotate_plane_drag(
     event: On<Pointer<Drag>>, 
     mut commands: Commands,
     input_state: ResMut<InputState>,
+    target_camera_query: Query<&ComputedUiTargetCamera>,
+    camera_query: Query<&Camera>,
 ) {
     if input_state.rotate_ignore_pointers.contains(&event.pointer_id) {
         return;
     }
-    commands.trigger(RotateInput(event.delta));
+
+    let scaled_delta = target_camera_query
+        .get(event.entity)
+        .ok()
+        .and_then(|target| target.get())
+        .and_then(|camera_entity| camera_query.get(camera_entity).ok())
+        .map(|camera| {
+            camera.physical_viewport_size().map(|viewport_size| {
+                event.delta / viewport_size.x as f32
+            }).unwrap_or(event.delta)
+        });
+    if let Some(delta) = scaled_delta {
+        commands.trigger(RotateInput(delta));
+    }
 }
