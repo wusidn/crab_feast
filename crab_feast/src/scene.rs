@@ -1,4 +1,4 @@
-use bevy::{camera::Viewport, prelude::*};
+use bevy::prelude::*;
 
 use crate::event::{MoveInputState, RotateInput};
 pub struct ScenePlugin;
@@ -19,10 +19,7 @@ impl ScenePlugin {
         mut commands: Commands,
         mut meshes: ResMut<Assets<Mesh>>,
         mut materials: ResMut<Assets<StandardMaterial>>,
-        window: Single<&Window>,
     ) {
-
-        let window_size = window.resolution.physical_size().as_vec2();
 
         // circular base
         commands.spawn((
@@ -49,14 +46,6 @@ impl ScenePlugin {
             Camera3d::default(),
             Transform::from_xyz(-2.5, 4.5, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
             AutoCamera,
-            Camera {
-                viewport: Some(Viewport {
-                    physical_position: (window_size * 0.125).as_uvec2(),
-                    physical_size: (window_size * 0.75).as_uvec2(),
-                ..default()
-            }),
-            ..Default::default()
-            }
         ));
     }
 }
@@ -66,6 +55,9 @@ fn auto_camera_react_to_input(
     input: Res<MoveInputState>,
     time: Res<Time>,
 ) {
+    if !input.active {
+        return;
+    }
 
     let move_speed = 0.3;
     camera.iter_mut().for_each(|(mut transform, _)| {
@@ -81,7 +73,7 @@ fn auto_camera_rotate(
     trigger: On<RotateInput>,
     mut camera: Query<(&mut Transform, &mut Camera3d), With<AutoCamera>>,
 ) {
-    let rotate_speed = 0.001;
+    let rotate_speed = 0.02;
     camera.iter_mut().for_each(|(mut transform, _)| {
         // 计算绕世界Y轴的旋转（yaw）
         let yaw = Quat::from_rotation_y(-trigger.event().0.x * rotate_speed);

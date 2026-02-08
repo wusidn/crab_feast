@@ -1,18 +1,18 @@
 use std::any::TypeId;
 
 use bevy::{
-    animation::{AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId}, prelude::*
+    animation::{AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId}, picking::pointer::PointerId, prelude::*
 };
+use bevy_rapier2d::parry::utils::hashset::HashSet;
 use crab_feast_ui_joysticks::{Joystick, JoystickEvent, JoystickInteraction, JoystickPlugin};
 
 use crate::event::{MoveInputState, RotateInput};
 
 pub struct InputPlugin;
 
-#[derive(Resource, Debug, Reflect)]
+#[derive(Resource, Debug, Default)]
 pub struct InputState {
-    pub rotate_input_enabled: bool,
-    pub move_input_enabled: bool,
+    rotate_ignore_pointers: HashSet<PointerId>,
 }
 
 #[derive(Clone)]
@@ -22,15 +22,6 @@ struct BackgroundColorProperty;
 struct JoystickFadeAnimatePlayer {
     fade_in_index: AnimationNodeIndex,
     fade_out_index: AnimationNodeIndex,
-}
-
-impl Default for InputState {
-    fn default() -> Self {
-        Self {
-            rotate_input_enabled: true,
-            move_input_enabled: true,
-        }
-    }
 }
 
 impl Plugin for InputPlugin {
@@ -156,9 +147,10 @@ fn on_joystick_event(
     mut input_state: ResMut<InputState>,
 ) {
     match joystick_event.event {
-        JoystickInteraction::Activated(_) => {
-            println!("Joystick activated: {:?}", joystick_event.entity);
-            input_state.rotate_input_enabled = false;
+        JoystickInteraction::Activated(pointer_id) => {
+            // println!("Joystick activated: {:?}", joystick_event.entity);
+            input_state.rotate_ignore_pointers.insert(pointer_id);
+            move_input_state.active = true;
 
             joystick_fade_animate_player_query.iter_mut().for_each(|(mut animation_player, joystick_fade_animate_player)| {
                 animation_player.stop_all();
@@ -167,18 +159,19 @@ fn on_joystick_event(
             });
         }
         JoystickInteraction::Moved(direction, force) => {
-            println!("Joystick moved: {:?}", joystick_event.entity);
+            // println!("Joystick moved: {:?}", joystick_event.entity);
             move_input_state.direction = direction;
             move_input_state.force = force;
         }
-        JoystickInteraction::Deactivated => {
-            println!("Joystick deactivated: {:?}", joystick_event.entity);
+        JoystickInteraction::Deactivated(pointer_id) => {
+            // println!("Joystick deactivated: {:?}", joystick_event.entity);
             move_input_state.direction = Vec2::ZERO;
             move_input_state.force = 0.0;
-            input_state.rotate_input_enabled = true;
+            input_state.rotate_ignore_pointers.remove(&pointer_id);
+            move_input_state.active = false;
         }
         JoystickInteraction::Rebound => {
-            println!("Joystick rebound: {:?}", joystick_event.entity);
+            // println!("Joystick rebound: {:?}", joystick_event.entity);
 
             joystick_fade_animate_player_query.iter_mut().for_each(|(mut animation_player, joystick_fade_animate_player)| {
                 animation_player.stop_all();
@@ -228,7 +221,7 @@ fn on_drag(
     mut commands: Commands,
     input_state: ResMut<InputState>,
 ) {
-    if !input_state.rotate_input_enabled {
+    if input_state.rotate_ignore_pointers.contains(&event.pointer_id) {
         return;
     }
     commands.trigger(RotateInput(event.delta));

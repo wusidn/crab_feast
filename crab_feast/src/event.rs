@@ -5,6 +5,7 @@ use bevy::{ecs::{event::Event, resource::Resource}, math::Vec2};
 pub struct MoveInputState {
     pub direction: Vec2,
     pub force: f32,
+    pub active: bool,
 }
 
 

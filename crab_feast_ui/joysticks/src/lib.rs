@@ -41,7 +41,7 @@ struct ElasticRebound {
 pub enum JoystickInteraction {
     Activated(PointerId),
     Moved(Vec2, f32),
-    Deactivated,
+    Deactivated(PointerId),
     Rebound,
 }
 
@@ -261,22 +261,24 @@ fn joystick_on_release(
     });
 
     deactivated_entities.iter().for_each(|entity| {
-        commands.entity(*entity).remove::<Activated>();
-        if let Ok(mut joystick_state) = joystick_state_query.get_mut(*entity) {
-            commands.entity(*entity)
-            .remove::<Activated>()
-            .insert(ElasticRebound{
-                offset: joystick_state.direction * joystick_state.force,
-                duration: 0.1,
-                ..Default::default()
+        if let Ok((_, activated)) = joystick_activated_query.get(*entity) {
+            commands.entity(*entity).remove::<Activated>();
+            if let Ok(mut joystick_state) = joystick_state_query.get_mut(*entity) {
+                commands.entity(*entity)
+                .remove::<Activated>()
+                .insert(ElasticRebound{
+                    offset: joystick_state.direction * joystick_state.force,
+                    duration: 0.1,
+                    ..Default::default()
+                });
+                joystick_state.direction = Vec2::ZERO;
+                joystick_state.force = 0.0;
+            }
+            commands.trigger(JoystickEvent {
+                entity: *entity,
+                event: JoystickInteraction::Deactivated(activated.pointer),
             });
-            joystick_state.direction = Vec2::ZERO;
-            joystick_state.force = 0.0;
         }
-        commands.trigger(JoystickEvent {
-            entity: *entity,
-            event: JoystickInteraction::Deactivated,
-        });
     });
     deactivated_entities.clear();
 
