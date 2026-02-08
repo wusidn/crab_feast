@@ -89,36 +89,6 @@ fn auto_camera_rotate(
         let pitch = Quat::from_rotation_x(-trigger.event().0.y * rotate_speed);
         
         // 应用旋转到当前旋转上
-        let new_rotation = yaw * transform.rotation * pitch;
-        
-        // 四元数投影法锁定z轴（Swing-Twist分解）
-        // 将四元数分解为：q = swing * twist
-        // 其中twist是绕局部z轴的旋转，swing是垂直于z轴的旋转
-        // 我们移除twist分量来锁定z轴
-        
-        // 获取旋转后的局部z轴方向（即相机的前向向量的反方向）
-        let twist_axis = Vec3::Z;
-        
-        // 计算twist分量：将四元数的向量部分投影到twist轴上
-        let q_vec = new_rotation.xyz();
-        let projection = q_vec.dot(twist_axis);
-        
-        // 构造twist四元数：(projection * twist_axis, w)
-        let twist = Quat::from_xyzw(
-            twist_axis.x * projection,
-            twist_axis.y * projection,
-            twist_axis.z * projection,
-            new_rotation.w,
-        );
-        
-        // 归一化twist四元数
-        let twist_normalized = twist.normalize();
-        
-        // 计算swing分量：swing = q * twist^(-1)
-        // swing保留了所有非z轴的旋转
-        let swing = new_rotation * twist_normalized.inverse();
-        
-        // 应用swing旋转（已移除z轴旋转）
-        transform.rotation = swing.normalize();
+        transform.rotation = (transform.rotation * yaw * pitch).normalize();
     });
 }
