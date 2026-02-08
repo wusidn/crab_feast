@@ -9,7 +9,9 @@ struct AutoCamera;
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, Self::setup)
-        .add_systems(Update, auto_camera_react_to_input.run_if(resource_exists::<MoveInputState>))
+        .add_systems(Update, auto_camera_react_to_input.run_if(|input: Res<MoveInputState>| {
+            matches!(input.as_ref(), MoveInputState::Activated { .. })
+        }))
         .add_observer(auto_camera_rotate);
     }
 }
@@ -55,18 +57,18 @@ fn auto_camera_react_to_input(
     input: Res<MoveInputState>,
     time: Res<Time>,
 ) {
-    if !input.active {
-        return;
-    }
-
     let move_speed = 0.3;
-    camera.iter_mut().for_each(|(mut transform, _)| {
-        let local_move_direction = Vec3::new(input.direction.x, 0.0, input.direction.y);
-        let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
-        let move_distance = world_move_direction * input.force * move_speed * time.delta_secs();
-        transform.translation += move_distance;
-    });
-
+    match input.as_ref() {
+        MoveInputState::Idle => return,
+        MoveInputState::Activated { direction, force } => {
+            camera.iter_mut().for_each(|(mut transform, _)| {
+                let local_move_direction = Vec3::new(direction.x, 0.0, direction.y);
+                let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
+                let move_distance = world_move_direction * *force * move_speed * time.delta_secs();
+                transform.translation += move_distance;
+            });
+        }
+    }
 }
 
 fn auto_camera_rotate(

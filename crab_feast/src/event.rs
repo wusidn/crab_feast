@@ -1,11 +1,14 @@
-use bevy::{ecs::{event::Event, resource::Resource}, math::Vec2};
+use bevy::{ecs::{event::Event, resource::Resource}, math::Vec2, reflect::Reflect};
 
 
-#[derive(Resource, Default)]
-pub struct MoveInputState {
-    pub direction: Vec2,
-    pub force: f32,
-    pub active: bool,
+#[derive(Resource, Debug, Clone, Copy, Reflect, Default)]
+pub enum MoveInputState {
+    #[default]
+    Idle,
+    Activated {
+        direction: Vec2,
+        force: f32,
+    }
 }
 
 

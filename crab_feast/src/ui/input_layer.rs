@@ -150,7 +150,10 @@ fn on_joystick_event(
         JoystickInteraction::Activated(pointer_id) => {
             // println!("Joystick activated: {:?}", joystick_event.entity);
             input_state.rotate_ignore_pointers.insert(pointer_id);
-            move_input_state.active = true;
+            *move_input_state = MoveInputState::Activated {
+                direction: Vec2::ZERO,
+                force: 0.0,
+            };
 
             joystick_fade_animate_player_query.iter_mut().for_each(|(mut animation_player, joystick_fade_animate_player)| {
                 animation_player.stop_all();
@@ -158,17 +161,17 @@ fn on_joystick_event(
                 animation_player.play(joystick_fade_animate_player.fade_in_index);
             });
         }
-        JoystickInteraction::Moved(direction, force) => {
+        JoystickInteraction::Moved(new_direction, new_force) => {
             // println!("Joystick moved: {:?}", joystick_event.entity);
-            move_input_state.direction = direction;
-            move_input_state.force = force;
+            if let MoveInputState::Activated { direction, force} = move_input_state.as_mut() {
+                *direction = new_direction;
+                *force = new_force;
+            }
         }
         JoystickInteraction::Deactivated(pointer_id) => {
             // println!("Joystick deactivated: {:?}", joystick_event.entity);
-            move_input_state.direction = Vec2::ZERO;
-            move_input_state.force = 0.0;
+            *move_input_state = MoveInputState::Idle;
             input_state.rotate_ignore_pointers.remove(&pointer_id);
-            move_input_state.active = false;
         }
         JoystickInteraction::Rebound => {
             // println!("Joystick rebound: {:?}", joystick_event.entity);
