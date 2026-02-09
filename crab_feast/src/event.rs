@@ -2,7 +2,7 @@ use bevy::{ecs::{event::Event, resource::Resource}, math::Vec2, reflect::Reflect
 
 
 #[derive(Resource, Debug, Clone, Copy, Reflect, Default)]
-pub enum MoveInputState {
+pub enum MovementInput {
     #[default]
     Idle,
     Activated {
@@ -13,4 +13,4 @@ pub enum MoveInputState {
 
 
 #[derive(Event)]
-pub struct RotateInput(pub Vec2);
+pub struct LookInput(pub Vec2);

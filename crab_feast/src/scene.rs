@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::event::{MoveInputState, RotateInput};
+use crate::event::{MovementInput, LookInput};
 pub struct ScenePlugin;
 
 #[derive(Component)]
@@ -15,8 +15,8 @@ impl Plugin for ScenePlugin {
             RapierDebugRenderPlugin::default(),
         ))
         .add_systems(Startup, Self::setup)
-        .add_systems(Update, camera_move_system.run_if(|input: Res<MoveInputState>| {
-            matches!(input.as_ref(), MoveInputState::Activated { .. })
+        .add_systems(Update, camera_move_system.run_if(|input: Res<MovementInput>| {
+            matches!(input.as_ref(), MovementInput::Activated { .. })
         }))
         .add_observer(camera_rotate_system);
     }
@@ -69,12 +69,12 @@ impl ScenePlugin {
 
 fn camera_move_system(
     mut camera: Query<(&mut Transform, &mut Camera3d), With<AutoCamera>>,
-    input: Res<MoveInputState>,
+    input: Res<MovementInput>,
     time: Res<Time>,
 ) {
     let move_speed = 30.0;
 
-    if let MoveInputState::Activated { direction, force } = input.as_ref() {
+    if let MovementInput::Activated { direction, force } = input.as_ref() {
         camera.iter_mut().for_each(|(mut transform, _)| {
                 let local_move_direction = Vec3::new(direction.x, 0.0, direction.y);
                 let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
@@ -85,7 +85,7 @@ fn camera_move_system(
 }
 
 fn camera_rotate_system(
-    trigger: On<RotateInput>,
+    trigger: On<LookInput>,
     mut camera: Query<(&mut Transform, &mut Camera3d), With<AutoCamera>>,
 ) {
     let rotate_speed = 10.0;

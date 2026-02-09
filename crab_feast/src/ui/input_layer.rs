@@ -13,7 +13,7 @@ use crab_feast_ui_joysticks::{
 };
 
 use crate::{
-    event::{MoveInputState, RotateInput},
+    event::{MovementInput, LookInput},
     utils::is_non_mobile,
 };
 
@@ -40,7 +40,7 @@ impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(JoystickPlugin)
             .init_resource::<InputState>()
-            .init_resource::<MoveInputState>()
+            .init_resource::<MovementInput>()
             .add_systems(Startup, Self::setup)
             .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
 
@@ -162,14 +162,14 @@ fn on_joystick_event(
         &mut AnimationPlayer,
         &JoystickFadeAnimatePlayer,
     )>,
-    mut move_input_state: ResMut<MoveInputState>,
+    mut move_input_state: ResMut<MovementInput>,
     mut input_state: ResMut<InputState>,
 ) {
     match joystick_event.event {
         JoystickInteraction::Activated(pointer_id) => {
             // println!("Joystick activated: {:?}", joystick_event.entity);
             input_state.rotate_ignore_pointers.insert(pointer_id);
-            *move_input_state = MoveInputState::Activated {
+            *move_input_state = MovementInput::Activated {
                 direction: Vec2::ZERO,
                 force: 0.0,
             };
@@ -184,14 +184,14 @@ fn on_joystick_event(
         }
         JoystickInteraction::Moved(new_direction, new_force) => {
             // println!("Joystick moved: {:?}", joystick_event.entity);
-            if let MoveInputState::Activated { direction, force } = move_input_state.as_mut() {
+            if let MovementInput::Activated { direction, force } = move_input_state.as_mut() {
                 *direction = new_direction;
                 *force = new_force;
             }
         }
         JoystickInteraction::Deactivated(pointer_id) => {
             // println!("Joystick deactivated: {:?}", joystick_event.entity);
-            *move_input_state = MoveInputState::Idle;
+            *move_input_state = MovementInput::Idle;
             input_state.rotate_ignore_pointers.remove(&pointer_id);
         }
         JoystickInteraction::Rebound => {
@@ -268,7 +268,7 @@ fn on_rotate_plane_drag(
                 .unwrap_or(event.delta)
         });
     if let Some(delta) = scaled_delta {
-        commands.trigger(RotateInput(delta));
+        commands.trigger(LookInput(delta));
     }
 }
 
