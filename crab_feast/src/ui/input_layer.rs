@@ -313,18 +313,15 @@ fn on_keyboard_event(
     direction = direction.normalize_or_zero();
 
     move_input_joystick_query.iter().for_each(|entity| {
-        match joystick_marionette_query.get_mut(entity) {
-            Ok((_, mut joystick_marionette)) => {
-                joystick_marionette.direction = direction;
-                joystick_marionette.force = speed;
-            },
-            Err(_) => {
-                commands.entity(entity).insert(JoystickMarionette {
-                            direction: direction,
-                            force: speed,
-                            ..Default::default()
-                        });
-            }
-        };
+        if let Ok((_, mut joystick_marionette)) = joystick_marionette_query.get_mut(entity) {
+            joystick_marionette.direction = direction;
+            joystick_marionette.force = speed;
+        } else {
+            commands.entity(entity).insert(JoystickMarionette {
+                direction: direction,
+                force: speed,
+                ..Default::default()
+            });
+        }
     });
 }

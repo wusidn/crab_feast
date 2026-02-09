@@ -181,10 +181,7 @@ fn joystick_on_press(
 
         let pointer_center_sub = pointer_position - activated.center_position;
         joystick_state.direction = pointer_center_sub.normalize();
-        joystick_state.force = match pointer_center_sub.length() {
-            0.0 => 0.0,
-            length => length / activated.max_distance,
-        }.min(1.0);
+        joystick_state.force = (pointer_center_sub.length() / activated.max_distance).min(1.0);
 
         commands.entity(joystick_entity).insert(activated);
 
@@ -211,10 +208,7 @@ fn joystick_on_drag(
 
         let thumb_position = pointer_position - activated.center_position;
         joystick_state.direction = thumb_position.normalize();
-        joystick_state.force = match thumb_position.length() {
-            0.0 => 0.0,
-            length => length / activated.max_distance,
-        }.min(1.0);
+        joystick_state.force = (thumb_position.length() / activated.max_distance).min(1.0);
 
         // 更新 Thumb 位置
         joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, activated.max_distance);
@@ -244,13 +238,9 @@ fn joystick_on_release(
             return;
         }
         joystick_activated_query.iter().for_each(|(entity, activated)| {
-            match activated.pointer {
-                PointerId::Mouse => {
-                    deactivated_entities.push(entity);
-                },
-                _ => {},
+            if activated.pointer == PointerId::Mouse {
+                deactivated_entities.push(entity);
             }
-
         });
     });
 
@@ -259,11 +249,10 @@ fn joystick_on_release(
             return;
         }
         joystick_activated_query.iter().for_each(|(entity, activated)| {
-            match activated.pointer {
-                PointerId::Touch(id) if id == event.id => {
+            if let PointerId::Touch(id) = activated.pointer {
+                if id == event.id {
                     deactivated_entities.push(entity);
-                },
-                _ => {},
+                }
             }
         });
     });
