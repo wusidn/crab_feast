@@ -20,9 +20,7 @@ use crate::{
 pub struct InputPlugin;
 
 #[derive(Resource, Debug, Default)]
-pub struct InputState {
-    rotate_ignore_pointers: HashSet<PointerId>,
-}
+pub struct LookInputIgnorePointers(HashSet<PointerId>);
 
 #[derive(Clone)]
 struct BackgroundColorProperty;
@@ -39,7 +37,7 @@ struct MoveInputJoystick;
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(JoystickPlugin)
-            .init_resource::<InputState>()
+            .init_resource::<LookInputIgnorePointers>()
             .init_resource::<MovementInput>()
             .add_systems(Startup, Self::setup)
             .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
@@ -163,12 +161,12 @@ fn on_joystick_event(
         &JoystickFadeAnimatePlayer,
     )>,
     mut move_input_state: ResMut<MovementInput>,
-    mut input_state: ResMut<InputState>,
+    mut look_ignore_pointers: ResMut<LookInputIgnorePointers>,
 ) {
     match joystick_event.event {
         JoystickInteraction::Activated(pointer_id) => {
             // println!("Joystick activated: {:?}", joystick_event.entity);
-            input_state.rotate_ignore_pointers.insert(pointer_id);
+            look_ignore_pointers.0.insert(pointer_id);
             *move_input_state = MovementInput::Activated {
                 direction: Vec2::ZERO,
                 force: 0.0,
@@ -192,7 +190,7 @@ fn on_joystick_event(
         JoystickInteraction::Deactivated(pointer_id) => {
             // println!("Joystick deactivated: {:?}", joystick_event.entity);
             *move_input_state = MovementInput::Idle;
-            input_state.rotate_ignore_pointers.remove(&pointer_id);
+            look_ignore_pointers.0.remove(&pointer_id);
         }
         JoystickInteraction::Rebound => {
             // println!("Joystick rebound: {:?}", joystick_event.entity);
@@ -245,14 +243,11 @@ impl AnimatableProperty for BackgroundColorProperty {
 fn on_rotate_plane_drag(
     event: On<Pointer<Drag>>,
     mut commands: Commands,
-    input_state: ResMut<InputState>,
+    look_ignore_pointers: ResMut<LookInputIgnorePointers>,
     target_camera_query: Query<&ComputedUiTargetCamera>,
     camera_query: Query<&Camera>,
 ) {
-    if input_state
-        .rotate_ignore_pointers
-        .contains(&event.pointer_id)
-    {
+    if look_ignore_pointers.0.contains(&event.pointer_id) {
         return;
     }
 
