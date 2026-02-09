@@ -279,8 +279,8 @@ fn on_keyboard_event(
     move_input_joystick_query: Query<Entity, With<MoveInputJoystick>>,
     mut joystick_marionette_query: Query<(Entity, &mut JoystickMarionette)>,
 ) {
-    let walk_speed = 0.75;
-    // let run_speed = 1.0;
+    let walk_speed = 0.65;
+    let run_speed = 1.0;
 
     let mut direction = Vec2::ZERO;
     let mut speed = walk_speed;
@@ -307,7 +307,7 @@ fn on_keyboard_event(
     });
 
     if key_input.pressed(Key::Shift) {
-        speed = 1.0;
+        speed = run_speed;
     }
 
     direction = direction.normalize_or_zero();

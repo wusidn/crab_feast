@@ -38,6 +38,7 @@ fn on_joystick_marionette_added(
     camera_query: Query<&Camera>,
     mut query: Query<(&Joystick, &mut JoystickState, &JoystickMarionette, &ComputedNode, &ComputedUiTargetCamera, &Children), Without<JoystickDisabled>>,
     mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
+    elastic_rebound_query: Query<&ElasticRebound>,
 ) {
     let joystick_entity = on_add.event_target();
     if let Ok((joystick, mut joystick_state, joystick_marionette, computed_node, computed_ui_target_camera, children)) = query.get_mut(joystick_entity) {
@@ -53,6 +54,10 @@ fn on_joystick_marionette_added(
             center_position: Vec2::ZERO,
             max_distance,
         });
+
+        if elastic_rebound_query.get(joystick_entity).is_ok() {
+            commands.entity(joystick_entity).remove::<ElasticRebound>();
+        }
 
         // 更新 Thumb 位置
         joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, max_distance);
