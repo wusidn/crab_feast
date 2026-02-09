@@ -19,3 +19,9 @@ web-sys = { version = "0.3", features = [
     "Window",
     "CssStyleDeclaration",
 ] }
+
+# 显式覆盖 getrandom 的功能
+[dependencies.getrandom]
+version = "0.2"
+features = ["js"]
+default-features = false
