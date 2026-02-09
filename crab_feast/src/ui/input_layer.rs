@@ -1,12 +1,21 @@
 use std::any::TypeId;
 
 use bevy::{
-    animation::{AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId}, picking::pointer::PointerId, prelude::*
+    animation::{AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId},
+    input::keyboard::Key,
+    picking::pointer::PointerId,
+    platform::collections::HashSet,
+    prelude::*,
 };
-use bevy_rapier2d::parry::utils::hashset::HashSet;
-use crab_feast_ui_joysticks::{Joystick, JoystickEvent, JoystickInteraction, JoystickPlugin};
+use crab_feast_ui_joysticks::{
+    Joystick, JoystickEvent, JoystickInteraction, JoystickMarionette, JoystickMarionettePlugin,
+    JoystickPlugin,
+};
 
-use crate::event::{MoveInputState, RotateInput};
+use crate::{
+    event::{MoveInputState, RotateInput},
+    utils::is_non_mobile,
+};
 
 pub struct InputPlugin;
 
@@ -24,12 +33,19 @@ struct JoystickFadeAnimatePlayer {
     fade_out_index: AnimationNodeIndex,
 }
 
+#[derive(Component)]
+struct MoveInputJoystick;
+
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(JoystickPlugin)
-            .add_systems(Startup, Self::setup)
             .init_resource::<InputState>()
-            .init_resource::<MoveInputState>();
+            .init_resource::<MoveInputState>()
+            .add_systems(Startup, Self::setup)
+            .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        app.add_plugins(JoystickMarionettePlugin);
     }
 }
 
@@ -101,48 +117,51 @@ impl InputPlugin {
             .id();
 
         let input_layer_entity = commands
-            .spawn(
-        Node {
-                    width: Val::Vw(100.0),
-                    height: Val::Vh(100.0),
-                    padding: UiRect::all(Val::Vw(10.0)),
-                    display: Display::Flex,
-                    justify_content: JustifyContent::FlexStart,
-                    align_items: AlignItems::FlexEnd,
-                    ..Default::default()
-                },
-            )
+            .spawn(Node {
+                width: Val::Vw(100.0),
+                height: Val::Vh(100.0),
+                padding: UiRect::all(Val::Vw(10.0)),
+                display: Display::Flex,
+                justify_content: JustifyContent::FlexStart,
+                align_items: AlignItems::FlexEnd,
+                ..Default::default()
+            })
             .observe(on_rotate_plane_drag)
             .id();
 
-        commands.spawn((
-            Node {
-                width: Val::Vw(10.0),
-                height: Val::Vw(10.0),
-                display: Display::Flex,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: UiRect::all(Val::Percent(0.05)),
-                border_radius: BorderRadius::all(Val::Percent(50.0)),
-                ..Default::default()
-            },
-            BackgroundColor(joystick_idle_color),
-            BorderColor::all(Color::hsla(0.0, 1.0, 1.0, 0.2)),
-            Joystick {
-                ..Default::default()
-            },
-            AnimatedBy(animation_player_entity),
-            animation_target_id,
-            animation_target_name,
-            ChildOf(input_layer_entity),
-        ))
-        .observe(on_joystick_event);
+        commands
+            .spawn((
+                Node {
+                    width: Val::Vw(10.0),
+                    height: Val::Vw(10.0),
+                    display: Display::Flex,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Percent(0.05)),
+                    border_radius: BorderRadius::all(Val::Percent(50.0)),
+                    ..Default::default()
+                },
+                BackgroundColor(joystick_idle_color),
+                BorderColor::all(Color::hsla(0.0, 1.0, 1.0, 0.2)),
+                Joystick {
+                    ..Default::default()
+                },
+                AnimatedBy(animation_player_entity),
+                animation_target_id,
+                animation_target_name,
+                ChildOf(input_layer_entity),
+                MoveInputJoystick,
+            ))
+            .observe(on_joystick_event);
     }
 }
 
 fn on_joystick_event(
     joystick_event: On<JoystickEvent>,
-    mut joystick_fade_animate_player_query: Query<(&mut AnimationPlayer, &JoystickFadeAnimatePlayer)>,
+    mut joystick_fade_animate_player_query: Query<(
+        &mut AnimationPlayer,
+        &JoystickFadeAnimatePlayer,
+    )>,
     mut move_input_state: ResMut<MoveInputState>,
     mut input_state: ResMut<InputState>,
 ) {
@@ -155,15 +174,17 @@ fn on_joystick_event(
                 force: 0.0,
             };
 
-            joystick_fade_animate_player_query.iter_mut().for_each(|(mut animation_player, joystick_fade_animate_player)| {
-                animation_player.stop_all();
-                // 播放淡入动画
-                animation_player.play(joystick_fade_animate_player.fade_in_index);
-            });
+            joystick_fade_animate_player_query.iter_mut().for_each(
+                |(mut animation_player, joystick_fade_animate_player)| {
+                    animation_player.stop_all();
+                    // 播放淡入动画
+                    animation_player.play(joystick_fade_animate_player.fade_in_index);
+                },
+            );
         }
         JoystickInteraction::Moved(new_direction, new_force) => {
             // println!("Joystick moved: {:?}", joystick_event.entity);
-            if let MoveInputState::Activated { direction, force} = move_input_state.as_mut() {
+            if let MoveInputState::Activated { direction, force } = move_input_state.as_mut() {
                 *direction = new_direction;
                 *force = new_force;
             }
@@ -176,11 +197,13 @@ fn on_joystick_event(
         JoystickInteraction::Rebound => {
             // println!("Joystick rebound: {:?}", joystick_event.entity);
 
-            joystick_fade_animate_player_query.iter_mut().for_each(|(mut animation_player, joystick_fade_animate_player)| {
-                animation_player.stop_all();
-                // 播放淡出动画
-                animation_player.play(joystick_fade_animate_player.fade_out_index);
-            });
+            joystick_fade_animate_player_query.iter_mut().for_each(
+                |(mut animation_player, joystick_fade_animate_player)| {
+                    animation_player.stop_all();
+                    // 播放淡出动画
+                    animation_player.play(joystick_fade_animate_player.fade_out_index);
+                },
+            );
         }
     }
 }
@@ -220,13 +243,16 @@ impl AnimatableProperty for BackgroundColorProperty {
 }
 
 fn on_rotate_plane_drag(
-    event: On<Pointer<Drag>>, 
+    event: On<Pointer<Drag>>,
     mut commands: Commands,
     input_state: ResMut<InputState>,
     target_camera_query: Query<&ComputedUiTargetCamera>,
     camera_query: Query<&Camera>,
 ) {
-    if input_state.rotate_ignore_pointers.contains(&event.pointer_id) {
+    if input_state
+        .rotate_ignore_pointers
+        .contains(&event.pointer_id)
+    {
         return;
     }
 
@@ -236,11 +262,69 @@ fn on_rotate_plane_drag(
         .and_then(|target| target.get())
         .and_then(|camera_entity| camera_query.get(camera_entity).ok())
         .map(|camera| {
-            camera.physical_viewport_size().map(|viewport_size| {
-                event.delta / viewport_size.x as f32
-            }).unwrap_or(event.delta)
+            camera
+                .physical_viewport_size()
+                .map(|viewport_size| event.delta / viewport_size.x as f32)
+                .unwrap_or(event.delta)
         });
     if let Some(delta) = scaled_delta {
         commands.trigger(RotateInput(delta));
     }
+}
+
+fn on_keyboard_event(
+    mut commands: Commands,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    key_input: Res<ButtonInput<Key>>,
+    move_input_joystick_query: Query<Entity, With<MoveInputJoystick>>,
+    mut joystick_marionette_query: Query<(Entity, &mut JoystickMarionette)>,
+) {
+    let walk_speed = 0.75;
+    // let run_speed = 1.0;
+
+    let mut direction = Vec2::ZERO;
+    let mut speed = walk_speed;
+
+    let is_pressed = [KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD]
+        .iter()
+        .any(|&key| keyboard_input.pressed(key));
+    if !is_pressed {
+        joystick_marionette_query.iter().for_each(|(entity, ..)| {
+            commands.entity(entity).remove::<JoystickMarionette>();
+        });
+        return;
+    }
+
+    [((KeyCode::KeyW, KeyCode::ArrowUp), -Vec2::Y),
+        ((KeyCode::KeyS, KeyCode::ArrowDown), Vec2::Y),
+        ((KeyCode::KeyA, KeyCode::ArrowLeft), -Vec2::X),
+        ((KeyCode::KeyD, KeyCode::ArrowRight), Vec2::X)]
+    .iter()
+    .for_each(|&(keys, offset)| {
+        if keyboard_input.pressed(keys.0) || keyboard_input.pressed(keys.1) {
+            direction += offset;
+        }
+    });
+
+    if key_input.pressed(Key::Shift) {
+        speed = 1.0;
+    }
+
+    direction = direction.normalize_or_zero();
+
+    move_input_joystick_query.iter().for_each(|entity| {
+        match joystick_marionette_query.get_mut(entity) {
+            Ok((_, mut joystick_marionette)) => {
+                joystick_marionette.direction = direction;
+                joystick_marionette.force = speed;
+            },
+            Err(_) => {
+                commands.entity(entity).insert(JoystickMarionette {
+                            direction: direction,
+                            force: speed,
+                            ..Default::default()
+                        });
+            }
+        };
+    });
 }

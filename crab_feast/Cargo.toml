@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy.workspace                  = true
-bevy_rapier2d.workspace         = true
+bevy_rapier3d.workspace         = true
 bevy_replicon.workspace         = true
 bevy_replicon_renet.workspace   = true
 serde.workspace                 = true

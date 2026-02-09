@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy_rapier3d::prelude::*;
 
 use crate::event::{MoveInputState, RotateInput};
 pub struct ScenePlugin;
@@ -8,7 +9,12 @@ struct AutoCamera;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, Self::setup)
+        app
+        .add_plugins((
+            RapierPhysicsPlugin::<NoUserData>::default(),
+            RapierDebugRenderPlugin::default(),
+        ))
+        .add_systems(Startup, Self::setup)
         .add_systems(Update, camera_move_system.run_if(|input: Res<MoveInputState>| {
             matches!(input.as_ref(), MoveInputState::Activated { .. })
         }))
@@ -49,6 +55,15 @@ impl ScenePlugin {
             Transform::from_xyz(-2.5, 4.5, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
             AutoCamera,
         ));
+
+        // Base
+        let ground_size = 3.1;
+        let ground_height = 0.1;
+        commands.spawn((
+            Transform::from_xyz(0.0, -ground_height / 2.0, 0.0),
+            Collider::cuboid(ground_size, ground_height, ground_size),
+            ColliderDebugColor(Hsla::BLACK),
+        ));
     }
 }
 
@@ -57,7 +72,7 @@ fn camera_move_system(
     input: Res<MoveInputState>,
     time: Res<Time>,
 ) {
-    let move_speed = 0.3;
+    let move_speed = 30.0;
 
     if let MoveInputState::Activated { direction, force } = input.as_ref() {
         camera.iter_mut().for_each(|(mut transform, _)| {
