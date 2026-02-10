@@ -91,7 +91,7 @@ fn joystick_on_add(
     joystick_query: Query<&Joystick>,
     joystick_thumb_query: Query<&JoystickThumb>,
 ) {
-    info!("Joystick added");
+    // info!("Joystick added");
 
     let joystick_entity = on_add.event_target();
     let children = children_query.get(joystick_entity);
@@ -140,7 +140,7 @@ fn joystick_on_remove(
     children_query: Query<&Children>,
     joystick_thumb_query: Query<&JoystickThumb>,
 ) {
-    info!("Joystick removed");
+    // info!("Joystick removed");
     let joystick_entity = on_remove.event_target();
     if let Ok(children) = children_query.get(joystick_entity) {
         children.iter().for_each(|child| {
@@ -184,9 +184,6 @@ fn joystick_on_press(
         joystick_state.force = (pointer_center_sub.length() / activated.max_distance).min(1.0);
 
         commands.entity(joystick_entity).insert(activated);
-
-        // // 更新 Thumb 位置
-        // joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, max_distance);
     }
 
     commands.trigger(JoystickEvent {
@@ -208,9 +205,6 @@ fn joystick_on_drag(
         let thumb_position = pointer_position - activated.center_position;
         joystick_state.direction = thumb_position.normalize();
         joystick_state.force = (thumb_position.length() / activated.max_distance).min(1.0);
-
-        // // 更新 Thumb 位置
-        // joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, activated.max_distance);
 
         commands.trigger(JoystickEvent {
             entity: joystick_entity,
