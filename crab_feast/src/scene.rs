@@ -1,13 +1,13 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::movement::{MovementInputPlugin, Movement};
+use crate::control::{ControlInputPlugin, Controllable};
 pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app
-        .add_plugins(MovementInputPlugin)
+        .add_plugins(ControlInputPlugin)
         .add_plugins((
             RapierPhysicsPlugin::<NoUserData>::default(),
             RapierDebugRenderPlugin::default(),
@@ -47,7 +47,7 @@ impl ScenePlugin {
         commands.spawn((
             Camera3d::default(),
             Transform::from_xyz(0.0, 6.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
-            Movement,
+            Controllable,
         ));
 
         // Base

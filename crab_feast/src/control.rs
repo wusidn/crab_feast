@@ -16,46 +16,46 @@ pub enum MovementInput {
 pub struct LookInput(pub Vec2);
 
 #[derive(Component)]
-pub struct Movement;
+pub struct Controllable;
 
-pub struct MovementInputPlugin;
+pub struct ControlInputPlugin;
 
-impl Plugin for MovementInputPlugin {
+impl Plugin for ControlInputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MovementInput>()
-        .add_systems(Update, move_input_system.run_if(|input: Res<MovementInput>| {
+        .add_systems(Update, controlled_move_system.run_if(|input: Res<MovementInput>| {
             matches!(input.as_ref(), MovementInput::Activated { .. })
         }))
-        .add_observer(look_input_system);
+        .add_observer(controlled_look_system);
     }
 }
 
-fn move_input_system(
-    mut camera: Query<(&mut Transform, &mut Camera3d), With<Movement>>,
+fn controlled_move_system(
+    mut controlled_objects: Query<&mut Transform, With<Controllable>>,
     input: Res<MovementInput>,
     time: Res<Time>,
 ) {
     let move_speed = 30.0;
 
     if let MovementInput::Activated { direction, force } = input.as_ref() {
-        camera.iter_mut().for_each(|(mut transform, _)| {
+        controlled_objects.iter_mut().for_each(|mut controlled_transform| {
                 let local_move_direction = Vec3::new(direction.x, 0.0, direction.y);
-                let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
+                let world_move_direction = controlled_transform.rotation.mul_vec3(local_move_direction);
                 let move_distance = world_move_direction * *force * move_speed * time.delta_secs();
-                transform.translation += move_distance;
+                controlled_transform.translation += move_distance;
             });
     }
 }
 
-fn look_input_system(
+fn controlled_look_system(
     trigger: On<LookInput>,
     mut rotation_angles: Local<Option<Vec2>>,
-    mut camera: Query<(&mut Transform, &mut Camera3d), With<Movement>>,
+    mut controlled_objects: Query<&mut Transform, With<Controllable>>,
 ) {
     let rotate_speed = 10.0;
     let max_pitch = std::f32::consts::FRAC_PI_2 - 0.1; // 防止翻转，限制在±85度
     
-    if let Ok((mut transform, _)) = camera.single_mut() {
+    if let Ok(mut transform) = controlled_objects.single_mut() {
             // 初始化角度
         let angles = rotation_angles.get_or_insert_with(|| {
             let (_roll, yaw, pitch) = transform.rotation.to_euler(EulerRot::ZYX);
