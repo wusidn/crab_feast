@@ -79,7 +79,8 @@ impl Plugin for JoystickPlugin {
         app.add_observer(joystick_on_add)
             .add_observer(joystick_on_remove)
             .add_systems(Update, joystick_on_release)
-            .add_systems(Update, joystick_thumb_elastic_rebound_system);
+            .add_systems(Update, joystick_thumb_update)
+            .add_systems(Update, joystick_thumb_elastic_rebound_system.after(joystick_thumb_update));
     }
 }
 
@@ -154,8 +155,7 @@ fn joystick_on_press(
     event: On<Pointer<Press>>,
     mut commands: Commands,
     camera_query: Query<&Camera>,
-    mut joystick_state_query: Query<(&mut JoystickState, &ComputedNode, &Joystick, &UiGlobalTransform, &Children), (Without<JoystickDisabled>, Without<Activated>)>,
-    mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
+    mut joystick_state_query: Query<(&mut JoystickState, &ComputedNode, &Joystick, &UiGlobalTransform), (Without<JoystickDisabled>, Without<Activated>)>,
 ) {
     let joystick_entity = event.event_target();
     
@@ -163,7 +163,7 @@ fn joystick_on_press(
     let viewport_rect_min = camera.logical_viewport_rect().map_or(Vec2::ZERO, |rect| rect.min);
     let scale_factor = camera.computed.target_info.as_ref().map(|info| info.scale_factor).unwrap_or(1.0);
 
-    if let Ok((mut joystick_state, computed_node, joystick, ui_global_transform, children)) = joystick_state_query.get_mut(joystick_entity)
+    if let Ok((mut joystick_state, computed_node, joystick, ui_global_transform)) = joystick_state_query.get_mut(joystick_entity)
     {
         // 获取点击位置 logic （相对于窗口左上角的逻辑坐标系）
         let pointer_position = event.pointer_location.position;
@@ -185,8 +185,8 @@ fn joystick_on_press(
 
         commands.entity(joystick_entity).insert(activated);
 
-        // 更新 Thumb 位置
-        joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, max_distance);
+        // // 更新 Thumb 位置
+        // joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, max_distance);
     }
 
     commands.trigger(JoystickEvent {
@@ -198,20 +198,19 @@ fn joystick_on_press(
 fn joystick_on_drag(
     event: On<Pointer<Drag>>,
     mut commands: Commands,
-    mut joystick_state_query: Query<(&mut JoystickState, &Activated, &Children)>,
-    mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
+    mut joystick_state_query: Query<(&mut JoystickState, &Activated)>,
 ) {
     let joystick_entity = event.event_target();
 
-    if let Ok((mut joystick_state, activated, children)) = joystick_state_query.get_mut(joystick_entity) {
+    if let Ok((mut joystick_state, activated)) = joystick_state_query.get_mut(joystick_entity) {
         let pointer_position = event.pointer_location.position;
 
         let thumb_position = pointer_position - activated.center_position;
         joystick_state.direction = thumb_position.normalize();
         joystick_state.force = (thumb_position.length() / activated.max_distance).min(1.0);
 
-        // 更新 Thumb 位置
-        joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, activated.max_distance);
+        // // 更新 Thumb 位置
+        // joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, activated.max_distance);
 
         commands.trigger(JoystickEvent {
             entity: joystick_entity,
@@ -280,21 +279,21 @@ fn joystick_on_release(
 
 }
 
-pub(crate) fn joystick_thumb_update(
-    joystick_state: &JoystickState,
-    joystick_children: &Children,
-    transform_query: &mut Query<&mut UiTransform, With<JoystickThumb>>,
-    max_distance: f32,
+fn joystick_thumb_update(
+    mut joystick_query: Query<(&mut JoystickState, &Activated, &Children), Changed<JoystickState>>,
+    mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
 ) {
-    // 更新 Thumb 位置
-    joystick_children.iter().for_each(|child| {
-        if let Ok(mut thumb_transform) = transform_query.get_mut(child) {
-            let thumb_position = joystick_state.direction * joystick_state.force * max_distance;
-            thumb_transform.translation.x = Val::Px(thumb_position.x);
-            thumb_transform.translation.y = Val::Px(thumb_position.y);
-        }
+    joystick_query.iter_mut().for_each(|(joystick_state, activated, children)| {
+        children.iter().for_each(|child| {
+            if let Ok(mut thumb_transform) = transform_query.get_mut(child) {
+                let thumb_position = joystick_state.direction * joystick_state.force * activated.max_distance;
+                thumb_transform.translation.x = Val::Px(thumb_position.x);
+                thumb_transform.translation.y = Val::Px(thumb_position.y);
+            }
+        });
     });
 }
+
 
 fn joystick_thumb_elastic_rebound_system(
     mut commands: Commands,

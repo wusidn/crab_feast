@@ -7,13 +7,17 @@ use bevy::{
     platform::collections::HashSet,
     prelude::*,
 };
+
 use crab_feast_ui_joysticks::{
-    Joystick, JoystickEvent, JoystickInteraction, JoystickMarionette, JoystickMarionettePlugin,
+    Joystick, JoystickEvent, JoystickInteraction, JoystickMarionette,
     JoystickPlugin,
 };
 
+#[allow(unused_imports)]
+use crab_feast_ui_joysticks::JoystickMarionettePlugin;
+
 use crate::{
-    control::{LookInput, MovementInput},
+    input::{LookInput, MovementInput},
     utils::is_non_mobile,
 };
 
@@ -146,7 +150,7 @@ impl InputPlugin {
                 },
                 AnimatedBy(animation_player_entity),
                 animation_target_id,
-                animation_target_name,
+                // animation_target_name,
                 ChildOf(input_layer_entity),
                 MoveInputJoystick,
             ))

@@ -1,6 +1,6 @@
 use bevy::{asset::uuid::Uuid, picking::pointer::PointerId, prelude::*};
 
-use crate::{Joystick, JoystickEvent, JoystickInteraction, JoystickThumb, joystick::{Activated, ElasticRebound, JoystickDisabled, JoystickState, joystick_thumb_update}};
+use crate::{Joystick, JoystickEvent, JoystickInteraction, joystick::{Activated, ElasticRebound, JoystickDisabled, JoystickState}};
 
 pub struct JoystickMarionettePlugin;
 
@@ -36,12 +36,11 @@ fn on_joystick_marionette_added(
     on_add: On<Add, JoystickMarionette>,
     mut commands: Commands,
     camera_query: Query<&Camera>,
-    mut query: Query<(&Joystick, &mut JoystickState, &JoystickMarionette, &ComputedNode, &ComputedUiTargetCamera, &Children), Without<JoystickDisabled>>,
-    mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
+    mut query: Query<(&Joystick, &mut JoystickState, &JoystickMarionette, &ComputedNode, &ComputedUiTargetCamera), Without<JoystickDisabled>>,
     elastic_rebound_query: Query<&ElasticRebound>,
 ) {
     let joystick_entity = on_add.event_target();
-    if let Ok((joystick, mut joystick_state, joystick_marionette, computed_node, computed_ui_target_camera, children)) = query.get_mut(joystick_entity) {
+    if let Ok((joystick, mut joystick_state, joystick_marionette, computed_node, computed_ui_target_camera)) = query.get_mut(joystick_entity) {
 
         joystick_state.direction = joystick_marionette.direction;
         joystick_state.force = joystick_marionette.force;
@@ -58,9 +57,6 @@ fn on_joystick_marionette_added(
         if elastic_rebound_query.get(joystick_entity).is_ok() {
             commands.entity(joystick_entity).remove::<ElasticRebound>();
         }
-
-        // 更新 Thumb 位置
-        joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, max_distance);
 
         commands.trigger(JoystickEvent {
             entity: joystick_entity,
@@ -102,10 +98,9 @@ fn on_joystick_marionette_removed(
 
 fn update_joystick_marionette(
     mut commands: Commands,
-    mut joystick_marionettes: Query<(Entity, &JoystickMarionette, &mut JoystickState, &Activated, &Children)>,
-    mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
+    mut joystick_marionettes: Query<(Entity, &JoystickMarionette, &mut JoystickState)>,
 ) {
-    for ( joystick_entity, joystick_marionette, mut joystick_state, activated, children) in joystick_marionettes.iter_mut() {
+    for ( joystick_entity, joystick_marionette, mut joystick_state) in joystick_marionettes.iter_mut() {
 
         if (joystick_state.direction.dot(joystick_marionette.direction) - 1.0).abs() <= 0.01 && (joystick_state.force - joystick_marionette.force).abs() < 0.01 {
             continue;
@@ -113,9 +108,6 @@ fn update_joystick_marionette(
 
         joystick_state.direction = joystick_marionette.direction;
         joystick_state.force = joystick_marionette.force;
-
-        // 更新 Thumb 位置
-        joystick_thumb_update(joystick_state.as_ref(), children, &mut transform_query, activated.max_distance);
 
         commands.trigger(JoystickEvent {
             entity: joystick_entity,

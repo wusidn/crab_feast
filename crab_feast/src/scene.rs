@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::control::{ControlInputPlugin, Controllable};
+use crate::input::{ControlInputPlugin, LookAxis, LookController, MovementController};
 pub struct ScenePlugin;
 
 impl Plugin for ScenePlugin {
@@ -43,21 +43,37 @@ impl ScenePlugin {
             },
             Transform::from_xyz(4.0, 8.0, 4.0),
         ));
-        // camera
-        commands.spawn((
-            Camera3d::default(),
-            Transform::from_xyz(0.0, 6.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
-            Controllable,
-        ));
 
         // Base
-        let ground_size = 3.1;
+        let ground_size = 30.0;
         let ground_height = 0.1;
         commands.spawn((
             Transform::from_xyz(0.0, -ground_height / 2.0, 0.0),
             Collider::cuboid(ground_size, ground_height, ground_size),
             ColliderDebugColor(Hsla::BLACK),
         ));
+
+        // Player
+        commands.spawn((
+            Transform::from_xyz(0.0, 1.0, 0.0),
+            RigidBody::Dynamic, // 添加动态刚体组件使对象受重力影响
+            Collider::cuboid(0.5, 1.0, 0.5),
+            ColliderDebugColor(Hsla::WHITE),
+            MovementController::default(),
+            LookController{
+                axis: LookAxis::Yaw,
+                ..Default::default()
+            },
+        )).with_children(|parent| {
+            // camera
+            parent.spawn((
+                Camera3d::default(),
+                Transform::from_xyz(0.0, 2.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
+                LookController {
+                    axis: LookAxis::Pitch,
+                    ..Default::default()
+                },
+            ));
+        });
     }
 }
-
