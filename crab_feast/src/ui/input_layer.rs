@@ -13,7 +13,7 @@ use crab_feast_ui_joysticks::{
 };
 
 use crate::{
-    control::{MovementInput, LookInput},
+    control::{LookInput, MovementInput},
     utils::is_non_mobile,
 };
 
@@ -280,9 +280,12 @@ fn on_keyboard_event(
     let mut direction = Vec2::ZERO;
     let mut speed = walk_speed;
 
-    let is_pressed = [KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD]
-        .iter()
-        .any(|&key| keyboard_input.pressed(key));
+    let is_pressed = [
+        KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD,
+        KeyCode::ArrowUp, KeyCode::ArrowLeft, KeyCode::ArrowDown, KeyCode::ArrowRight
+    ]
+    .iter()
+    .any(|&key| keyboard_input.pressed(key));
     if !is_pressed {
         joystick_marionette_query.iter().for_each(|(entity, ..)| {
             commands.entity(entity).remove::<JoystickMarionette>();
@@ -290,10 +293,12 @@ fn on_keyboard_event(
         return;
     }
 
-    [((KeyCode::KeyW, KeyCode::ArrowUp), -Vec2::Y),
+    [
+        ((KeyCode::KeyW, KeyCode::ArrowUp), -Vec2::Y),
         ((KeyCode::KeyS, KeyCode::ArrowDown), Vec2::Y),
         ((KeyCode::KeyA, KeyCode::ArrowLeft), -Vec2::X),
-        ((KeyCode::KeyD, KeyCode::ArrowRight), Vec2::X)]
+        ((KeyCode::KeyD, KeyCode::ArrowRight), Vec2::X),
+    ]
     .iter()
     .for_each(|&(keys, offset)| {
         if keyboard_input.pressed(keys.0) || keyboard_input.pressed(keys.1) {
