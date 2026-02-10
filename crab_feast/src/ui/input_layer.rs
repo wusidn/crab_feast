@@ -13,7 +13,7 @@ use crab_feast_ui_joysticks::{
 };
 
 use crate::{
-    event::{MovementInput, LookInput},
+    movement::{MovementInput, LookInput},
     utils::is_non_mobile,
 };
 

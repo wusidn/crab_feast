@@ -2,7 +2,7 @@
 use bevy::prelude::*;
 
 mod scene;
-mod event;
+mod movement;
 mod ui;
 mod utils;
 
