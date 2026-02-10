@@ -49,27 +49,32 @@ fn controlled_move_system(
 
 fn controlled_look_system(
     trigger: On<LookInput>,
-    mut rotation_angles: Local<Option<Vec2>>,
-    mut controlled_objects: Query<&mut Transform, With<Controllable>>,
+    mut rotation_angles: Local<Option<(Entity, Vec2)>>,
+    mut controlled_objects: Query<(Entity, &mut Transform), With<Controllable>>,
 ) {
     let rotate_speed = 10.0;
     let max_pitch = std::f32::consts::FRAC_PI_2 - 0.1; // 防止翻转，限制在±85度
     
-    if let Ok(mut transform) = controlled_objects.single_mut() {
-            // 初始化角度
-        let angles = rotation_angles.get_or_insert_with(|| {
+    if let Ok((current_entity, mut transform)) = controlled_objects.single_mut() {
+        
+        // 检查实体是否发生了变化
+        if rotation_angles.as_ref().map(|(e, _)| *e) != Some(current_entity) {
+            // 实体变化了，重新初始化角度
             let (_roll, yaw, pitch) = transform.rotation.to_euler(EulerRot::ZYX);
-            Vec2::new(yaw, pitch)
-        });
+            *rotation_angles = Some((current_entity, Vec2::new(yaw, pitch)));
+        }
 
-        // 更新偏航(yaw)和俯仰(pitch)角度
-        angles.x -= trigger.event().0.x * rotate_speed; // Yaw: 左右转动
-        angles.y -= trigger.event().0.y * rotate_speed; // Pitch: 上下转动
-        
-        // 限制俯仰角度，防止翻转
-        angles.y = angles.y.clamp(-max_pitch, max_pitch);
-        
-        // 应用旋转
-        transform.rotation = Quat::from_euler(EulerRot::ZYX, 0.0, angles.x, angles.y);
+        // 获取角度
+        if let Some((_, ref mut angles)) = *rotation_angles {
+            // 更新偏航(yaw)和俯仰(pitch)角度
+            angles.x -= trigger.event().0.x * rotate_speed; // Yaw: 左右转动
+            angles.y -= trigger.event().0.y * rotate_speed; // Pitch: 上下转动
+            
+            // 限制俯仰角度，防止翻转
+            angles.y = angles.y.clamp(-max_pitch, max_pitch);
+            
+            // 应用旋转
+            transform.rotation = Quat::from_euler(EulerRot::ZYX, 0.0, angles.x, angles.y);
+        }
     }
 }
