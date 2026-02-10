@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
@@ -12,16 +14,37 @@ impl Plugin for ScenePlugin {
             RapierPhysicsPlugin::<NoUserData>::default(),
             RapierDebugRenderPlugin::default(),
         ))
+        .add_systems(Update, setup_scene_once_loaded)
         .add_systems(Startup, Self::setup);
     }
+}
+#[derive(Resource)]
+struct Animations {
+    animations: Vec<AnimationNodeIndex>,
+    graph_handle: Handle<AnimationGraph>,
 }
 
 impl ScenePlugin {
     fn setup(
         mut commands: Commands,
+        asset_server: Res<AssetServer>,
         mut meshes: ResMut<Assets<Mesh>>,
         mut materials: ResMut<Assets<StandardMaterial>>,
+        mut graphs: ResMut<Assets<AnimationGraph>>,
     ) {
+
+        // Build the animation graph
+        let (graph, node_indices) = AnimationGraph::from_clips([
+            asset_server.load(GltfAssetLabel::Animation(0).from_asset("characters/animations/Dance.glb")),
+        ]);
+
+        // Keep our animation graph in a Resource so that it can be inserted onto
+        // the correct entity once the scene actually loads.
+        let graph_handle = graphs.add(graph);
+        commands.insert_resource(Animations {
+            animations: node_indices,
+            graph_handle,
+        });
 
         // circular base
         commands.spawn((
@@ -65,6 +88,14 @@ impl ScenePlugin {
                 ..Default::default()
             },
         )).with_children(|parent| {
+
+            parent.spawn((
+                SceneRoot(
+                    asset_server.load(GltfAssetLabel::Scene(0).from_asset("characters/rigs/Ortiz.glb")),
+                ),
+                Transform::from_xyz(0.0, -1.0, 0.0),
+            ));
+
             // camera
             parent.spawn((
                 Camera3d::default(),
@@ -75,5 +106,30 @@ impl ScenePlugin {
                 },
             ));
         });
+    }
+}
+
+fn setup_scene_once_loaded(
+    mut commands: Commands,
+    animations: Res<Animations>,
+    mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
+) {
+    for (entity, mut player) in &mut players {
+        let mut transitions = AnimationTransitions::new();
+
+        // Make sure to start the animation via the `AnimationTransitions`
+        // component. The `AnimationTransitions` component wants to manage all
+        // the animations and will get confused if the animations are started
+        // directly via the `AnimationPlayer`.
+        transitions
+            .play(&mut player, animations.animations[0], Duration::from_secs(10))
+            .repeat();
+
+        commands
+            .entity(entity)
+            .insert(AnimationGraphHandle(animations.graph_handle.clone()))
+            .insert(transitions);
+
+        info!("Added animation graph to entity {:?}", entity);
     }
 }
