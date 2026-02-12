@@ -1,4 +1,5 @@
 use bevy::{prelude::*, winit::WinitSettings};
+use bevy_inspector_egui::{bevy_egui::EguiPlugin, quick::WorldInspectorPlugin};
 
 fn main() {
     let mut app = crab_feast::build_app();
@@ -19,6 +20,8 @@ fn main() {
     .insert_resource(WinitSettings {
         focused_mode: bevy::winit::UpdateMode::Continuous,
         ..Default::default()
-    });
-    app.run();
+    })
+    .add_plugins(EguiPlugin::default())
+    .add_plugins(WorldInspectorPlugin::new())
+    .run();
 }

@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 bevy.workspace = true
 crab_feast = {path = "../../crab_feast"}
+bevy-inspector-egui = "0.36"

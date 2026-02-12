@@ -128,6 +128,8 @@ impl InputPlugin {
                 align_items: AlignItems::FlexEnd,
                 ..Default::default()
             })
+            .observe(on_rotate_plane_press)
+            .observe(on_rotate_plane_release)
             .observe(on_rotate_plane_drag)
             .id();
 
@@ -242,6 +244,44 @@ impl AnimatableProperty for BackgroundColorProperty {
             ))),
         }
     }
+}
+
+fn on_rotate_plane_press(
+    event: On<Pointer<Press>>,
+    target_camera_query: Query<&ComputedUiTargetCamera>,
+    mut look_ignore_pointers: ResMut<LookInputIgnorePointers>,
+    camera_query: Query<&Camera>,
+) {
+    if look_ignore_pointers.0.contains(&event.pointer_id) {
+        return;
+    }
+    info!("on_rotate_plane_press: {:?}", event);
+    if event.button != PointerButton::Primary {
+        return;
+    }
+    info!("on_rotate_plane_press: {:?}", event.pointer_location);
+
+    let hit_left = target_camera_query
+        .get(event.entity)
+        .ok()
+        .and_then(|target| target.get())
+        .and_then(|camera_entity| camera_query.get(camera_entity).ok())
+        .map(|camera| {
+            camera
+                .logical_viewport_size()
+                .map(|viewport_size| event.pointer_location.position.x < viewport_size.x as f32 / 2.0)
+                .unwrap_or(true)
+        });
+    if hit_left.unwrap_or(true) {
+        look_ignore_pointers.0.insert(event.pointer_id);
+    }
+}
+
+fn on_rotate_plane_release(
+    event: On<Pointer<Release>>,
+    mut look_ignore_pointers: ResMut<LookInputIgnorePointers>,
+) {
+    look_ignore_pointers.0.remove(&event.pointer_id);
 }
 
 fn on_rotate_plane_drag(
