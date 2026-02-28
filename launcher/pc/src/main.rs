@@ -2,26 +2,25 @@ use bevy::{prelude::*, winit::WinitSettings};
 use bevy_inspector_egui::{bevy_egui::EguiPlugin, quick::WorldInspectorPlugin};
 
 fn main() {
-    let mut app = crab_feast::build_app();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "carab_feast".to_string(),
-                    focused: true,
-                    resizable: true,
-                    // 启用垂直同步（和显示器刷新率同步，通常60/120FPS）
-                    present_mode: bevy::window::PresentMode::AutoVsync,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-    ) // 配置WinitSettings，禁用后台帧率限制
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "carab_feast".to_string(),
+            focused: true,
+            resizable: true,
+            present_mode: bevy::window::PresentMode::AutoVsync,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }))
     .insert_resource(WinitSettings {
         focused_mode: bevy::winit::UpdateMode::Continuous,
         ..Default::default()
     })
     .add_plugins(EguiPlugin::default())
-    .add_plugins(WorldInspectorPlugin::new())
-    .run();
+    .add_plugins(WorldInspectorPlugin::new());
+
+    crab_feast::build_app(&mut app);
+
+    app.run();
 }

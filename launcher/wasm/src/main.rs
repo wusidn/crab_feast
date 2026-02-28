@@ -1,48 +1,43 @@
-
 use bevy::{prelude::*, window::WindowResized};
 use wasm_bindgen::prelude::wasm_bindgen;
 
 fn main() {
     console_error_panic_hook::set_once();
     wasm_logger::init(wasm_logger::Config::new(log::Level::Info));
-    
-    let mut app = crab_feast::build_app();
-    app.add_plugins(DefaultPlugins
-        .set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "carab_feast111".to_string(),
-                focused: true,
-                resizable: false,
-                fit_canvas_to_parent: true,
-                // 指定canvas元素ID
-                canvas: Some("#bevy".to_string()),
-                prevent_default_event_handling: false,
-                // resolution: WindowResolution::new(1280, 720),  // 明确指定分辨率
-                // 添加这个设置来控制缩放
-                present_mode: bevy::window::PresentMode::Fifo,  // 或其他模式
+
+    let mut app = App::new();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "carab_feast111".to_string(),
+                    focused: true,
+                    resizable: false,
+                    fit_canvas_to_parent: true,
+                    canvas: Some("#bevy".to_string()),
+                    prevent_default_event_handling: false,
+                    present_mode: bevy::window::PresentMode::Fifo,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .set(bevy::log::LogPlugin {
+                level: bevy::log::Level::INFO,
+                filter: "wgpu=error,bevy_render=info,bevy_ecs=trace".to_string(),
                 ..Default::default()
             }),
-            ..Default::default()
-        })
-        .set(bevy::log::LogPlugin {
-            level: bevy::log::Level::INFO,
-            filter: "wgpu=error,bevy_render=info,bevy_ecs=trace".to_string(),
-            ..Default::default()
-        })
     )
     .add_systems(Startup, update_window_size)
     .add_systems(PreUpdate, listen_window_size)
-    // 添加测试系统，输出不同级别的日志
     .add_systems(Startup, test_logs);
+
+    crab_feast::build_app(&mut app);
     app.run();
 }
 
-
 static mut WINDOW_SIZE_BUFFER: [f32; 5] = [0.0; 5];
 
-fn update_window_size(
-    windows: Query<&Window>,
-) {
+fn update_window_size(windows: Query<&Window>) {
     let window = windows.single().unwrap();
     let window_physical_size = window.physical_size();
     unsafe {
@@ -51,14 +46,18 @@ fn update_window_size(
         WINDOW_SIZE_BUFFER[2] = window_physical_size.x as f32;
         WINDOW_SIZE_BUFFER[3] = window_physical_size.y as f32;
         WINDOW_SIZE_BUFFER[4] = window.resolution.scale_factor();
-        info!("window size: {}, {}, {}, {}, {}", WINDOW_SIZE_BUFFER[0], WINDOW_SIZE_BUFFER[1], WINDOW_SIZE_BUFFER[2], WINDOW_SIZE_BUFFER[3], WINDOW_SIZE_BUFFER[4]);
+        info!(
+            "window size: {}, {}, {}, {}, {}",
+            WINDOW_SIZE_BUFFER[0],
+            WINDOW_SIZE_BUFFER[1],
+            WINDOW_SIZE_BUFFER[2],
+            WINDOW_SIZE_BUFFER[3],
+            WINDOW_SIZE_BUFFER[4]
+        );
     }
 }
 
-fn listen_window_size(
-    windows: Query<&Window>,
-    resize_events: MessageReader<WindowResized>
-) {
+fn listen_window_size(windows: Query<&Window>, resize_events: MessageReader<WindowResized>) {
     if resize_events.is_empty() {
         return;
     }
@@ -66,17 +65,15 @@ fn listen_window_size(
 }
 
 #[wasm_bindgen]
-#[allow(static_mut_refs)] 
+#[allow(static_mut_refs)]
 pub fn get_window_size_buffer_ptr() -> *const f32 {
-    unsafe {
-        WINDOW_SIZE_BUFFER.as_ptr()
-    }
+    unsafe { WINDOW_SIZE_BUFFER.as_ptr() }
 }
 
 #[wasm_bindgen]
-#[allow(static_mut_refs)] 
+#[allow(static_mut_refs)]
 pub fn get_window_size_buffer_len() -> usize {
-   unsafe { WINDOW_SIZE_BUFFER.len() }
+    unsafe { WINDOW_SIZE_BUFFER.len() }
 }
 
 // 测试日志输出的系统

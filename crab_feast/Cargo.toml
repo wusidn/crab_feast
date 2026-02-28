@@ -14,3 +14,5 @@ bytes.workspace                 = true
 crab_feast_library = { path = "../crab_feast_library" }
 crab_feast_ui_joysticks = { path = "../crab_feast_ui/joysticks" }
 crab_feast_ui_fps = { path = "../crab_feast_ui/fps" }
+bevy_asset_loader.workspace = true
+iyes_progress.workspace = true

@@ -9,8 +9,7 @@ use bevy::{
 };
 
 use crab_feast_ui_joysticks::{
-    Joystick, JoystickEvent, JoystickInteraction, JoystickMarionette,
-    JoystickPlugin,
+    Joystick, JoystickEvent, JoystickInteraction, JoystickMarionette, JoystickPlugin,
 };
 
 #[allow(unused_imports)]
@@ -43,7 +42,7 @@ impl Plugin for InputPlugin {
         app.add_plugins(JoystickPlugin)
             .init_resource::<LookInputIgnorePointers>()
             .init_resource::<MovementInput>()
-            .add_systems(Startup, Self::setup)
+            .add_systems(OnEnter(crate::GameState::Game), Self::setup)
             .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -269,7 +268,9 @@ fn on_rotate_plane_press(
         .map(|camera| {
             camera
                 .logical_viewport_size()
-                .map(|viewport_size| event.pointer_location.position.x < viewport_size.x as f32 / 2.0)
+                .map(|viewport_size| {
+                    event.pointer_location.position.x < viewport_size.x as f32 / 2.0
+                })
                 .unwrap_or(true)
         });
     if hit_left.unwrap_or(true) {
@@ -325,8 +326,14 @@ fn on_keyboard_event(
     let mut speed = walk_speed;
 
     let is_pressed = [
-        KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD,
-        KeyCode::ArrowUp, KeyCode::ArrowLeft, KeyCode::ArrowDown, KeyCode::ArrowRight
+        KeyCode::KeyW,
+        KeyCode::KeyA,
+        KeyCode::KeyS,
+        KeyCode::KeyD,
+        KeyCode::ArrowUp,
+        KeyCode::ArrowLeft,
+        KeyCode::ArrowDown,
+        KeyCode::ArrowRight,
     ]
     .iter()
     .any(|&key| keyboard_input.pressed(key));

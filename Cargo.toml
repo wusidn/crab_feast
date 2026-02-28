@@ -23,3 +23,5 @@ rand                    = "0.8.5"
 serde                   = "1.0.216"
 bevy_replicon_renet     = "0.12.0"
 log                     = "0.4.29"
+bevy_asset_loader      = { version = "0.25", features = ["progress_tracking", "2d"] }
+iyes_progress          = "0.16.0"

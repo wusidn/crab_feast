@@ -7,7 +7,7 @@ pub enum MovementInput {
     Activated {
         direction: Vec2,
         force: f32,
-    }
+    },
 }
 
 #[derive(Event)]
@@ -21,7 +21,7 @@ pub enum JumpInput {
 }
 
 #[derive(Component)]
-pub struct MovementController{
+pub struct MovementController {
     pub speed: f32,
 }
 
@@ -41,9 +41,7 @@ pub struct LookController {
 
 impl Default for MovementController {
     fn default() -> Self {
-        Self {
-            speed: 10.0,
-        }
+        Self { speed: 10.0 }
     }
 }
 
@@ -62,12 +60,18 @@ pub struct ControlInputPlugin;
 impl Plugin for ControlInputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MovementInput>()
-        .init_resource::<JumpInput>()
-        .add_systems(Update, movement_system.run_if(|input: Res<MovementInput>| {
-            matches!(input.as_ref(), MovementInput::Activated { .. })
-        }))
-        .add_systems(Update, jump_system.run_if(resource_changed::<MovementInput>))
-        .add_observer(look_system);
+            .init_resource::<JumpInput>()
+            .add_systems(
+                Update,
+                movement_system.run_if(|input: Res<MovementInput>| {
+                    matches!(input.as_ref(), MovementInput::Activated { .. })
+                }),
+            )
+            .add_systems(
+                Update,
+                jump_system.run_if(resource_changed::<MovementInput>),
+            )
+            .add_observer(look_system);
     }
 }
 
@@ -77,10 +81,13 @@ fn movement_system(
     time: Res<Time>,
 ) {
     if let MovementInput::Activated { direction, force } = input.as_ref() {
-        movement_controllers.iter_mut().for_each(|(mut transform, movement_controller)| {
+        movement_controllers
+            .iter_mut()
+            .for_each(|(mut transform, movement_controller)| {
                 let local_move_direction = Vec3::new(direction.x, 0.0, direction.y);
                 let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
-                let move_distance = world_move_direction * *force * movement_controller.speed * time.delta_secs();
+                let move_distance =
+                    world_move_direction * *force * movement_controller.speed * time.delta_secs();
                 transform.translation += move_distance;
             });
     }
@@ -92,36 +99,38 @@ fn look_system(
 ) {
     let rotate_speed = 10.0;
     let max_pitch = std::f32::consts::FRAC_PI_2 - 0.1; // 防止翻转，限制在±85度
-   
-    look_controllers.iter_mut().for_each(|(mut transform, mut look_controller)| {
-        match look_controller.axis {
-            LookAxis::Yaw => {
-                look_controller.accumulated_yaw -= trigger.event().0.x * rotate_speed;
-            }
-            LookAxis::Pitch => {
-                look_controller.accumulated_pitch = (look_controller.accumulated_pitch - trigger.event().0.y * rotate_speed)
-                    .clamp(-max_pitch, max_pitch);
-            }
-            LookAxis::YawAndPitch => {
-                look_controller.accumulated_yaw -= trigger.event().0.x * rotate_speed;
-                look_controller.accumulated_pitch = (look_controller.accumulated_pitch - trigger.event().0.y * rotate_speed)
-                    .clamp(-max_pitch, max_pitch);
-            }
-        }
 
-        // 基于累积的角度创建新的旋转
-        transform.rotation = Quat::from_euler(
-            EulerRot::ZYX, 
-            0.0, // 滚转
-            look_controller.accumulated_yaw, 
-            look_controller.accumulated_pitch
-        );
-    });
+    look_controllers
+        .iter_mut()
+        .for_each(|(mut transform, mut look_controller)| {
+            match look_controller.axis {
+                LookAxis::Yaw => {
+                    look_controller.accumulated_yaw -= trigger.event().0.x * rotate_speed;
+                }
+                LookAxis::Pitch => {
+                    look_controller.accumulated_pitch = (look_controller.accumulated_pitch
+                        - trigger.event().0.y * rotate_speed)
+                        .clamp(-max_pitch, max_pitch);
+                }
+                LookAxis::YawAndPitch => {
+                    look_controller.accumulated_yaw -= trigger.event().0.x * rotate_speed;
+                    look_controller.accumulated_pitch = (look_controller.accumulated_pitch
+                        - trigger.event().0.y * rotate_speed)
+                        .clamp(-max_pitch, max_pitch);
+                }
+            }
+
+            // 基于累积的角度创建新的旋转
+            transform.rotation = Quat::from_euler(
+                EulerRot::ZYX,
+                0.0, // 滚转
+                look_controller.accumulated_yaw,
+                look_controller.accumulated_pitch,
+            );
+        });
 }
 
-fn jump_system(
-    input: Res<JumpInput>,
-) {
+fn jump_system(input: Res<JumpInput>) {
     if let JumpInput::Activated = input.as_ref() {
         // 跳跃逻辑
     }
