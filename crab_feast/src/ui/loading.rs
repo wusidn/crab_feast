@@ -5,6 +5,14 @@ use crate::GameState;
 
 pub struct LoadingUiPlugin;
 
+#[derive(Resource)]
+struct LoadingUI {
+    root: Entity,
+}
+
+#[derive(Component)]
+struct ProgressBarMarker;
+
 impl Plugin for LoadingUiPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(GameState::AssetLoading), setup_loading_ui)
@@ -16,23 +24,16 @@ impl Plugin for LoadingUiPlugin {
     }
 }
 
-#[derive(Resource)]
-struct LoadingUI {
-    root: Entity,
-    progress_bar: Entity,
-}
-
 fn setup_loading_ui(mut commands: Commands) {
-    commands.spawn(Camera2d);
-
     let progress_bar = commands
         .spawn((
             Node {
                 width: Val::Percent(0.0),
-                height: Val::Px(20.0),
+                height: Val::Percent(100.),
                 ..default()
             },
             BackgroundColor(Color::srgb(0.2, 0.6, 1.0)),
+            ProgressBarMarker,
         ))
         .id();
 
@@ -74,7 +75,7 @@ fn setup_loading_ui(mut commands: Commands) {
         })
         .id();
 
-    commands.insert_resource(LoadingUI { root, progress_bar });
+    commands.insert_resource(LoadingUI { root });
 }
 
 fn cleanup_loading_ui(mut commands: Commands, loading_ui: Res<LoadingUI>) {
@@ -96,6 +97,3 @@ fn update_progress_bar(
         }
     }
 }
-
-#[derive(Component)]
-struct ProgressBarMarker;

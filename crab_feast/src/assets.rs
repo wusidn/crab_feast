@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy_asset_loader::prelude::*;
+use iyes_progress::ProgressPlugin;
 
 use crate::GameState;
 
@@ -25,10 +26,12 @@ pub struct AssetLoadingPlugin;
 
 impl Plugin for AssetLoadingPlugin {
     fn build(&self, app: &mut App) {
-        app.init_state::<GameState>().add_loading_state(
-            LoadingState::new(GameState::AssetLoading)
-                .load_collection::<GameAssets>()
-                .continue_to_state(GameState::Game),
-        );
+        app.init_state::<GameState>()
+            .add_plugins(ProgressPlugin::<GameState>::default())
+            .add_loading_state(
+                LoadingState::new(GameState::AssetLoading)
+                    .load_collection::<GameAssets>()
+                    .continue_to_state(GameState::Game),
+            );
     }
 }

@@ -1,10 +1,12 @@
 use std::{ops::DerefMut, time::Duration};
 
-use bevy::prelude::*;
+use bevy::{camera, prelude::*};
 use bevy_rapier3d::prelude::*;
 
+use crate::camera::GameCamera;
 use crate::input::{ControlInputPlugin, LookAxis, LookController, MovementController};
 use crate::{GameAssets, GameState};
+use crate::root_motion::{RootMotionPlugin, setup_root_motion_for_character, RootBone};
 
 pub struct ScenePlugin;
 
@@ -15,6 +17,7 @@ impl Plugin for ScenePlugin {
                 RapierPhysicsPlugin::<NoUserData>::default(),
                 RapierDebugRenderPlugin::default(),
             ))
+            .add_plugins(RootMotionPlugin)
             .add_systems(OnEnter(GameState::Game), Self::setup)
             .add_systems(
                 Update,
@@ -39,6 +42,7 @@ impl ScenePlugin {
         mut meshes: ResMut<Assets<Mesh>>,
         mut materials: ResMut<Assets<StandardMaterial>>,
         mut graphs: ResMut<Assets<AnimationGraph>>,
+        game_camera: Res<GameCamera>,
     ) {
         let (graph, node_indices) = AnimationGraph::from_clips([
             game_assets.silly_dancing.clone(),
@@ -81,7 +85,7 @@ impl ScenePlugin {
             ColliderDebugColor(Hsla::BLACK),
         ));
 
-        commands
+        let player_entity = commands
             .spawn((
                 Transform::from_xyz(0.0, 1.0, 0.0),
                 RigidBody::Dynamic,
@@ -92,6 +96,8 @@ impl ScenePlugin {
                     axis: LookAxis::Yaw,
                     ..Default::default()
                 },
+                InheritedVisibility::default(),
+                Visibility::Visible,
             ))
             .with_children(|parent| {
                 parent.spawn((
@@ -102,15 +108,16 @@ impl ScenePlugin {
                     },
                 ));
 
-                parent.spawn((
-                    Camera3d::default(),
-                    Transform::from_xyz(0.0, 1.3, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
-                    LookController {
-                        axis: LookAxis::Pitch,
-                        ..Default::default()
-                    },
-                ));
-            });
+            }).id();
+
+        commands.entity(game_camera.0).insert((
+            ChildOf(player_entity),
+            Transform::from_xyz(0.0, 1.3, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+            LookController {
+                axis: LookAxis::Pitch,
+                ..Default::default()
+            },
+        ));
     }
 }
 
