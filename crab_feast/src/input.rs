@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy_rapier3d::prelude::*;
 
 #[derive(Resource, Debug, Clone, Copy, Reflect, Default)]
 pub enum MovementInput {
@@ -76,19 +77,19 @@ impl Plugin for ControlInputPlugin {
 }
 
 fn movement_system(
-    mut movement_controllers: Query<(&mut Transform, &MovementController)>,
+    mut movement_controllers: Query<(&Transform, &MovementController, &mut Velocity)>,
     input: Res<MovementInput>,
-    time: Res<Time>,
 ) {
-    if let MovementInput::Activated { direction, force } = input.as_ref() {
+   if let MovementInput::Activated { direction, force } = input.as_ref() {
         movement_controllers
             .iter_mut()
-            .for_each(|(mut transform, movement_controller)| {
+            .for_each(|(transform, movement_controller, mut velocity)| {
                 let local_move_direction = Vec3::new(direction.x, 0.0, direction.y);
                 let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
                 let move_distance =
-                    world_move_direction * *force * movement_controller.speed * time.delta_secs();
-                transform.translation += move_distance;
+                    world_move_direction * *force * movement_controller.speed;
+                velocity.linvel.x = move_distance.x;
+                velocity.linvel.z = move_distance.z;
             });
     }
 }

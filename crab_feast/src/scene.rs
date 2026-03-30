@@ -1,6 +1,6 @@
 use std::{ops::DerefMut, time::Duration};
 
-use bevy::{camera, prelude::*};
+use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
 use crate::camera::GameCamera;
@@ -67,6 +67,18 @@ impl ScenePlugin {
             Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
             MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
             Transform::from_xyz(0.0, 0.5, 0.0),
+            Collider::cuboid(0.5, 0.5, 0.5),
+            ColliderDebugColor(Hsla::gray(0.6)),
+            RigidBody::Fixed,
+        ));
+
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+            MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
+            Transform::from_xyz(1.0, 0.5, 1.0),
+            Collider::cuboid(0.5, 0.5, 0.5),
+            ColliderDebugColor(Hsla::gray(0.6)),
+            RigidBody::Fixed,
         ));
 
         commands.spawn((
@@ -87,10 +99,18 @@ impl ScenePlugin {
 
         let player_entity = commands
             .spawn((
-                Transform::from_xyz(0.0, 1.0, 0.0),
+                Transform::from_xyz(0.0, 2.0, 0.0),
                 RigidBody::Dynamic,
-                Collider::cuboid(0.5, 1.0, 0.5),
+                Collider::capsule_y(0.5, 0.2),
                 ColliderDebugColor(Hsla::WHITE),
+                Restitution::coefficient(0.3),
+                Damping {
+                    linear_damping: 0.3,
+                    angular_damping: 0.3,
+                },
+                // Ccd::enabled(),  
+                LockedAxes::ROTATION_LOCKED,
+                Velocity::zero(),
                 MovementController::default(),
                 LookController {
                     axis: LookAxis::Yaw,
@@ -103,7 +123,7 @@ impl ScenePlugin {
                 parent.spawn((
                     SceneRoot(game_assets.amy_model.clone()),
                     Transform {
-                        translation: Vec3::new(0.0, -1.0, 0.0),
+                        translation: Vec3::new(0.0, -0.7, 0.0),
                         ..Default::default()
                     },
                 ));

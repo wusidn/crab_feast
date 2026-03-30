@@ -31,12 +31,6 @@ fn setup_ui_camera(mut commands: Commands) {
     commands.insert_resource(UiCamera(ui_camera));
 }
 
-/// 清理UI相机
-fn cleanup_ui_camera(mut commands: Commands, ui_camera: Res<UiCamera>) {
-    commands.entity(ui_camera.0).despawn();
-    commands.remove_resource::<UiCamera>();
-}
-
 /// 设置游戏场景相机
 fn setup_game_camera(mut commands: Commands) {
     let game_camera = commands.spawn((
@@ -48,10 +42,4 @@ fn setup_game_camera(mut commands: Commands) {
     )).id();
     
     commands.insert_resource(GameCamera(game_camera));
-}
-
-/// 清理游戏场景相机
-fn cleanup_game_camera(mut commands: Commands, game_camera: Res<GameCamera>) {
-    commands.entity(game_camera.0).despawn();
-    commands.remove_resource::<GameCamera>();
 }
