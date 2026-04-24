@@ -1,12 +1,21 @@
-use std::{ops::DerefMut, time::Duration};
+use std::time::Duration;
 
+use bevy::app::AnimationSystems;
+use bevy::animation::RepeatAnimation;
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
 use crate::camera::GameCamera;
-use crate::input::{ControlInputPlugin, LookAxis, LookController, MovementController};
+use crate::input::{
+    CharacterBodyYaw, ControlInputPlugin, LookAxis, LookController, MovementController, MovementInput,
+    PlayerCharacterModelRoot,
+};
+use crate::locomotion::{locomotion_anim_from_speed_and_force, LocomotionAnim, LocomotionInput};
+use crate::root_motion::{
+    process_root_motion_rebase_requests, wire_mixamo_hips_for_root_compensation,
+    CharacterRootMotionLink, RootMotionPlugin, RootMotionRebaseRequest,
+};
 use crate::{GameAssets, GameState};
-use crate::root_motion::{RootMotionPlugin, setup_root_motion_for_character, RootBone};
 
 pub struct ScenePlugin;
 
@@ -25,15 +34,46 @@ impl Plugin for ScenePlugin {
             )
             .add_systems(
                 Update,
-                animation_controller.run_if(in_state(GameState::Game)),
+                try_wire_amy_hips_root_motion.run_if(in_state(GameState::Game)),
+            )
+            .add_systems(
+                Update,
+                debug_animation_hotkeys.run_if(in_state(GameState::Game)),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    update_amy_locomotion_animation,
+                    process_root_motion_rebase_requests,
+                )
+                    .chain()
+                    .before(AnimationSystems)
+                    .run_if(in_state(GameState::Game)),
             );
     }
 }
+
+/// Order: idle, walk, run, jog, silly, runba — used for locomotion (first four).
 #[derive(Resource)]
-struct Animations {
-    animations: Vec<AnimationNodeIndex>,
+struct AmyAnimationGraph {
     graph_handle: Handle<AnimationGraph>,
+    idle: AnimationNodeIndex,
+    walk: AnimationNodeIndex,
+    run: AnimationNodeIndex,
+    jog: AnimationNodeIndex,
+    silly: AnimationNodeIndex,
+    runba: AnimationNodeIndex,
 }
+
+#[derive(Resource)]
+struct AmyPlayerBinding {
+    body: Entity,
+    anim_player: Option<Entity>,
+    hips_wired: bool,
+}
+
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+struct LastLocomotion(LocomotionAnim);
 
 impl ScenePlugin {
     fn setup(
@@ -45,16 +85,23 @@ impl ScenePlugin {
         game_camera: Res<GameCamera>,
     ) {
         let (graph, node_indices) = AnimationGraph::from_clips([
+            game_assets.idle.clone(),
+            game_assets.walking.clone(),
+            game_assets.running.clone(),
+            game_assets.jogging.clone(),
             game_assets.silly_dancing.clone(),
             game_assets.runba_dancing.clone(),
-            game_assets.idle.clone(),
-            game_assets.jogging.clone(),
         ]);
 
         let graph_handle = graphs.add(graph);
-        commands.insert_resource(Animations {
-            animations: node_indices,
+        commands.insert_resource(AmyAnimationGraph {
             graph_handle,
+            idle: node_indices[0],
+            walk: node_indices[1],
+            run: node_indices[2],
+            jog: node_indices[3],
+            silly: node_indices[4],
+            runba: node_indices[5],
         });
 
         commands.spawn((
@@ -100,6 +147,7 @@ impl ScenePlugin {
         let player_entity = commands
             .spawn((
                 Transform::from_xyz(0.0, 2.0, 0.0),
+                CharacterBodyYaw::default(),
                 RigidBody::Dynamic,
                 Collider::capsule_y(0.5, 0.2),
                 ColliderDebugColor(Hsla::WHITE),
@@ -108,91 +156,255 @@ impl ScenePlugin {
                     linear_damping: 0.3,
                     angular_damping: 0.3,
                 },
-                // Ccd::enabled(),  
                 LockedAxes::ROTATION_LOCKED,
                 Velocity::zero(),
                 MovementController::default(),
-                LookController {
-                    axis: LookAxis::Yaw,
-                    ..Default::default()
-                },
                 InheritedVisibility::default(),
                 Visibility::Visible,
             ))
             .with_children(|parent| {
-                parent.spawn((
-                    SceneRoot(game_assets.amy_model.clone()),
-                    Transform {
-                        translation: Vec3::new(0.0, -0.7, 0.0),
-                        ..Default::default()
-                    },
-                ));
+                parent
+                    .spawn((
+                        Name::new("PlayerCharacterModelRoot"),
+                        PlayerCharacterModelRoot,
+                        Transform::from_translation(Vec3::new(0.0, -0.7, 0.0)),
+                    ))
+                    .with_children(|p2| {
+                        p2.spawn((SceneRoot(game_assets.amy_model.clone()), Transform::default()));
+                    });
+            })
+            .id();
 
-            }).id();
+        commands.insert_resource(AmyPlayerBinding {
+            body: player_entity,
+            anim_player: None,
+            hips_wired: false,
+        });
 
         commands.entity(game_camera.0).insert((
-            ChildOf(player_entity),
-            Transform::from_xyz(0.0, 1.3, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+            Transform::from_xyz(0.0, 1.3, 5.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
             LookController {
-                axis: LookAxis::Pitch,
+                axis: LookAxis::YawAndPitch,
                 ..Default::default()
             },
         ));
     }
 }
 
+const HIPS_BONE: &str = "mixamorig:Hips";
+
+fn is_descendant_of(
+    mut current: Entity,
+    child_of: &Query<&ChildOf>,
+    ancestor: Entity,
+) -> bool {
+    for _ in 0..256 {
+        if current == ancestor {
+            return true;
+        }
+        if let Ok(c) = child_of.get(current) {
+            current = c.0;
+        } else {
+            return false;
+        }
+    }
+    false
+}
+
+fn find_descendant_by_name(
+    start: Entity,
+    children: &Query<&Children>,
+    names: &Query<&Name>,
+    target: &str,
+) -> Option<Entity> {
+    let mut stack = vec![start];
+    while let Some(e) = stack.pop() {
+        if let Ok(n) = names.get(e) {
+            if n.as_str() == target {
+                return Some(e);
+            }
+        }
+        if let Ok(kids) = children.get(e) {
+            for c in kids.iter() {
+                stack.push(c);
+            }
+        }
+    }
+    None
+}
+
 fn setup_scene_once_loaded(
     mut commands: Commands,
-    animations: Res<Animations>,
+    anims: Res<AmyAnimationGraph>,
+    mut binding: ResMut<AmyPlayerBinding>,
+    child_of: Query<&ChildOf>,
     mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
 ) {
     for (entity, mut player) in &mut players {
+        if !is_descendant_of(entity, &child_of, binding.body) {
+            continue;
+        }
+        if binding.anim_player.is_some() {
+            continue;
+        }
         let mut transitions = AnimationTransitions::new();
-
         transitions
-            .play(&mut player, animations.animations[0], Duration::ZERO)
-            .repeat();
+            .play(&mut player, anims.idle, Duration::ZERO)
+            .set_repeat(RepeatAnimation::Forever);
 
         commands
             .entity(entity)
-            .insert(AnimationGraphHandle(animations.graph_handle.clone()))
-            .insert(transitions);
+            .insert(AnimationGraphHandle(anims.graph_handle.clone()))
+            .insert(transitions)
+            .insert(LastLocomotion(LocomotionAnim::Idle));
 
-        info!("Added animation graph to entity {:?}", entity);
+        binding.anim_player = Some(entity);
     }
 }
 
-fn animation_controller(
-    keyboard_input: Res<ButtonInput<KeyCode>>,
-    animations: Res<Animations>,
-    mut animation_players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+fn try_wire_amy_hips_root_motion(
+    mut commands: Commands,
+    _anims: Res<AmyAnimationGraph>,
+    mut binding: ResMut<AmyPlayerBinding>,
+    children: Query<&Children>,
+    child_of: Query<&ChildOf>,
+    names: Query<&Name>,
 ) {
-    if keyboard_input.just_pressed(KeyCode::Digit1) {
-        info!("Switching to animation 1: Silly Dancing");
-        switch_animation(&mut animation_players, animations.animations[0]);
-    } else if keyboard_input.just_pressed(KeyCode::Digit2) {
-        info!("Switching to animation 2: Runba Dancing");
-        switch_animation(&mut animation_players, animations.animations[1]);
-    } else if keyboard_input.just_pressed(KeyCode::Digit3) {
-        info!("Switching to animation 3: Idle");
-        switch_animation(&mut animation_players, animations.animations[2]);
-    } else if keyboard_input.just_pressed(KeyCode::Digit4) {
-        info!("Switching to animation 4: Jogging");
-        switch_animation(&mut animation_players, animations.animations[3]);
+    if binding.hips_wired {
+        return;
     }
+    let Some(anim_e) = binding.anim_player else {
+        return;
+    };
+
+    let Some(hips) = find_descendant_by_name(binding.body, &children, &names, HIPS_BONE) else {
+        return;
+    };
+    let Ok(parent) = child_of.get(hips) else {
+        return;
+    };
+    let parent = parent.0;
+
+    wire_mixamo_hips_for_root_compensation(&mut commands, parent, hips);
+
+    commands
+        .entity(anim_e)
+        .insert(CharacterRootMotionLink { hips_entity: hips });
+    binding.hips_wired = true;
 }
 
-fn switch_animation(
-    animation_players: &mut Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
-    animation_index: AnimationNodeIndex,
+const FADE: Duration = Duration::from_millis(200);
+const LOCO_IDLE_MAX: f32 = 0.2;
+const LOCO_RUN_MIN: f32 = 4.0;
+const LOCO_RUN_FORCE: f32 = 0.9;
+
+/// Pauses automatic walk/run/idle for a few seconds after number-key debug switches.
+#[derive(Component)]
+struct LocomotionDebugSuppress {
+    end_secs: f32,
+}
+
+fn update_amy_locomotion_animation(
+    mut commands: Commands,
+    anims: Res<AmyAnimationGraph>,
+    binding: Res<AmyPlayerBinding>,
+    input: Res<MovementInput>,
+    time: Res<Time>,
+    bodies: Query<&Velocity>,
+    mut anim_state: Query<(
+        Entity,
+        &mut AnimationPlayer,
+        &mut AnimationTransitions,
+        &mut LastLocomotion,
+        Option<&LocomotionDebugSuppress>,
+    )>,
 ) {
-    for (mut animation_player, mut transitions) in animation_players.iter_mut() {
-        transitions
-            .play(
-                animation_player.deref_mut(),
-                animation_index,
-                Duration::ZERO,
-            )
-            .repeat();
+    let Some(anim_e) = binding.anim_player else {
+        return;
+    };
+    let Ok(vel) = bodies.get(binding.body) else {
+        return;
+    };
+    let Ok((anim_entity, mut ap, mut tr, mut last, debug_hold)) = anim_state.get_mut(anim_e) else {
+        return;
+    };
+    if let Some(s) = debug_hold {
+        if time.elapsed_secs() < s.end_secs {
+            return;
+        }
+    }
+
+    let horizontal = (vel.linvel * Vec3::new(1.0, 0.0, 1.0)).length();
+    let loco_in = match input.as_ref() {
+        MovementInput::Idle => LocomotionInput {
+            speed_horizontal: horizontal,
+            move_force: None,
+        },
+        MovementInput::Activated { direction, force } if direction.length() > 0.01 => {
+            LocomotionInput {
+                speed_horizontal: horizontal,
+                move_force: Some(*force),
+            }
+        }
+        _ => LocomotionInput {
+            speed_horizontal: horizontal,
+            move_force: None,
+        },
+    };
+
+    let desired = locomotion_anim_from_speed_and_force(
+        loco_in,
+        LOCO_IDLE_MAX,
+        LOCO_RUN_MIN,
+        LOCO_RUN_FORCE,
+    );
+
+    if last.0 == desired {
+        return;
+    }
+    last.0 = desired;
+
+    let node = match desired {
+        LocomotionAnim::Idle => anims.idle,
+        LocomotionAnim::Walk => anims.walk,
+        LocomotionAnim::Run => anims.run,
+    };
+    tr.play(&mut ap, node, FADE)
+        .set_repeat(RepeatAnimation::Forever);
+    commands
+        .entity(anim_entity)
+        .insert(RootMotionRebaseRequest);
+}
+
+fn debug_animation_hotkeys(
+    time: Res<Time>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    anims: Res<AmyAnimationGraph>,
+    mut q: Query<(
+        Entity,
+        &mut AnimationPlayer,
+        &mut AnimationTransitions,
+    ), With<LastLocomotion>>,
+    mut commands: Commands,
+) {
+    let any = [
+        (KeyCode::Digit1, anims.silly),
+        (KeyCode::Digit2, anims.runba),
+        (KeyCode::Digit3, anims.jog),
+        (KeyCode::Digit4, anims.run),
+    ]
+    .into_iter()
+    .find(|(k, _)| keyboard.just_pressed(*k));
+    if let Some((_, node)) = any {
+        for (e, mut p, mut t) in &mut q {
+            t.play(&mut p, node, FADE)
+                .set_repeat(RepeatAnimation::Forever);
+            commands.entity(e).insert((
+                RootMotionRebaseRequest,
+                LocomotionDebugSuppress {
+                    end_secs: time.elapsed_secs() + 2.0,
+                },
+            ));
+        }
     }
 }

@@ -4,6 +4,9 @@ use iyes_progress::ProgressPlugin;
 
 use crate::GameState;
 
+/// Character clips: for best results with [`crate::root_motion`] compensation, export
+/// Mixamo animations **in place** (or strip root translation in a DCC) so Hips carry
+/// minimal unwanted world drift in the source data.
 #[derive(AssetCollection, Resource)]
 pub struct GameAssets {
     #[asset(path = "characters/rigs/Amy.glb#Scene0")]
@@ -17,6 +20,12 @@ pub struct GameAssets {
 
     #[asset(path = "characters/animations/Amy/Idle.glb#Animation0")]
     pub idle: Handle<AnimationClip>,
+
+    #[asset(path = "characters/animations/Amy/Walking.glb#Animation0")]
+    pub walking: Handle<AnimationClip>,
+
+    #[asset(path = "characters/animations/Amy/Running.glb#Animation0")]
+    pub running: Handle<AnimationClip>,
 
     #[asset(path = "characters/animations/Amy/Jogging.glb#Animation0")]
     pub jogging: Handle<AnimationClip>,

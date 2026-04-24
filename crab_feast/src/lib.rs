@@ -8,6 +8,7 @@ use bevy::{
 mod assets;
 mod camera;
 mod input;
+mod locomotion;
 mod scene;
 mod state;
 mod ui;

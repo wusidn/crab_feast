@@ -41,7 +41,6 @@ impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(JoystickPlugin)
             .init_resource::<LookInputIgnorePointers>()
-            .init_resource::<MovementInput>()
             .add_systems(OnEnter(crate::GameState::Game), Self::setup)
             .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
 
