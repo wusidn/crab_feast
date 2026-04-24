@@ -23,6 +23,15 @@ pub enum JumpInput {
     Activated,
 }
 
+/// 按住 Left Alt 时为 [`StrafeKeepFacing`](MovementFacingMode::StrafeKeepFacing)：
+/// 身体偏航不随移动转向；否则朝移动方向转向。
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
+pub enum MovementFacingMode {
+    #[default]
+    FaceMoveDirection,
+    StrafeKeepFacing,
+}
+
 /// 仅用于移动方向与蒙皮前向；刚体根保持 **identity** 旋转，相机在世界里独立轨道。
 #[derive(Component, Clone, Copy, Default)]
 pub struct CharacterBodyYaw(pub f32);
@@ -72,9 +81,11 @@ impl Plugin for ControlInputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MovementInput>()
             .init_resource::<JumpInput>()
+            .init_resource::<MovementFacingMode>()
             .add_systems(
                 Update,
                 (
+                    sync_movement_facing_mode_from_keyboard,
                     face_body_toward_local_movement,
                     // 每帧运行：无输入时清零水平速度，避免仅靠阻尼滑行导致与切 idle/根骨 存在长时间错位感
                     movement_system,
@@ -94,8 +105,20 @@ impl Plugin for ControlInputPlugin {
 const FACE_TURN_RADIANS_PER_SEC: f32 = 10.0;
 /// 与目标角差小于此则直接对齐，避免围绕「移动目标角」做无尽闭环修正
 const FACE_ARRIVAL_RAD: f32 = 0.05;
+const STRAFE_MODIFIER_KEY: KeyCode = KeyCode::AltLeft;
 const CAM_OFFSET: Vec3 = Vec3::new(0.0, 1.3, 5.0);
 const CAM_LOOK_AT_OFFSET: Vec3 = Vec3::new(0.0, 0.6, 0.0);
+
+fn sync_movement_facing_mode_from_keyboard(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<MovementFacingMode>,
+) {
+    *mode = if keyboard.pressed(STRAFE_MODIFIER_KEY) {
+        MovementFacingMode::StrafeKeepFacing
+    } else {
+        MovementFacingMode::FaceMoveDirection
+    };
+}
 
 fn body_rotation(yaw: f32) -> Quat {
     Quat::from_axis_angle(Vec3::Y, yaw)
@@ -136,11 +159,15 @@ fn intent_horizontal_xz_on_ground(
 
 fn face_body_toward_local_movement(
     time: Res<Time>,
+    facing: Res<MovementFacingMode>,
     input: Res<MovementInput>,
     game: Res<GameCamera>,
     camera: Query<&LookController, With<Camera3d>>,
     mut q: Query<&mut CharacterBodyYaw, With<MovementController>>,
 ) {
+    if matches!(*facing, MovementFacingMode::StrafeKeepFacing) {
+        return;
+    }
     if let MovementInput::Activated { direction, force } = input.as_ref() {
         if *force < 0.01 || direction.length() < 0.01 {
             return;
