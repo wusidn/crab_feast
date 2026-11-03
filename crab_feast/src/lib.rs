@@ -3,7 +3,7 @@ use bevy::{
     prelude::*,
     text::FontSmoothing,
 };
-
+use crab_feast_library::platform::PlatformInfo;
 
 mod assets;
 mod camera;
@@ -11,20 +11,19 @@ mod input;
 mod scene;
 mod state;
 mod ui;
-mod utils;
-mod root_motion;
 
 pub use assets::GameAssets;
 pub use state::GameState;
 
 pub fn build_app(app: &mut App) {
-    app.add_plugins((
+    app.insert_resource(PlatformInfo::current())
+        .add_plugins((
         camera::CameraPlugin,
         FpsOverlayPlugin {
             config: FpsOverlayConfig {
                 text_config: TextFont {
                     // Here we define size of our overlay
-                    font_size: 28.0,
+                    font_size: FontSize::Rem(1.0),
                     // If we want, we can use a custom font
                     font: default(),
                     // We could also disable font smoothing,

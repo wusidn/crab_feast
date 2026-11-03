@@ -6,7 +6,6 @@ use bevy_rapier3d::prelude::*;
 use crate::camera::GameCamera;
 use crate::input::{ControlInputPlugin, LookAxis, LookController, MovementController};
 use crate::{GameAssets, GameState};
-use crate::root_motion::{RootMotionPlugin, setup_root_motion_for_character, RootBone};
 
 pub struct ScenePlugin;
 
@@ -17,7 +16,6 @@ impl Plugin for ScenePlugin {
                 RapierPhysicsPlugin::<NoUserData>::default(),
                 RapierDebugRenderPlugin::default(),
             ))
-            .add_plugins(RootMotionPlugin)
             .add_systems(OnEnter(GameState::Game), Self::setup)
             .add_systems(
                 Update,
@@ -45,10 +43,7 @@ impl ScenePlugin {
         game_camera: Res<GameCamera>,
     ) {
         let (graph, node_indices) = AnimationGraph::from_clips([
-            game_assets.silly_dancing.clone(),
-            game_assets.runba_dancing.clone(),
             game_assets.idle.clone(),
-            game_assets.jogging.clone(),
         ]);
 
         let graph_handle = graphs.add(graph);
@@ -68,7 +63,7 @@ impl ScenePlugin {
             MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
             Transform::from_xyz(0.0, 0.5, 0.0),
             Collider::cuboid(0.5, 0.5, 0.5),
-            ColliderDebugColor(Hsla::gray(0.6)),
+            ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.6)),
             RigidBody::Fixed,
         ));
 
@@ -77,13 +72,13 @@ impl ScenePlugin {
             MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
             Transform::from_xyz(1.0, 0.5, 1.0),
             Collider::cuboid(0.5, 0.5, 0.5),
-            ColliderDebugColor(Hsla::gray(0.6)),
+            ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.6)),
             RigidBody::Fixed,
         ));
 
         commands.spawn((
             PointLight {
-                shadows_enabled: true,
+                shadow_maps_enabled: true,
                 ..default()
             },
             Transform::from_xyz(4.0, 8.0, 4.0),
@@ -94,7 +89,7 @@ impl ScenePlugin {
         commands.spawn((
             Transform::from_xyz(0.0, -ground_height / 2.0, 0.0),
             Collider::cuboid(ground_size, ground_height, ground_size),
-            ColliderDebugColor(Hsla::BLACK),
+            ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.0)),
         ));
 
         let player_entity = commands
@@ -102,7 +97,7 @@ impl ScenePlugin {
                 Transform::from_xyz(0.0, 2.0, 0.0),
                 RigidBody::Dynamic,
                 Collider::capsule_y(0.5, 0.2),
-                ColliderDebugColor(Hsla::WHITE),
+                ColliderDebugColor(Hsla::hsl(0.0, 0.0, 1.0)),
                 Restitution::coefficient(0.3),
                 Damping {
                     linear_damping: 0.3,
@@ -121,7 +116,7 @@ impl ScenePlugin {
             ))
             .with_children(|parent| {
                 parent.spawn((
-                    SceneRoot(game_assets.amy_model.clone()),
+                    WorldAssetRoot(game_assets.amy_model.clone()),
                     Transform {
                         translation: Vec3::new(0.0, -0.7, 0.0),
                         ..Default::default()
@@ -168,18 +163,22 @@ fn animation_controller(
     mut animation_players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
 ) {
     if keyboard_input.just_pressed(KeyCode::Digit1) {
-        info!("Switching to animation 1: Silly Dancing");
+        info!("Switching to animation 1: RIG-rainAction");
         switch_animation(&mut animation_players, animations.animations[0]);
-    } else if keyboard_input.just_pressed(KeyCode::Digit2) {
-        info!("Switching to animation 2: Runba Dancing");
-        switch_animation(&mut animation_players, animations.animations[1]);
-    } else if keyboard_input.just_pressed(KeyCode::Digit3) {
-        info!("Switching to animation 3: Idle");
-        switch_animation(&mut animation_players, animations.animations[2]);
-    } else if keyboard_input.just_pressed(KeyCode::Digit4) {
-        info!("Switching to animation 4: Jogging");
-        switch_animation(&mut animation_players, animations.animations[3]);
     }
+    // else if keyboard_input.just_pressed(KeyCode::Digit2) {
+    //     info!("Switching to animation 2: Runba Dancing");
+    //     switch_animation(&mut animation_players, animations.animations[1]);
+    // } else if keyboard_input.just_pressed(KeyCode::Digit3) {
+    //     info!("Switching to animation 3: Idle");
+    //     switch_animation(&mut animation_players, animations.animations[2]);
+    // } else if keyboard_input.just_pressed(KeyCode::Digit4) {
+    //     info!("Switching to animation 4: Jogging");
+    //     switch_animation(&mut animation_players, animations.animations[3]);
+    // } else if keyboard_input.just_pressed(KeyCode::Digit5) {
+    //     info!("Switching to animation 5: Jogging");
+    //     switch_animation(&mut animation_players, animations.animatons[4]);
+    // }
 }
 
 fn switch_animation(

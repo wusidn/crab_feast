@@ -1,3 +1,0 @@
-
-mod pc;
-mod mobile;

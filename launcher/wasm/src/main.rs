@@ -1,37 +1,14 @@
 use bevy::{prelude::*, window::WindowResized};
+use crab_feast_launcher::{LaunchConfig, build_app};
 use wasm_bindgen::prelude::wasm_bindgen;
 
 fn main() {
-    console_error_panic_hook::set_once();
-    wasm_logger::init(wasm_logger::Config::new(log::Level::Info));
+    let mut app = build_app(LaunchConfig::default(), |app| {
+        app.add_systems(Startup, update_window_size)
+            .add_systems(PreUpdate, listen_window_size);
+        crab_feast::build_app(app);
+    });
 
-    let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "carab_feast111".to_string(),
-                    focused: true,
-                    resizable: false,
-                    fit_canvas_to_parent: true,
-                    canvas: Some("#bevy".to_string()),
-                    prevent_default_event_handling: false,
-                    present_mode: bevy::window::PresentMode::Fifo,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-            .set(bevy::log::LogPlugin {
-                level: bevy::log::Level::INFO,
-                filter: "wgpu=error,bevy_render=info,bevy_ecs=trace".to_string(),
-                ..Default::default()
-            }),
-    )
-    .add_systems(Startup, update_window_size)
-    .add_systems(PreUpdate, listen_window_size)
-    .add_systems(Startup, test_logs);
-
-    crab_feast::build_app(&mut app);
     app.run();
 }
 
@@ -74,14 +51,4 @@ pub fn get_window_size_buffer_ptr() -> *const f32 {
 #[allow(static_mut_refs)]
 pub fn get_window_size_buffer_len() -> usize {
     unsafe { WINDOW_SIZE_BUFFER.len() }
-}
-
-// 测试日志输出的系统
-fn test_logs() {
-    // 不同级别的日志，都会输出到浏览器控制台
-    error!("这是错误日志 ❌");
-    warn!("这是警告日志 ⚠️");
-    info!("这是信息日志 ℹ️");
-    debug!("这是调试日志 🐛"); // 需要日志级别设为Debug才能看到
-    trace!("这是追踪日志 🕵️"); // 需要级别设为Trace
 }

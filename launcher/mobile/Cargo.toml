@@ -11,13 +11,7 @@ license = "MIT OR Apache-2.0"
 name = "crab_feast_mobile"
 crate-type = ["lib", "cdylib"]
 
-# [[bin]]
-# name = "crab_feast_mobile"
-# path = "src/lib.rs"
-
 [dependencies]
 bevy.workspace = true
 crab_feast = {path = "../../crab_feast"}
-log.workspace = true
-android_logger = "0.12"  # 用于将Rust日志输出到Android Logcat
-cfg-if = "1.0"           # 用于跨平台条件编译
+crab_feast_launcher = {path = "../shared"}

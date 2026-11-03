@@ -1,5 +1,6 @@
 use bevy::prelude::*;
-use bevy_rapier3d::prelude::*;
+
+use bevy_rapier3d::dynamics::Velocity;
 
 #[derive(Resource, Debug, Clone, Copy, Reflect, Default)]
 pub enum MovementInput {
@@ -87,9 +88,9 @@ fn movement_system(
                 let local_move_direction = Vec3::new(direction.x, 0.0, direction.y);
                 let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
                 let move_distance =
-                    world_move_direction * *force * movement_controller.speed;
-                velocity.linvel.x = move_distance.x;
-                velocity.linvel.z = move_distance.z;
+                    world_move_direction * force * movement_controller.speed;
+                velocity.linear.x = move_distance.x;
+                velocity.linear.z = move_distance.z;
             });
     }
 }

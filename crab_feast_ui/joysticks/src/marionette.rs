@@ -33,7 +33,7 @@ impl Plugin for JoystickMarionettePlugin {
 
 
 fn on_joystick_marionette_added(
-    on_add: On<Add, JoystickMarionette>,
+    on_add: On<Add<JoystickMarionette>>,
     mut commands: Commands,
     camera_query: Query<&Camera>,
     mut query: Query<(&Joystick, &mut JoystickState, &JoystickMarionette, &ComputedNode, &ComputedUiTargetCamera), Without<JoystickDisabled>>,
@@ -71,7 +71,7 @@ fn on_joystick_marionette_added(
 }
 
 fn on_joystick_marionette_removed(
-    on_remove: On<Remove, JoystickMarionette>,
+    on_remove: On<Remove<JoystickMarionette>>,
     mut commands: Commands,
     mut query: Query<(&mut JoystickState, &Activated), Without<JoystickDisabled>>,
 ) {

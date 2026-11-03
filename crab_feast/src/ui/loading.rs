@@ -55,7 +55,7 @@ fn setup_loading_ui(mut commands: Commands) {
             parent.spawn((
                 Text::new("Loading..."),
                 TextFont {
-                    font_size: 40.0,
+                    font_size: FontSize::Rem(2.0),
                     ..default()
                 },
                 TextColor(Color::WHITE),

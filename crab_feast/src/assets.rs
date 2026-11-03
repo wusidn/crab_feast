@@ -7,7 +7,7 @@ use crate::GameState;
 #[derive(AssetCollection, Resource)]
 pub struct GameAssets {
     #[asset(path = "characters/rigs/Amy.glb#Scene0")]
-    pub amy_model: Handle<Scene>,
+    pub amy_model: Handle<WorldAsset>,
 
     #[asset(path = "characters/animations/Amy/SillyDancing.glb#Animation0")]
     pub silly_dancing: Handle<AnimationClip>,

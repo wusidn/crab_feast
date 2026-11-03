@@ -12,13 +12,10 @@ use crab_feast_ui_joysticks::{
     Joystick, JoystickEvent, JoystickInteraction, JoystickMarionette, JoystickPlugin,
 };
 
-#[allow(unused_imports)]
+use crab_feast_library::platform::PlatformInfo;
 use crab_feast_ui_joysticks::JoystickMarionettePlugin;
 
-use crate::{
-    input::{LookInput, MovementInput},
-    utils::is_non_mobile,
-};
+use crate::input::{LookInput, MovementInput};
 
 pub struct InputPlugin;
 
@@ -45,9 +42,14 @@ impl Plugin for InputPlugin {
             .add_systems(OnEnter(crate::GameState::Game), Self::setup)
             .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
 
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        app.add_plugins(JoystickMarionettePlugin);
+        if !PlatformInfo::current().is_mobile() {
+            app.add_plugins(JoystickMarionettePlugin);
+        }
     }
+}
+
+fn is_non_mobile(platform: Res<PlatformInfo>) -> bool {
+    !platform.is_mobile()
 }
 
 impl InputPlugin {
@@ -246,19 +248,19 @@ impl AnimatableProperty for BackgroundColorProperty {
 }
 
 fn on_rotate_plane_press(
-    event: On<Pointer<Press>>,
+    event: On<PointerPress>,
     target_camera_query: Query<&ComputedUiTargetCamera>,
     mut look_ignore_pointers: ResMut<LookInputIgnorePointers>,
     camera_query: Query<&Camera>,
 ) {
-    if look_ignore_pointers.0.contains(&event.pointer_id) {
+    if look_ignore_pointers.0.contains(&event.pointer.id) {
         return;
     }
     info!("on_rotate_plane_press: {:?}", event);
     if event.button != PointerButton::Primary {
         return;
     }
-    info!("on_rotate_plane_press: {:?}", event.pointer_location);
+    info!("on_rotate_plane_press: {:?}", event.pointer.location());
 
     let hit_left = target_camera_query
         .get(event.entity)
@@ -269,30 +271,30 @@ fn on_rotate_plane_press(
             camera
                 .logical_viewport_size()
                 .map(|viewport_size| {
-                    event.pointer_location.position.x < viewport_size.x as f32 / 2.0
+                    event.pointer.position.x < viewport_size.x as f32 / 2.0
                 })
                 .unwrap_or(true)
         });
     if hit_left.unwrap_or(true) {
-        look_ignore_pointers.0.insert(event.pointer_id);
+        look_ignore_pointers.0.insert(event.pointer.id);
     }
 }
 
 fn on_rotate_plane_release(
-    event: On<Pointer<Release>>,
+    event: On<PointerRelease>,
     mut look_ignore_pointers: ResMut<LookInputIgnorePointers>,
 ) {
-    look_ignore_pointers.0.remove(&event.pointer_id);
+    look_ignore_pointers.0.remove(&event.pointer.id);
 }
 
 fn on_rotate_plane_drag(
-    event: On<Pointer<Drag>>,
+    event: On<PointerDrag>,
     mut commands: Commands,
     look_ignore_pointers: ResMut<LookInputIgnorePointers>,
     target_camera_query: Query<&ComputedUiTargetCamera>,
     camera_query: Query<&Camera>,
 ) {
-    if look_ignore_pointers.0.contains(&event.pointer_id) {
+    if look_ignore_pointers.0.contains(&event.pointer.id) {
         return;
     }
 

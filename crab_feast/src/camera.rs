@@ -10,25 +10,19 @@ impl Plugin for CameraPlugin {
     }
 }
 
-/// UI相机资源标记
-#[derive(Resource)]
-pub struct UiCamera(pub Entity);
-
 /// 游戏场景相机资源标记
 #[derive(Resource)]
 pub struct GameCamera(pub Entity);
 
 /// 设置UI相机（用于加载界面）
 fn setup_ui_camera(mut commands: Commands) {
-    let ui_camera = commands.spawn((
+    commands.spawn((
         Camera2d,
         Camera {
-            order: 1,  // UI相机渲染在游戏场景前面
+            order: 1, // UI相机渲染在游戏场景前面
             ..default()
         },
-    )).id();
-    
-    commands.insert_resource(UiCamera(ui_camera));
+    ));
 }
 
 /// 设置游戏场景相机

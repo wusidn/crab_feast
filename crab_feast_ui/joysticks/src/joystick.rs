@@ -85,7 +85,7 @@ impl Plugin for JoystickPlugin {
 }
 
 fn joystick_on_add(
-    on_add: On<Add, Joystick>,
+    on_add: On<Add<Joystick>>,
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_query: Query<&Joystick>,
@@ -135,7 +135,7 @@ fn joystick_on_add(
 }
 
 fn joystick_on_remove(
-    on_remove: On<Remove, Joystick>,
+    on_remove: On<Remove<Joystick>>,
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_thumb_query: Query<&JoystickThumb>,
@@ -152,7 +152,7 @@ fn joystick_on_remove(
 }
 
 fn joystick_on_press(
-    event: On<Pointer<Press>>,
+    event: On<PointerPress>,
     mut commands: Commands,
     camera_query: Query<&Camera>,
     mut joystick_state_query: Query<(&mut JoystickState, &ComputedNode, &Joystick, &UiGlobalTransform), (Without<JoystickDisabled>, Without<Activated>)>,
@@ -166,7 +166,7 @@ fn joystick_on_press(
     if let Ok((mut joystick_state, computed_node, joystick, ui_global_transform)) = joystick_state_query.get_mut(joystick_entity)
     {
         // 获取点击位置 logic （相对于窗口左上角的逻辑坐标系）
-        let pointer_position = event.pointer_location.position;
+        let pointer_position = event.pointer.location().position;
 
         // 获取 Joystick UI (相对于视口左上角的物理坐标系)
         let joystick_position = ui_global_transform.translation;
@@ -174,7 +174,7 @@ fn joystick_on_press(
         let max_distance = (computed_node.size / scale_factor).length() * joystick.thumb_max_distance_percent / 100.0 / 2.0;
 
         let activated = Activated { 
-            pointer: event.pointer_id,
+            pointer: event.pointer.id,
             center_position: joystick_position / scale_factor + viewport_rect_min,
             max_distance,
         };
@@ -188,19 +188,19 @@ fn joystick_on_press(
 
     commands.trigger(JoystickEvent {
         entity: joystick_entity,
-        event: JoystickInteraction::Activated(event.pointer_id),
+        event: JoystickInteraction::Activated(event.pointer.id),
     });
 }
 
 fn joystick_on_drag(
-    event: On<Pointer<Drag>>,
+    event: On<PointerDrag>,
     mut commands: Commands,
     mut joystick_state_query: Query<(&mut JoystickState, &Activated)>,
 ) {
     let joystick_entity = event.event_target();
 
     if let Ok((mut joystick_state, activated)) = joystick_state_query.get_mut(joystick_entity) {
-        let pointer_position = event.pointer_location.position;
+        let pointer_position = event.pointer.position;
 
         let thumb_position = pointer_position - activated.center_position;
         joystick_state.direction = thumb_position.normalize();

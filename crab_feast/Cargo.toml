@@ -6,13 +6,7 @@ edition = "2024"
 [dependencies]
 bevy.workspace                  = true
 bevy_rapier3d.workspace         = true
-bevy_replicon.workspace         = true
-bevy_replicon_renet.workspace   = true
-serde.workspace                 = true
-rand.workspace                  = true
-bytes.workspace                 = true
 crab_feast_library = { path = "../crab_feast_library" }
 crab_feast_ui_joysticks = { path = "../crab_feast_ui/joysticks" }
-crab_feast_ui_fps = { path = "../crab_feast_ui/fps" }
 bevy_asset_loader.workspace = true
 iyes_progress.workspace = true
