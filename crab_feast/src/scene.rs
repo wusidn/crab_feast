@@ -37,8 +37,6 @@ impl ScenePlugin {
     fn setup(
         mut commands: Commands,
         game_assets: Res<GameAssets>,
-        mut meshes: ResMut<Assets<Mesh>>,
-        mut materials: ResMut<Assets<StandardMaterial>>,
         mut graphs: ResMut<Assets<AnimationGraph>>,
         game_camera: Res<GameCamera>,
     ) {
@@ -52,45 +50,26 @@ impl ScenePlugin {
             graph_handle,
         });
 
-        commands.spawn((
-            Mesh3d(meshes.add(Circle::new(4.0))),
-            MeshMaterial3d(materials.add(Color::WHITE)),
-            Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-        ));
-
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-            MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
-            Transform::from_xyz(0.0, 0.5, 0.0),
-            Collider::cuboid(0.5, 0.5, 0.5),
-            ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.6)),
-            RigidBody::Fixed,
-        ));
-
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-            MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
-            Transform::from_xyz(1.0, 0.5, 1.0),
-            Collider::cuboid(0.5, 0.5, 0.5),
-            ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.6)),
-            RigidBody::Fixed,
-        ));
-
-        commands.spawn((
-            PointLight {
-                shadow_maps_enabled: true,
-                ..default()
-            },
-            Transform::from_xyz(4.0, 8.0, 4.0),
-        ));
-
         let ground_size = 30.0;
         let ground_height = 0.1;
-        commands.spawn((
-            Transform::from_xyz(0.0, -ground_height / 2.0, 0.0),
-            Collider::cuboid(ground_size, ground_height, ground_size),
-            ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.0)),
-        ));
+
+        // 用可复用的 scene 函数组合整个场景（纯视觉 + 带物理均可进 BSN）
+        commands.spawn_scene_list(bsn_list! {
+            Mesh3d(asset_value(Circle::new(4.0)))
+            MeshMaterial3d<StandardMaterial>(asset_value(Color::WHITE))
+            Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+            --
+            @cube(Vec3::new(0.0, 0.5, 0.0))
+            --
+            @cube(Vec3::new(1.0, 0.5, 1.0))
+            --
+            PointLight {
+                shadow_maps_enabled: true,
+            }
+            Transform::from_xyz(4.0, 8.0, 4.0)
+            --
+            @ground(ground_size, ground_height)
+        });
 
         let player_entity = commands
             .spawn((
@@ -133,6 +112,29 @@ impl ScenePlugin {
                 ..Default::default()
             },
         ));
+    }
+}
+
+/// 一个带物理的立方体：视觉 + 碰撞体 + 固定刚体
+fn cube(translation: Vec3) -> impl Scene {
+    let debug_color = ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.6));
+    bsn! {
+        Mesh3d(asset_value(Cuboid::new(1.0, 1.0, 1.0)))
+        MeshMaterial3d<StandardMaterial>(asset_value(Color::srgb_u8(124, 144, 255)))
+        Transform::from_translation(translation)
+        ~Collider::cuboid(0.5, 0.5, 0.5)
+        debug_color
+        ~RigidBody::Fixed
+    }
+}
+
+/// 地面：只有碰撞体，无渲染 mesh
+fn ground(size: f32, height: f32) -> impl Scene {
+    let debug_color = ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.0));
+    bsn! {
+        Transform::from_xyz(0.0, -height / 2.0, 0.0)
+        ~Collider::cuboid(size, height, size)
+        debug_color
     }
 }
 

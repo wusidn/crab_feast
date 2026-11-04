@@ -1,9 +1,16 @@
 
 use bevy::{input::{ButtonState, mouse::MouseButtonInput, touch::TouchPhase}, picking::pointer::PointerId, prelude::*};
+use bevy::scene::Ready;
 
 pub struct JoystickPlugin;
 
-#[derive(Component)]
+// 注意：必须去掉 derive(FromTemplate)，只保留 Clone。
+// derive(FromTemplate) 会生成伴生模板结构体 JoystickTemplate，其 Default 是"逐字段零值"，
+// 完全绕过下方手工 impl Default 的合理值 → bsn! 裸写 Joystick 时拿到全零组件（thumb_percent=0）。
+// 且它还会与 blanket `impl<T: Clone+Default+Unpin> FromTemplate`（Clone 触发）产生两个冲突的 impl（E0119）。
+// 只保留 Clone → Joystick 命中 blanket FromTemplate（type Template = 自身），
+// bsn! 裸写走 get_or_insert_template::<Joystick> → Joystick::default()（下方手工 impl 的合理值）。
+#[derive(Component, Clone)]
 pub struct Joystick {
     pub hit_area_percent: f32,
     pub thumb_percent: f32,
@@ -77,6 +84,7 @@ impl Default for ElasticRebound {
 impl Plugin for JoystickPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(joystick_on_add)
+            .add_observer(joystick_on_ready)
             .add_observer(joystick_on_remove)
             .add_systems(Update, joystick_on_release)
             .add_systems(Update, joystick_thumb_update)
@@ -84,16 +92,15 @@ impl Plugin for JoystickPlugin {
     }
 }
 
-fn joystick_on_add(
-    on_add: On<Add<Joystick>>,
+// 共用初始化逻辑：spawn thumb 子节点 + 挂 press/drag observer + insert JoystickState。
+// `On<Add<Joystick>>` 和 `On<Ready>` 都走这里，保证两种入口行为一致。
+fn init_joystick(
+    joystick_entity: Entity,
     mut commands: Commands,
     children_query: Query<&Children>,
     joystick_query: Query<&Joystick>,
     joystick_thumb_query: Query<&JoystickThumb>,
 ) {
-    // info!("Joystick added");
-
-    let joystick_entity = on_add.event_target();
     let children = children_query.get(joystick_entity);
 
     let mut joystick_thumb_entity = children.map_or(None, |children| {
@@ -132,6 +139,47 @@ fn joystick_on_add(
             .entity(joystick_entity)
             .insert(JoystickState::default());
     }
+}
+
+// `On<Add<Joystick>>`：命令式 spawn/insert 添加 Joystick 时触发（走 deferred trigger_on_add）
+fn joystick_on_add(
+    on_add: On<Add<Joystick>>,
+    commands: Commands,
+    children_query: Query<&Children>,
+    joystick_query: Query<&Joystick>,
+    joystick_thumb_query: Query<&JoystickThumb>,
+) {
+    // info!("Joystick added");
+    init_joystick(
+        on_add.event_target(),
+        commands,
+        children_query,
+        joystick_query,
+        joystick_thumb_query,
+    );
+}
+
+// `On<Ready>`：场景（bsn!/spawn_scene，含动态 spawn）里每个实体完整 spawn 后触发一次。
+// `Ready` 会对场景中所有实体触发，只有带 `Joystick` 的才初始化，其余直接返回。
+// 这让 Joystick 能原生放进 bsn! 场景，不必再用 .insert() 绕。
+fn joystick_on_ready(
+    ready: On<Ready>,
+    commands: Commands,
+    joystick_query: Query<&Joystick>,
+    children_query: Query<&Children>,
+    joystick_thumb_query: Query<&JoystickThumb>,
+) {
+    let joystick_entity = ready.event_target();
+    if joystick_query.get(joystick_entity).is_err() {
+        return;
+    }
+    init_joystick(
+        joystick_entity,
+        commands,
+        children_query,
+        joystick_query,
+        joystick_thumb_query,
+    );
 }
 
 fn joystick_on_remove(
