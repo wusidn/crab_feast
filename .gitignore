@@ -40,3 +40,6 @@ assets/scenes/load_scene_example-new.scn.ron
 
 # macos
 .DS_Store
+
+# assets
+/assets/characters

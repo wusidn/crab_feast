@@ -4,23 +4,10 @@ use iyes_progress::ProgressPlugin;
 
 use crate::GameState;
 
+/// 角色模型与动画现在由 `preview` 模块按需异步加载，
+/// 这里保留资源位以便后续放入真正需要预加载的资产。
 #[derive(AssetCollection, Resource)]
-pub struct GameAssets {
-    #[asset(path = "characters/rigs/Amy.glb#Scene0")]
-    pub amy_model: Handle<WorldAsset>,
-
-    #[asset(path = "characters/animations/Amy/SillyDancing.glb#Animation0")]
-    pub silly_dancing: Handle<AnimationClip>,
-
-    #[asset(path = "characters/animations/Amy/RunbaDancing.glb#Animation0")]
-    pub runba_dancing: Handle<AnimationClip>,
-
-    #[asset(path = "characters/animations/Amy/Idle.glb#Animation0")]
-    pub idle: Handle<AnimationClip>,
-
-    #[asset(path = "characters/animations/Amy/Jogging.glb#Animation0")]
-    pub jogging: Handle<AnimationClip>,
-}
+pub struct GameAssets {}
 
 pub struct AssetLoadingPlugin;
 

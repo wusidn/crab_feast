@@ -27,13 +27,15 @@ fn setup_ui_camera(mut commands: Commands) {
 
 /// 设置游戏场景相机
 fn setup_game_camera(mut commands: Commands) {
-    let game_camera = commands.spawn((
-        Camera3d::default(),
-        Camera {
-            order: 0,  // 游戏场景相机渲染在底层
-            ..default()
-        },
-    )).id();
-    
+    let game_camera = commands
+        .spawn((
+            Camera3d::default(),
+            Camera {
+                order: 0, // 游戏场景相机渲染在底层
+                ..default()
+            },
+        ))
+        .id();
+
     commands.insert_resource(GameCamera(game_camera));
 }

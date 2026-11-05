@@ -134,26 +134,26 @@ impl InputPlugin {
             .observe(on_rotate_plane_drag)
             .id();
 
-        commands.spawn_scene(bsn! {
-            Node {
-                width: Val::Vw(10.0),
-                height: Val::Vw(10.0),
-                display: Display::Flex,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: UiRect::all(Val::Percent(0.05)),
-                border_radius: BorderRadius::all(Val::Percent(50.0)),
-            }
-            ChildOf(input_layer_entity)
-            BackgroundColor(joystick_idle_color)
-            BorderColor::all(Color::hsla(0.0, 1.0, 1.0, 0.2))
-            animation_target_id
-            MoveInputJoystick
-            Joystick
-        })
-        .insert(AnimatedBy(animation_player_entity))
-        .observe(on_joystick_event);
-
+        commands
+            .spawn_scene(bsn! {
+                Node {
+                    width: Val::Vw(10.0),
+                    height: Val::Vw(10.0),
+                    display: Display::Flex,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Percent(0.05)),
+                    border_radius: BorderRadius::all(Val::Percent(50.0)),
+                }
+                ChildOf(input_layer_entity)
+                BackgroundColor(joystick_idle_color)
+                BorderColor::all(Color::hsla(0.0, 1.0, 1.0, 0.2))
+                animation_target_id
+                MoveInputJoystick
+                Joystick
+            })
+            .insert(AnimatedBy(animation_player_entity))
+            .observe(on_joystick_event);
     }
 }
 
@@ -266,9 +266,7 @@ fn on_rotate_plane_press(
         .map(|camera| {
             camera
                 .logical_viewport_size()
-                .map(|viewport_size| {
-                    event.pointer.position.x < viewport_size.x as f32 / 2.0
-                })
+                .map(|viewport_size| event.pointer.position.x < viewport_size.x as f32 / 2.0)
                 .unwrap_or(true)
         });
     if hit_left.unwrap_or(true) {

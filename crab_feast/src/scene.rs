@@ -1,13 +1,15 @@
-use std::{ops::DerefMut, time::Duration};
-
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
+use crate::GameState;
 use crate::camera::GameCamera;
 use crate::input::{ControlInputPlugin, LookAxis, LookController, MovementController};
-use crate::{GameAssets, GameState};
 
 pub struct ScenePlugin;
+
+/// 玩家实体（角色模型挂在这个实体下面，动画预览切换模型时只替换子节点）
+#[derive(Component)]
+pub struct Avatar;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
@@ -16,40 +18,11 @@ impl Plugin for ScenePlugin {
                 RapierPhysicsPlugin::<NoUserData>::default(),
                 RapierDebugRenderPlugin::default(),
             ))
-            .add_systems(OnEnter(GameState::Game), Self::setup)
-            .add_systems(
-                Update,
-                setup_scene_once_loaded.run_if(in_state(GameState::Game)),
-            )
-            .add_systems(
-                Update,
-                animation_controller.run_if(in_state(GameState::Game)),
-            );
+            .add_systems(OnEnter(GameState::Game), Self::setup);
     }
 }
-#[derive(Resource)]
-struct Animations {
-    animations: Vec<AnimationNodeIndex>,
-    graph_handle: Handle<AnimationGraph>,
-}
-
 impl ScenePlugin {
-    fn setup(
-        mut commands: Commands,
-        game_assets: Res<GameAssets>,
-        mut graphs: ResMut<Assets<AnimationGraph>>,
-        game_camera: Res<GameCamera>,
-    ) {
-        let (graph, node_indices) = AnimationGraph::from_clips([
-            game_assets.idle.clone(),
-        ]);
-
-        let graph_handle = graphs.add(graph);
-        commands.insert_resource(Animations {
-            animations: node_indices,
-            graph_handle,
-        });
-
+    fn setup(mut commands: Commands, game_camera: Res<GameCamera>) {
         let ground_size = 30.0;
         let ground_height = 0.1;
 
@@ -82,7 +55,7 @@ impl ScenePlugin {
                     linear_damping: 0.3,
                     angular_damping: 0.3,
                 },
-                // Ccd::enabled(),  
+                // Ccd::enabled(),
                 LockedAxes::ROTATION_LOCKED,
                 Velocity::zero(),
                 MovementController::default(),
@@ -92,17 +65,9 @@ impl ScenePlugin {
                 },
                 InheritedVisibility::default(),
                 Visibility::Visible,
+                Avatar,
             ))
-            .with_children(|parent| {
-                parent.spawn((
-                    WorldAssetRoot(game_assets.amy_model.clone()),
-                    Transform {
-                        translation: Vec3::new(0.0, -0.7, 0.0),
-                        ..Default::default()
-                    },
-                ));
-
-            }).id();
+            .id();
 
         commands.entity(game_camera.0).insert((
             ChildOf(player_entity),
@@ -135,65 +100,5 @@ fn ground(size: f32, height: f32) -> impl Scene {
         Transform::from_xyz(0.0, -height / 2.0, 0.0)
         ~Collider::cuboid(size, height, size)
         debug_color
-    }
-}
-
-fn setup_scene_once_loaded(
-    mut commands: Commands,
-    animations: Res<Animations>,
-    mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
-) {
-    for (entity, mut player) in &mut players {
-        let mut transitions = AnimationTransitions::new();
-
-        transitions
-            .play(&mut player, animations.animations[0], Duration::ZERO)
-            .repeat();
-
-        commands
-            .entity(entity)
-            .insert(AnimationGraphHandle(animations.graph_handle.clone()))
-            .insert(transitions);
-
-        info!("Added animation graph to entity {:?}", entity);
-    }
-}
-
-fn animation_controller(
-    keyboard_input: Res<ButtonInput<KeyCode>>,
-    animations: Res<Animations>,
-    mut animation_players: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
-) {
-    if keyboard_input.just_pressed(KeyCode::Digit1) {
-        info!("Switching to animation 1: RIG-rainAction");
-        switch_animation(&mut animation_players, animations.animations[0]);
-    }
-    // else if keyboard_input.just_pressed(KeyCode::Digit2) {
-    //     info!("Switching to animation 2: Runba Dancing");
-    //     switch_animation(&mut animation_players, animations.animations[1]);
-    // } else if keyboard_input.just_pressed(KeyCode::Digit3) {
-    //     info!("Switching to animation 3: Idle");
-    //     switch_animation(&mut animation_players, animations.animations[2]);
-    // } else if keyboard_input.just_pressed(KeyCode::Digit4) {
-    //     info!("Switching to animation 4: Jogging");
-    //     switch_animation(&mut animation_players, animations.animations[3]);
-    // } else if keyboard_input.just_pressed(KeyCode::Digit5) {
-    //     info!("Switching to animation 5: Jogging");
-    //     switch_animation(&mut animation_players, animations.animatons[4]);
-    // }
-}
-
-fn switch_animation(
-    animation_players: &mut Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
-    animation_index: AnimationNodeIndex,
-) {
-    for (mut animation_player, mut transitions) in animation_players.iter_mut() {
-        transitions
-            .play(
-                animation_player.deref_mut(),
-                animation_index,
-                Duration::ZERO,
-            )
-            .repeat();
     }
 }

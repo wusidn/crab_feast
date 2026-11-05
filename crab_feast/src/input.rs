@@ -81,17 +81,16 @@ fn movement_system(
     mut movement_controllers: Query<(&Transform, &MovementController, &mut Velocity)>,
     input: Res<MovementInput>,
 ) {
-   if let MovementInput::Activated { direction, force } = input.as_ref() {
-        movement_controllers
-            .iter_mut()
-            .for_each(|(transform, movement_controller, mut velocity)| {
+    if let MovementInput::Activated { direction, force } = input.as_ref() {
+        movement_controllers.iter_mut().for_each(
+            |(transform, movement_controller, mut velocity)| {
                 let local_move_direction = Vec3::new(direction.x, 0.0, direction.y);
                 let world_move_direction = transform.rotation.mul_vec3(local_move_direction);
-                let move_distance =
-                    world_move_direction * force * movement_controller.speed;
+                let move_distance = world_move_direction * force * movement_controller.speed;
                 velocity.linear.x = move_distance.x;
                 velocity.linear.z = move_distance.z;
-            });
+            },
+        );
     }
 }
 

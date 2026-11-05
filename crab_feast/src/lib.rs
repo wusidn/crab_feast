@@ -16,8 +16,7 @@ pub use assets::GameAssets;
 pub use state::GameState;
 
 pub fn build_app(app: &mut App) {
-    app.insert_resource(PlatformInfo::current())
-        .add_plugins((
+    app.insert_resource(PlatformInfo::current()).add_plugins((
         camera::CameraPlugin,
         FpsOverlayPlugin {
             config: FpsOverlayConfig {
@@ -47,4 +46,5 @@ pub fn build_app(app: &mut App) {
         ui::UiPlugin,
         scene::ScenePlugin,
     ));
+
 }
