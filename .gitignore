@@ -43,3 +43,6 @@ assets/scenes/load_scene_example-new.scn.ron
 
 # assets
 /assets/characters
+
+# 源模型 FBX（单文件几十~上百 MB，本地保留，不入库）
+/assets/source/character/rigs/
