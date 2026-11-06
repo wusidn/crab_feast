@@ -52,6 +52,10 @@ pub(super) fn sync_clip_set(
     if runtime.clips.is_empty() {
         return;
     }
+    // 剪辑集合与角色都没变时，不必每帧拼指纹字符串
+    if clips.rig.is_some() && !runtime.is_changed() {
+        return;
+    }
     let character = catalog.character(preview.character);
     let name = character.map(|def| def.name.as_str()).unwrap_or("");
     let fingerprint = runtime.clips.keys().cloned().collect::<Vec<_>>().join("|");
@@ -110,9 +114,6 @@ pub(super) fn drive_pose(
     targets: Query<(&AnimationTargetId, Option<&AnimatedBy>)>,
     names: Query<&Name>,
     mut transforms: Query<&mut Transform>,
-    mut last_log: Local<usize>,
-    // (evaluate_space 累计微秒, 写骨骼累计微秒, 帧数)
-    mut stats: Local<(f64, f64, u32)>,
 ) {
     let Some(model) = runtime.model else {
         return;
@@ -154,7 +155,6 @@ pub(super) fn drive_pose(
     let mut last_point = [0.0, 0.0];
     let mut last_root_delta = Vec3::ZERO;
     let mut any = false;
-    let mut apply_micros = 0.0f64;
 
     // 预览打开时只驱动当前选中的混合系统；关闭编辑器后按「启用」顺序驱动
     let selected: Vec<&super::registry::MixerSnapshot> = if editor.open {
@@ -183,11 +183,8 @@ pub(super) fn drive_pose(
             hips: skeleton.hips,
         };
 
-        let eval_start = std::time::Instant::now();
         let output = evaluate_space(&mixer.space, &mut context);
-        stats.0 += eval_start.elapsed().as_secs_f64() * 1e6;
 
-        let apply_start = std::time::Instant::now();
         for (id, bone) in output.pose.iter() {
             if let Some(entity) = skeleton.by_id.get(id) {
                 if let Ok(mut transform) = transforms.get_mut(*entity) {
@@ -195,8 +192,6 @@ pub(super) fn drive_pose(
                 }
             }
         }
-        apply_micros += apply_start.elapsed().as_secs_f64() * 1e6;
-
         last_weights = output.clip_weights.clone();
         last_issues = output.issues.clone();
         last_point = output.point;
@@ -224,34 +219,6 @@ pub(super) fn drive_pose(
         }
     }
 
-    if any {
-        stats.2 += 1;
-    }
-    stats.1 += apply_micros;
-
-    if debug_enabled() {
-        let second = time.elapsed_secs() as usize;
-        if second != *last_log {
-            *last_log = second;
-            let frames = stats.2.max(1) as f64;
-            let eval_us = stats.0 / frames;
-            let apply_us = stats.1 / frames;
-            info!(
-                "[blendspace] t={}s point={:?} weights={:?} eval={:.0}us apply={:.0}us 上限{:.0}fps",
-                second,
-                last_point,
-                weights,
-                eval_us,
-                apply_us,
-                if eval_us > 0.0 { 1e6 / eval_us } else { 0.0 }
-            );
-            *stats = (0.0, 0.0, 0);
-        }
-    }
-}
-
-fn debug_enabled() -> bool {
-    std::env::var("CRAB_ANIM_DEBUG").is_ok()
 }
 
 #[allow(clippy::too_many_arguments)]

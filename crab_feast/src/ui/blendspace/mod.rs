@@ -729,14 +729,27 @@ fn sync_dropdown(
         Query<(&Node, Option<&ChildOf>), Without<BlendDropdownPopup>>,
     )>,
 ) {
-    for (popup, anchor, mut node, mut scroll) in &mut popups {
-        let open = editor.open_dropdown == Some(popup.0);
-        if open && node.display != Display::Flex {
-            scroll.0 = Vec2::ZERO;
+    // 收起状态只保证浮层隐藏，不做几何测量（每帧走父链 + 取 rect 是白花）
+    let Some(open_kind) = editor.open_dropdown else {
+        for (_popup, _anchor, mut node, mut scroll) in &mut popups {
+            if node.display != Display::None {
+                node.display = Display::None;
+                scroll.0 = Vec2::ZERO;
+            }
         }
-        let desired = if open { Display::Flex } else { Display::None };
-        if node.display != desired {
-            node.display = desired;
+        return;
+    };
+
+    for (popup, anchor, mut node, mut scroll) in &mut popups {
+        if popup.0 != open_kind {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+            continue;
+        }
+        if node.display != Display::Flex {
+            scroll.0 = Vec2::ZERO;
+            node.display = Display::Flex;
         }
         // 触发器的上下边界（UI 逻辑像素，原点左上）
         let trigger_rect = {
@@ -791,10 +804,6 @@ fn sync_dropdown(
         // 高度按 8px 取整，避免每帧微调布局
         let max_height = Val::Px(((available.min(300.0)) / 8.0).floor().max(2.0) * 8.0);
 
-        info!(
-            "[rect] {:?} trigger=({:.0}..{:.0}) host=({:.0}..{:.0}) up={:.0} down={:.0} max={:?}",
-            anchor.trigger, trigger_top, trigger_bottom, host_top, host_bottom, space_up, space_down, max_height
-        );
         let want_top = if upward { Val::Auto } else { Val::Percent(100.0) };
         let want_bottom = if upward { Val::Percent(100.0) } else { Val::Auto };
         if node.top != want_top || node.bottom != want_bottom {

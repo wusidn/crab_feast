@@ -1,5 +1,5 @@
+use avian3d::prelude::*;
 use bevy::prelude::*;
-use bevy_rapier3d::prelude::*;
 
 use crate::GameState;
 use crate::camera::GameCamera;
@@ -15,8 +15,8 @@ impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ControlInputPlugin)
             .add_plugins((
-                RapierPhysicsPlugin::<NoUserData>::default(),
-                RapierDebugRenderPlugin::default(),
+                PhysicsPlugins::default(),
+                PhysicsDebugPlugin,
             ))
             .add_systems(OnEnter(GameState::Game), Self::setup);
     }
@@ -48,16 +48,16 @@ impl ScenePlugin {
             .spawn((
                 Transform::from_xyz(0.0, 2.0, 0.0),
                 RigidBody::Dynamic,
-                Collider::capsule_y(0.5, 0.2),
-                ColliderDebugColor(Hsla::hsl(0.0, 0.0, 1.0)),
-                Restitution::coefficient(0.3),
-                Damping {
-                    linear_damping: 0.3,
-                    angular_damping: 0.3,
-                },
-                // Ccd::enabled(),
+                // Avian 的 capsule 用「半径 + 不含半球的原柱长度」，
+                // rapier 的 capsule_y(half_height, radius) 等价于 capsule(0.2, 1.0)
+                Collider::capsule(0.2, 1.0),
+                DebugRender::default().with_collider_color(Color::WHITE),
+                Restitution::new(0.3),
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                // SweptCcd::default(),
                 LockedAxes::ROTATION_LOCKED,
-                Velocity::zero(),
+                LinearVelocity::ZERO,
                 MovementController::default(),
                 LookController {
                     axis: LookAxis::Yaw,
@@ -82,23 +82,27 @@ impl ScenePlugin {
 
 /// 一个带物理的立方体：视觉 + 碰撞体 + 固定刚体
 fn cube(translation: Vec3) -> impl Scene {
-    let debug_color = ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.6));
+    // Avian 的 Collider::cuboid 收的是「完整边长」，rapier 收的是半长，数值因此翻倍
+    let debug_color = DebugRender::default().with_collider_color(Color::srgb(0.6, 0.6, 0.6));
     bsn! {
         Mesh3d(asset_value(Cuboid::new(1.0, 1.0, 1.0)))
         MeshMaterial3d<StandardMaterial>(asset_value(Color::srgb_u8(124, 144, 255)))
         Transform::from_translation(translation)
-        ~Collider::cuboid(0.5, 0.5, 0.5)
+        ~Collider::cuboid(1.0, 1.0, 1.0)
         debug_color
-        ~RigidBody::Fixed
+        ~RigidBody::Static
     }
 }
 
 /// 地面：只有碰撞体，无渲染 mesh
 fn ground(size: f32, height: f32) -> impl Scene {
-    let debug_color = ColliderDebugColor(Hsla::hsl(0.0, 0.0, 0.0));
+    let debug_color = DebugRender::default().with_collider_color(Color::srgb(0.0, 0.0, 0.0));
     bsn! {
         Transform::from_xyz(0.0, -height / 2.0, 0.0)
-        ~Collider::cuboid(size, height, size)
+        ~Collider::cuboid(size * 2.0, height * 2.0, size * 2.0)
+        // Avian 不会把「只有 Collider 没有 RigidBody」的实体当成静态体，
+        // 缺了这行地面就是个纯渲染/纯调试物件，物体会直接穿过去
+        ~RigidBody::Static
         debug_color
     }
 }

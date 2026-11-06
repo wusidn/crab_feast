@@ -21,14 +21,39 @@ fn speed_one() -> f32 {
     1.0
 }
 
-/// 默认轴范围：两轴都是 [-1, 1] 的归一化区间
-fn unit_ranges() -> [[f32; 2]; 2] {
-    [[-1.0, 1.0], [-1.0, 1.0]]
+/// 某一轴上采样点的实际跨度 `(min, max)`；没有采样点时返回 `None`
+fn sample_span(samples: &[Sample2D], axis: usize) -> Option<(f32, f32)> {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for sample in samples {
+        let value = sample.at[axis.min(1)];
+        if value.is_finite() {
+            min = min.min(value);
+            max = max.max(value);
+        }
+    }
+    if min.is_finite() && max.is_finite() {
+        Some((min, max))
+    } else {
+        None
+    }
 }
 
-/// 移动混合的默认轴范围：yaw 用角度、speed 用归一化速度
-fn locomotion_ranges() -> [[f32; 2]; 2] {
-    [[-180.0, 180.0], [0.0, 1.0]]
+/// 文档没有写轴范围时，按采样点跨度推导：两侧各留 10% 余量，单点轴取该点 ±0.5。
+/// 完全没有采样点时退回归一化的 `[-1, 1]`。
+///
+/// 用「推导」而不是「猜一个默认单位」：同一个 `BlendSpaceDoc` 既放角度轴也放
+/// 归一化轴，任何固定默认值都会在另一类轴上把参数挡在滑杆范围之外。
+fn derived_range(samples: &[Sample2D], axis: usize) -> [f32; 2] {
+    let Some((min, max)) = sample_span(samples, axis) else {
+        return [-1.0, 1.0];
+    };
+    let span = max - min;
+    if span <= 1e-4 {
+        return [min - 0.5, max + 0.5];
+    }
+    let pad = span * 0.1;
+    [min - pad, max + pad]
 }
 
 /// 一个 Blend Space 2D（文档即真源，可直接序列化进 assets）
@@ -37,9 +62,12 @@ pub struct BlendSpaceDoc {
     pub version: u32,
     /// 两个输入轴的参数名，顺序为 [横轴, 纵轴]
     pub params: [String; 2],
-    /// 两个输入轴的取值区间，顺序与 `params` 对齐
-    #[serde(default = "unit_ranges")]
-    pub ranges: [[f32; 2]; 2],
+    /// 两个输入轴的取值区间，顺序与 `params` 对齐。
+    ///
+    /// 省略时按采样点跨度推导（见 [`BlendSpaceDoc::range`]），**不再**用一个
+    /// 写死的默认区间——那会在「角度轴 vs 归一化轴」之间把一侧参数挡在滑杆外。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranges: Option<[[f32; 2]; 2]>,
     /// 采样点：参数坐标 + 剪辑名
     pub samples: Vec<Sample2D>,
     #[serde(default = "speed_one")]
@@ -51,7 +79,7 @@ impl Default for BlendSpaceDoc {
         Self {
             version: 1,
             params: ["yaw".to_string(), "speed".to_string()],
-            ranges: locomotion_ranges(),
+            ranges: None,
             samples: Vec::new(),
             speed: 1.0,
         }
@@ -63,9 +91,48 @@ impl BlendSpaceDoc {
         &self.params[index.min(1)]
     }
 
-    /// 某一轴的 `[最小值, 最大值]`
+    /// 某一轴的 `[最小值, 最大值]`：文档里写了就用，没写就按采样点跨度推导
     pub fn range(&self, index: usize) -> [f32; 2] {
-        self.ranges[index.min(1)]
+        let index = index.min(1);
+        match self.ranges {
+            Some(ranges) => ranges[index],
+            None => derived_range(&self.samples, index),
+        }
+    }
+
+    /// 两轴区间的一次性快照：UI 每帧要拿同一个值同时换算像素与参数增量，
+    /// 分别调用 `range()` 在推导模式下没有差别，但集中取更省事也更好读。
+    pub fn axis_ranges(&self) -> [[f32; 2]; 2] {
+        [self.range(0), self.range(1)]
+    }
+
+    /// 把显式范围扩张到至少包住全部采样点，返回是否改动过。
+    ///
+    /// 老文档把 speed 写成 `0..1`、yaw 写成 `±180` 时，滑杆会把另一半参数
+    /// （负速度）直接截掉；这里只做「扩张」，从不缩小，不会动编辑者刻意留大的区间。
+    pub fn fit_ranges(&mut self) -> bool {
+        let Some(mut ranges) = self.ranges else {
+            return false;
+        };
+        let mut changed = false;
+        for axis in 0..2 {
+            let Some((min, max)) = sample_span(&self.samples, axis) else {
+                continue;
+            };
+            let span = (ranges[axis][1] - ranges[axis][0]).abs().max(1e-6);
+            if min < ranges[axis][0] {
+                ranges[axis][0] = min - span * 0.02;
+                changed = true;
+            }
+            if max > ranges[axis][1] {
+                ranges[axis][1] = max + span * 0.02;
+                changed = true;
+            }
+        }
+        if changed {
+            self.ranges = Some(ranges);
+        }
+        changed
     }
 
     pub fn weights(&self, point: [f32; 2]) -> Vec<(String, f32)> {
@@ -83,10 +150,11 @@ impl BlendSpaceDoc {
     }
 
     pub fn add_sample(&mut self, at: [f32; 2], clip: impl Into<String>) -> usize {
+        let ranges = self.axis_ranges();
         self.samples.push(Sample2D {
             at: [
-                at[0].clamp(self.ranges[0][0], self.ranges[0][1]),
-                at[1].clamp(self.ranges[1][0], self.ranges[1][1]),
+                at[0].clamp(ranges[0][0], ranges[0][1]),
+                at[1].clamp(ranges[1][0], ranges[1][1]),
             ],
             clip: clip.into(),
             reverse: false,
@@ -124,6 +192,23 @@ impl BlendSpaceDoc {
                 issues.push(format!("{} 坐标上有重复的 {} 采样点", format_point(sample.at), sample.clip));
             }
             seen.push((key, &sample.clip));
+        }
+        if let Some(ranges) = self.ranges {
+            for axis in 0..2 {
+                let Some((min, max)) = sample_span(&self.samples, axis) else {
+                    continue;
+                };
+                if min < ranges[axis][0] - 1e-4 || max > ranges[axis][1] + 1e-4 {
+                    issues.push(format!(
+                        "{} 轴范围 [{:.2}, {:.2}] 没包住采样点 [{:.2}, {:.2}]，滑杆会有一侧调不到",
+                        self.axis(axis),
+                        ranges[axis][0],
+                        ranges[axis][1],
+                        min,
+                        max
+                    ));
+                }
+            }
         }
         issues
     }
@@ -491,7 +576,7 @@ mod tests {
     fn yaw_speed_grid_interpolates() {
         use crate::anim::blendspace::Sample2D;
         let mut doc = BlendSpaceDoc::default();
-        doc.ranges = [[-90.0, 90.0], [-1.0, 1.0]];
+        doc.ranges = Some([[-90.0, 90.0], [-1.0, 1.0]]);
         let walk = [
             (-90.0, "LeftStrafeWalking", false),
             (0.0, "Walking", false),
@@ -582,5 +667,152 @@ mod tests {
         assert!(effective_period(&[(0.0, 8.333, 1.0)]).is_none());
         // 半步幅也要被忽略，否则低速档会把周期算爆
         assert!((effective_period(&[(1.190, 1.033, 1.0)]).unwrap() - 1.033).abs() < 1e-4);
+    }
+
+    /// 文档不写 ranges 时按采样点跨度推导，角度轴不会再被当成归一化轴。
+    #[test]
+    fn missing_ranges_derive_from_samples() {
+        let mut doc = BlendSpaceDoc::default();
+        doc.params = ["yaw".to_string(), "speed".to_string()];
+        doc.samples.push(Sample2D {
+            at: [-90.0, -1.0],
+            clip: "LeftStrafe".into(),
+            reverse: true,
+        });
+        doc.samples.push(Sample2D {
+            at: [90.0, 1.0],
+            clip: "RightStrafe".into(),
+            reverse: false,
+        });
+
+        let yaw = doc.range(0);
+        let speed = doc.range(1);
+        assert!(yaw[0] < -90.0 && yaw[1] > 90.0, "yaw 轴应覆盖 ±90，实际 {yaw:?}");
+        assert!(speed[0] < -1.0 && speed[1] > 1.0, "speed 轴应覆盖 ±1，实际 {speed:?}");
+        // 归一化余量不该把角度轴压回 ±1
+        assert!(yaw[1] > 45.0);
+    }
+
+    /// 显式范围太窄时 fit_ranges 会扩张到包住采样点，validate 也能提前报出来。
+    #[test]
+    fn narrow_ranges_are_fitted_and_reported() {
+        let mut doc = BlendSpaceDoc::default();
+        doc.ranges = Some([[-90.0, 90.0], [0.0, 1.0]]);
+        doc.samples.push(Sample2D {
+            at: [0.0, -1.0],
+            clip: "Running".into(),
+            reverse: true,
+        });
+        let before = doc.validate();
+        assert!(
+            before.iter().any(|issue| issue.contains("speed") && issue.contains("没包住")),
+            "validate 应报出 speed 轴调不到负值，实际 {before:?}"
+        );
+        assert!(doc.fit_ranges(), "负向采样点越界时应触发扩张");
+        assert!(doc.range(1)[0] < -1.0, "扩张后下限应小于 -1");
+        assert!(!doc.fit_ranges(), "已包住后不应再触发改动");
+        assert!(doc.validate().iter().all(|issue| !issue.contains("没包住")));
+    }
+
+    /// ranges 字段可省略、也可原样存取：老文档缺字段不会静默换成别的单位。
+    #[test]
+    fn ranges_round_trip() {
+        let mut doc = BlendSpaceDoc::default();
+        doc.samples.push(Sample2D {
+            at: [-90.0, 0.0],
+            clip: "Idle".into(),
+            reverse: false,
+        });
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(!json.contains("ranges"), "未指定范围时不该写入 ranges：{json}");
+        let back: BlendSpaceDoc = serde_json::from_str(&json).unwrap();
+        assert!(back.range(0)[0] < -90.0, "反序列化后应按采样点推导");
+
+        doc.ranges = Some([[-90.0, 90.0], [-1.0, 1.0]]);
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: BlendSpaceDoc = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.range(0), [-90.0, 90.0]);
+        assert_eq!(back.range(1), [-1.0, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use bevy::animation::{animated_field, AnimationClip, AnimationTargetId};
+
+    /// 诊断用：按真实骨架规模（169 个 target、3 通道、30 关键帧）量一次
+    /// 4 剪辑混合的单帧求值成本。`cargo test -p crab_feast_library bench_pose -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_pose_sampling() {
+        let names: Vec<Name> = (0..169).map(|i| Name::new(format!("Bone{i}"))).collect();
+        let ids: Vec<AnimationTargetId> =
+            names.iter().map(|name| AnimationTargetId::from_name(name)).collect();
+
+        let mut clip = AnimationClip::default();
+        for (index, id) in ids.iter().enumerate() {
+            let base = index as f32 * 0.01;
+            let keys = (0..30).map(|k| {
+                let t = k as f32 / 29.0;
+                (
+                    t,
+                    Vec3::new(
+                        base + (t * std::f32::consts::TAU).sin() * 0.01,
+                        base + (t * std::f32::consts::TAU).cos() * 0.01,
+                        base,
+                    ),
+                )
+            });
+            clip.add_curve_to_target(
+                *id,
+                AnimatableCurve::new(
+                    animated_field!(Transform::translation),
+                    AnimatableKeyframeCurve::new(keys).unwrap(),
+                ),
+            );
+            let keys = (0..30).map(|k| {
+                let t = k as f32 / 29.0;
+                (t, Quat::from_rotation_y(t * std::f32::consts::TAU))
+            });
+            clip.add_curve_to_target(
+                *id,
+                AnimatableCurve::new(
+                    animated_field!(Transform::rotation),
+                    AnimatableKeyframeCurve::new(keys).unwrap(),
+                ),
+            );
+            let keys = (0..30).map(|k| (k as f32 / 29.0, Vec3::ONE * (1.0 + base)));
+            clip.add_curve_to_target(
+                *id,
+                AnimatableCurve::new(
+                    animated_field!(Transform::scale),
+                    AnimatableKeyframeCurve::new(keys).unwrap(),
+                ),
+            );
+        }
+
+        let rest: HashMap<AnimationTargetId, BonePose> = ids
+            .iter()
+            .map(|id| (*id, BonePose::IDENTITY))
+            .collect();
+
+        const FRAMES: usize = 600;
+        let start = std::time::Instant::now();
+        for frame in 0..FRAMES {
+            let time = (frame as f32 / FRAMES as f32) * clip.duration();
+            let mut poses = Vec::with_capacity(4);
+            for _ in 0..4 {
+                poses.push((0.25f32, Pose::sample(&clip, &ids, &rest, time)));
+            }
+            let _ = Pose::combine(&poses);
+        }
+        let per_frame = start.elapsed().as_secs_f64() * 1e3 / FRAMES as f64;
+        println!(
+            "4 剪辑 × {} target × 3 通道：{:.3} ms/帧（含 combine），单剪辑约 {:.3} ms",
+            ids.len(),
+            per_frame,
+            per_frame / 4.0
+        );
     }
 }

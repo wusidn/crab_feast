@@ -332,6 +332,30 @@ def keep_only_action(arm, name: str):
     return action
 
 
+def action_fcurves(action, slot=None) -> list:
+    """取 action 里的所有 fcurve。
+
+    Blender 4.4 起 action 改成「layer → strip → channelbag(slot)」的分层存储，
+    5.x 里 `action.fcurves` 已经彻底移除（用它会抛
+    `AttributeError: 'Action' object has no attribute 'fcurves'`）。
+    slot 用来只取绑定本骨架那条 slot 的通道，避免多 slot action 混进别人的曲线。
+    """
+    legacy = getattr(action, "fcurves", None)
+    if legacy is not None:
+        return list(legacy)
+
+    bags = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            if slot is not None and hasattr(strip, "channelbag"):
+                bag = strip.channelbag(slot)
+                if bag is not None:
+                    bags.append(bag)
+                continue
+            bags.extend(getattr(strip, "channelbags", []))
+    return [fc for bag in bags for fc in bag.fcurves]
+
+
 def hips_local_axis(arm) -> Vector:
     """世界 Z 轴在 Ctrl_Hips 局部（matrix_basis）空间中的方向，用于贴地校正。
 
@@ -419,7 +443,8 @@ def ground_adjust(arm, action, probe: GroundProbe, start: int, end: int,
     axis = hips_local_axis(arm)
     curves = {}
     path = 'pose.bones["Ctrl_Hips"].location'
-    for fc in action.fcurves:
+    slot = arm.animation_data.action_slot if arm.animation_data else None
+    for fc in action_fcurves(action, slot):
         if fc.data_path == path:
             curves[fc.array_index] = fc
     if len(curves) < 3:

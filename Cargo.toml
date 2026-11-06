@@ -17,8 +17,22 @@ resolver = "2"
 default-members = ["launcher/pc"]
 
 [workspace.dependencies]
-bevy                    = { version = "0.20.1", features = ["bevy_dev_tools", "debug", "render_dev_tools", "jpeg"] }
-bevy_rapier3d           = "0.37.0"
+# complex_script_segmentation：给 parley 打开 ICU4X 的 CJK 词典切分，
+# 否则文本排版会打 "ICU4X data error: No segmentation model for complex script"
+bevy                    = { version = "0.20.1", features = ["bevy_dev_tools", "debug", "render_dev_tools", "complex_script_segmentation"] }
+# 物理引擎：Avian 0.8（对应 Bevy 0.20）。
+# 关闭默认特性里的 parallel，因为 parry 的 rayon 后端在 wasm32 上编译不过；
+# 其余默认特性（3d / parry-f32 / debug-plugin / xpbd_joints /
+# collider-from-mesh / bevy_scene / bevy_picking）在这里显式补回。
+avian3d                 = { version = "0.8.0", default-features = false, features = [
+    "3d",
+    "parry-f32",
+    "debug-plugin",
+    "xpbd_joints",
+    "collider-from-mesh",
+    "bevy_scene",
+    "bevy_picking",
+] }
 bevy_replicon           = "0.36.0"
 bytes                   = "1.9.0"
 rand                    = "0.8.5"
@@ -29,3 +43,10 @@ bevy_replicon_renet     = "0.12.0"
 log                     = "0.4.29"
 bevy_asset_loader      = { version = "0.28.1", features = ["progress_tracking", "2d"] }
 iyes_progress          = "0.18.0"
+# 开发构建按 Bevy 官方建议开轻量优化：本仓库开箱是 opt-level 0，
+# 混合预览每帧要采样 4 个剪辑 × 169 骨骼的姿态，未优化时会明显掉帧。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

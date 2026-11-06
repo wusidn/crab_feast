@@ -63,10 +63,10 @@ impl BlendSpaceSpec {
         BlendSpaceDoc {
             version: 1,
             params: [self.params[0].key.clone(), self.params[1].key.clone()],
-            ranges: [
+            ranges: Some([
                 [self.params[0].min, self.params[0].max],
                 [self.params[1].min, self.params[1].max],
-            ],
+            ]),
             samples: self
                 .default_samples
                 .iter()

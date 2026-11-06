@@ -174,7 +174,7 @@ pub(super) fn build_grid(
                     return;
                 };
                 editor.gesture_travel += drag.distance.length();
-                let ranges = editor.doc.ranges;
+                let ranges = editor.doc.axis_ranges();
                 let delta = px_to_param(drag.distance, ranges);
                 editor.params.insert(
                     axis0.clone(),
@@ -217,7 +217,7 @@ pub(super) fn rebuild_grid(
     }
 
     let font: Handle<Font> = asset_server.load("fonts/PingFang-SC-Regular.ttf");
-    let ranges = editor.doc.ranges;
+    let ranges = editor.doc.axis_ranges();
     for (index, sample) in editor.doc.samples.iter().enumerate() {
         spawn_dot(
             &mut commands,
@@ -346,7 +346,7 @@ fn spawn_dot(
                 return;
             }
             let start = state.start_at;
-            let ranges = editor.doc.ranges;
+            let ranges = editor.doc.axis_ranges();
             let delta = px_to_param(drag.distance, ranges);
             // 按住 Shift 可以临时脱离整点吸附，方便摆细位置
             let free = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
@@ -379,7 +379,7 @@ pub(super) fn apply_sample_positions(
         let Some(sample) = editor.doc.samples.get(dot.index) else {
             continue;
         };
-        let px = to_px(sample.at, editor.doc.ranges);
+        let px = to_px(sample.at, editor.doc.axis_ranges());
         node.left = Val::Px(px.x - DOT_RADIUS);
         node.top = Val::Px(px.y - DOT_RADIUS);
     }
@@ -414,7 +414,7 @@ pub(super) fn update_marker(
         editor.params.get(editor.doc.axis(0)).copied().unwrap_or(0.0),
         editor.params.get(editor.doc.axis(1)).copied().unwrap_or(0.0),
     ];
-    let px = to_px(point, editor.doc.ranges);
+    let px = to_px(point, editor.doc.axis_ranges());
     for mut node in &mut markers {
         // 只在真的移动时写回：无条件写 Node 会让整棵 UI 每帧重新布局
         let left = Val::Px(px.x - 9.0);

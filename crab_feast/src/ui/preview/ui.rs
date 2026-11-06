@@ -272,11 +272,18 @@ pub(super) fn update_speed_thumb(
     let value = value.0.clamp(range.start(), range.end());
     let position = range.thumb_position(value);
 
+    let left = Val::Percent(position * 100.0);
     for mut node in &mut thumbs {
-        node.left = Val::Percent(position * 100.0);
+        // 同值不写：避免每帧触发 UI 重排
+        if node.left != left {
+            node.left = left;
+        }
     }
+    let right = Val::Percent((1.0 - position) * 100.0);
     for mut node in &mut fills {
-        node.right = Val::Percent((1.0 - position) * 100.0);
+        if node.right != right {
+            node.right = right;
+        }
     }
 }
 

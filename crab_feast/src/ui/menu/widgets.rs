@@ -57,10 +57,17 @@ pub fn update_slider_styling(
         let position = range.thumb_position(value.0.clamp(range.start(), range.end()));
         for child in children.iter_descendants(root) {
             if let Ok(mut node) = thumbs.get_mut(child) {
-                node.left = Val::Percent(position * 100.0);
+                // 每帧无条件写会把 UI 布局标记为脏、每帧重排，只在真的变了才动
+                let left = Val::Percent(position * 100.0);
+                if node.left != left {
+                    node.left = left;
+                }
             }
             if let Ok(mut node) = fills.get_mut(child) {
-                node.right = Val::Percent((1.0 - position) * 100.0);
+                let right = Val::Percent((1.0 - position) * 100.0);
+                if node.right != right {
+                    node.right = right;
+                }
             }
         }
     }

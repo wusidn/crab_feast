@@ -459,10 +459,17 @@ pub(super) fn try_load_space(editor: &mut SpaceEditor) -> bool {
     let Ok(content) = std::fs::read_to_string(&path) else {
         return false;
     };
-    let Ok(doc) = serde_json::from_str::<BlendSpaceDoc>(&content) else {
+    let Ok(mut doc) = serde_json::from_str::<BlendSpaceDoc>(&content) else {
         warn!("混合空间 JSON 解析失败：{}", path.display());
         return false;
     };
+    if doc.fit_ranges() {
+        warn!(
+            "混合空间 {} 的轴范围没包住采样点，已按采样点扩张为 {:?}",
+            path.display(),
+            doc.axis_ranges()
+        );
+    }
 
     // 保证两个轴参数都有值
     for axis in 0..2 {
