@@ -10,3 +10,4 @@ crab_feast_library = { path = "../crab_feast_library" }
 crab_feast_ui_joysticks = { path = "../crab_feast_ui/joysticks" }
 bevy_asset_loader.workspace = true
 iyes_progress.workspace = true
+serde_json.workspace = true

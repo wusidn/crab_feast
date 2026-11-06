@@ -5,7 +5,8 @@
 //! 2. 添加 [`MenuPlugin::new(状态)`]，菜单只在该状态下存在；
 //! 3. 需要自定义内容的页面，在 `MenuSet::Setup` 之后往 [`MenuPageBody`] 里挂子节点。
 
-use bevy::{picking::pointer::PointerButton, prelude::*, state::state::States};
+use bevy::{
+    input::mouse::MouseScrollUnit,picking::pointer::PointerButton, prelude::*, state::state::States};
 
 use super::widgets;
 
@@ -14,6 +15,10 @@ pub type PageId = &'static str;
 
 /// 抽屉宽度，同时也是页面滑动的距离
 pub const DRAWER_WIDTH: f32 = 340.0;
+/// 滚轮「一行」折算的像素数
+const SCROLL_LINE_PX: f32 = 40.0;
+/// 单次滚动事件的最大位移，避免异常增量把内容甩飞
+const MAX_SCROLL_STEP: f32 = 320.0;
 
 const HEADER_HEIGHT: f32 = 56.0;
 /// 抽屉开合的临界阻尼弹簧角频率（越大越快，约 5/ω 秒到位）
@@ -141,6 +146,11 @@ impl Default for MenuState {
 }
 
 impl MenuState {
+    /// 抽屉展开进度：0 完全收起，1 完全展开
+    pub fn drawer_progress(&self) -> f32 {
+        self.drawer
+    }
+
     /// 当前停留的页面，`None` 为根页面
     pub fn current(&self) -> Option<PageId> {
         *self.stack.last().unwrap_or(&None)
@@ -248,12 +258,29 @@ impl<S: States> Plugin for MenuPlugin<S> {
                 setup_menu.in_set(MenuSet::Setup),
             )
             .add_systems(OnExit(self.state.clone()), cleanup_menu)
+            .add_systems(Update, keep_page_rows_unshrinkable)
             .add_systems(
                 Update,
                 (menu_hotkeys, advance_menu, sync_menu_layout)
                     .chain()
                     .run_if(in_state(self.state.clone())),
             );
+    }
+}
+
+/// 页面内容行不参与 flex 压缩：否则内容会被压进可视区，永远不会溢出，也就滚不动
+fn keep_page_rows_unshrinkable(
+    bodies: Query<&Children, With<MenuPageBody>>,
+    mut nodes: Query<&mut Node>,
+) {
+    for children in &bodies {
+        for child in children.iter() {
+            if let Ok(mut node) = nodes.get_mut(child) {
+                if node.flex_shrink != 0.0 {
+                    node.flex_shrink = 0.0;
+                }
+            }
+        }
     }
 }
 
@@ -444,20 +471,44 @@ fn spawn_page(
 
     widgets::text(commands, header, font, title.to_string(), 16.0, widgets::TEXT_COLOR);
 
-    // 内容区：自动放子页面入口，应用可以继续往里挂控件
+    // 内容区：自动放子页面入口，应用可以继续往里挂控件；内容超出时纵向滚动
     let body = commands
         .spawn_scene(bsn! {
             Node {
                 width: Val::Percent(100.0),
                 flex_grow: 1.0,
+                min_height: Val::Px(0.0),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(10.0),
                 padding: UiRect::all(Val::Px(14.0)),
+                overflow: Overflow::scroll_y(),
             }
             MenuPageBody { page }
             ChildOf(page_entity)
         })
         .id();
+    commands.entity(body).insert(ScrollPosition::DEFAULT);
+
+    // 滚轮事件冒泡到内容区时，改 ScrollPosition；越界由布局系统自动夹紧
+    commands.entity(body).observe(
+        move |scroll: On<PointerScroll>,
+              mut positions: Query<&mut ScrollPosition>,
+              nodes: Query<&ComputedNode>| {
+            let pixels = match scroll.unit {
+                MouseScrollUnit::Line => scroll.y * SCROLL_LINE_PX,
+                // 触控板/滚轮在 macOS 上给的是像素增量，直接当像素用
+                MouseScrollUnit::Pixel => scroll.y,
+            }
+            .clamp(-MAX_SCROLL_STEP, MAX_SCROLL_STEP);
+            let (Ok(mut position), Ok(computed)) = (positions.get_mut(body), nodes.get(body)) else {
+                return;
+            };
+            // 可滚动距离 = 内容高度 - 可视高度（ComputedNode 是物理像素，换算回逻辑像素）
+            let max = (computed.content_size().y - computed.size().y).max(0.0)
+                * computed.inverse_scale_factor();
+            position.0.y = (position.0.y - pixels).clamp(0.0, max);
+        },
+    );
 
     for child in config.pages.iter().filter(|def| def.parent == page) {
         spawn_menu_item(commands, body, child, font);

@@ -1,5 +1,6 @@
 use bevy::app::{App, Plugin};
 
+mod blendspace;
 mod input_layer;
 mod loading;
 pub(crate) mod menu;
@@ -12,6 +13,7 @@ impl Plugin for UiPlugin {
         app.add_plugins(input_layer::InputPlugin)
             .add_plugins(loading::LoadingUiPlugin)
             .add_plugins(preview::AnimationPreviewPlugin)
-            .add_plugins(menu::GameMenuPlugin);
+            .add_plugins(menu::GameMenuPlugin)
+            .add_plugins(blendspace::BlendSpaceEditorPlugin);
     }
 }

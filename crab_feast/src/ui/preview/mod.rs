@@ -1,7 +1,7 @@
 //! 动画预览：角色切换、播放倍速、根运动开关，右侧面板由 F2 / ` 呼出。
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -30,6 +30,37 @@ pub struct PreviewCatalog {
     pub clips: Vec<String>,
 }
 
+/// 从 `<角色>/manifest.json` 读到的步态元数据
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClipGait {
+    /// 一个循环的净前进距离（米）
+    pub stride: f32,
+    /// 固有地速（米/秒），等于 stride / duration；留给后续的播放倍率匹配
+    #[allow(dead_code)]
+    pub speed: f32,
+    /// 左脚触地的归一化相位；没测出来时为 None
+    pub contact_left: Option<f32>,
+    /// 左脚离地的归一化相位
+    pub lift_left: Option<f32>,
+    /// 右脚触地的归一化相位
+    pub contact_right: Option<f32>,
+    /// 右脚离地的归一化相位
+    pub lift_right: Option<f32>,
+}
+
+impl ClipGait {
+    /// 事件表，顺序与 `ClipMeta::gait_events` 一致：
+    /// `[左脚触地, 左脚离地, 右脚触地, 右脚离地]`
+    pub fn events(&self) -> [Option<f32>; 4] {
+        [
+            self.contact_left,
+            self.lift_left,
+            self.contact_right,
+            self.lift_right,
+        ]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CharacterDef {
     /// 下拉框里显示的名字（取自 rig 文件名）
@@ -40,6 +71,8 @@ pub struct CharacterDef {
     pub animations: String,
     /// 该角色自己拥有的剪辑名
     pub clips: Vec<String>,
+    /// 剪辑名 → 步态元数据（来自 manifest，缺失时为空）
+    pub gaits: HashMap<String, ClipGait>,
 }
 
 impl PreviewCatalog {
@@ -81,7 +114,8 @@ fn scan_catalog() -> PreviewCatalog {
         characters.push(CharacterDef {
             rig: format!("characters/rigs/{file}.glb"),
             animations: format!("characters/animations/{file}"),
-            name: file,
+            name: file.clone(),
+            gaits: read_gaits(&animations_root.join(&file)),
             clips,
         });
     }
@@ -97,6 +131,52 @@ fn scan_catalog() -> PreviewCatalog {
         catalog.clips.len()
     );
     catalog
+}
+
+/// 读 `<角色>/manifest.json` 里的步态元数据：步幅、固有地速、左脚触地相位。
+///
+/// 这些值由 `scripts/validate_animations.py` 从 GLB 里实测得出；
+/// 缺失时返回空表，运行时会退回「按加权时长推进相位」的旧行为。
+fn read_gaits(dir: &Path) -> HashMap<String, ClipGait> {
+    let path = dir.join("manifest.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        warn!("{} 解析失败，步幅/相位元数据缺失", path.display());
+        return HashMap::new();
+    };
+    let Some(clips) = json.get("clips").and_then(|value| value.as_object()) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::with_capacity(clips.len());
+    for (name, clip) in clips {
+        let stride = clip
+            .pointer("/stride/net")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        let speed = clip
+            .pointer("/gait/speed")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        let event = |field: &str| {
+            clip.pointer(&format!("/gait/{field}"))
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+        };
+        out.insert(
+            name.clone(),
+            ClipGait {
+                stride: stride as f32,
+                speed: speed as f32,
+                contact_left: event("contact_left"),
+                lift_left: event("lift_left"),
+                contact_right: event("contact_right"),
+                lift_right: event("lift_right"),
+            },
+        );
+    }
+    out
 }
 
 /// 读目录下的文件名（去掉扩展名），失败时返回空列表
@@ -123,7 +203,7 @@ fn read_names(dir: &Path, extension: &str) -> Vec<String> {
 }
 
 /// 找 assets 根目录：先看环境变量，再从工作目录和可执行文件位置向上找
-fn find_asset_root() -> Option<PathBuf> {
+pub(crate) fn find_asset_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("CRAB_ASSET_ROOT") {
         let path = PathBuf::from(root);
         if path.join("characters/rigs").is_dir() {
@@ -234,9 +314,11 @@ pub(crate) struct PreviewRootMotionLabel;
 struct PreviewModelRoot;
 
 #[derive(Resource, Default)]
-struct PreviewRuntime {
+pub(crate) struct PreviewRuntime {
     /// 当前的模型实体
-    model: Option<Entity>,
+    pub(crate) model: Option<Entity>,
+    /// 当前角色的剪辑句柄（按剪辑名索引，供动画图编辑器采样）
+    pub(crate) clips: std::collections::HashMap<String, Handle<AnimationClip>>,
     /// 动画图与 AnimationPlayer 所在实体
     player: Option<Entity>,
     /// 当前角色在清单中的下标
@@ -412,6 +494,15 @@ fn request_character(
     runtime.pending_character = Some(index);
     runtime.pending_rig = Some(rig);
     runtime.pending_clips = clips;
+
+    // 编辑器按「剪辑名」采样，这里单独保存一份不做缺件顶替的句柄
+    runtime.clips.clear();
+    for clip in &def.clips {
+        runtime.clips.insert(
+            clip.clone(),
+            asset_server.load(format!("{}/{}.glb#Animation0", def.animations, clip)),
+        );
+    }
 }
 
 /// 资源加载完成后换模型：旧角色会一直播放到换上的这一帧

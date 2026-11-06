@@ -41,6 +41,31 @@ pub struct SliderParts {
     pub fill: Entity,
 }
 
+/// 滑动条已填充进度部分（供 `update_slider_styling` 定位）
+#[derive(Component, Clone, Debug, Default)]
+pub struct SliderFill;
+
+/// 通用滑动条滑块定位：核心 Slider 不会自己摆滑块/进度条，
+/// 这里按 `SliderValue` 在 `SliderRange` 里的比例实时摆放，支持负区间（如 -1..1）。
+pub fn update_slider_styling(
+    sliders: Query<(Entity, &SliderValue, &SliderRange)>,
+    mut thumbs: Query<&mut Node, (With<SliderThumb>, Without<SliderFill>)>,
+    mut fills: Query<&mut Node, (With<SliderFill>, Without<SliderThumb>)>,
+    children: Query<&Children>,
+) {
+    for (root, value, range) in &sliders {
+        let position = range.thumb_position(value.0.clamp(range.start(), range.end()));
+        for child in children.iter_descendants(root) {
+            if let Ok(mut node) = thumbs.get_mut(child) {
+                node.left = Val::Percent(position * 100.0);
+            }
+            if let Ok(mut node) = fills.get_mut(child) {
+                node.right = Val::Percent((1.0 - position) * 100.0);
+            }
+        }
+    }
+}
+
 /// 一段普通文字
 pub fn text(
     commands: &mut Commands,
@@ -297,6 +322,7 @@ pub fn slider(
                 border_radius: BorderRadius::all(Val::Px(3.0)),
             }
             BackgroundColor(SLIDER_FILL)
+            SliderFill
             ChildOf(travel)
         })
         .id();

@@ -68,6 +68,178 @@ def node_names(doc: dict) -> set:
     return {n.get("name") for n in doc.get("nodes", []) if n.get("name")}
 
 
+# ---------------------------------------------------------------------------
+# 步态相位测量：沿 parent 链做正向运动学，取左右脚的世界高度，最低点即触地相位。
+# 纯 Python 实现，不依赖 numpy，保证这个脚本在任何环境下都能跑。
+# ---------------------------------------------------------------------------
+
+def _quat_mat(q: tuple) -> list:
+    x, y, z, w = q
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return [
+        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+    ]
+
+
+def _local_mat(translation, rotation, scale) -> list:
+    """返回 4x4 行主序矩阵的 (R*S | T) 形式，只用于点变换。"""
+    r = _quat_mat(rotation)
+    return [
+        [r[0][0] * scale[0], r[0][1] * scale[1], r[0][2] * scale[2], translation[0]],
+        [r[1][0] * scale[0], r[1][1] * scale[1], r[1][2] * scale[2], translation[1]],
+        [r[2][0] * scale[0], r[2][1] * scale[1], r[2][2] * scale[2], translation[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _mat_mul_point(m: list, p: tuple) -> tuple:
+    return (
+        m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2] + m[0][3],
+        m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2] + m[1][3],
+        m[2][0] * p[0] + m[2][1] * p[1] + m[2][2] * p[2] + m[2][3],
+    )
+
+
+def _mat_mul(a: list, b: list) -> list:
+    out = [[0.0] * 4 for _ in range(4)]
+    for i in range(4):
+        for j in range(4):
+            out[i][j] = sum(a[i][k] * b[k][j] for k in range(4))
+    return out
+
+
+def _channel_series(an: dict, doc: dict, blob: bytes, node: int, path: str):
+    ch = next((c for c in an["channels"]
+               if c["target"]["node"] == node and c["target"]["path"] == path), None)
+    if ch is None:
+        return None
+    sampler = an["samplers"][ch["sampler"]]
+    return (accessor(doc, blob, sampler["input"]), accessor(doc, blob, sampler["output"]))
+
+
+def _sample_series(series, t: float, quat: bool):
+    if series is None:
+        return None
+    times, values = series
+    if t <= times[0]:
+        return values[0]
+    if t >= times[-1]:
+        return values[-1]
+    i = 0
+    lo, hi = 0, len(times) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if times[mid] <= t:
+            lo = mid
+        else:
+            hi = mid
+    i = lo
+    span = times[i + 1] - times[i]
+    a = 0.0 if span <= 0 else (t - times[i]) / span
+    v0, v1 = values[i], values[i + 1]
+    if quat:
+        if sum(x * y for x, y in zip(v0, v1)) < 0:
+            v1 = tuple(-x for x in v1)
+        mixed = tuple((1 - a) * x + a * y for x, y in zip(v0, v1))
+        norm = math.sqrt(sum(x * x for x in mixed)) or 1.0
+        return tuple(x / norm for x in mixed)
+    return tuple((1 - a) * x + a * y for x, y in zip(v0, v1))
+
+
+def foot_ground_phase(doc: dict, blob: bytes, samples: int = 96,
+                      lift_threshold: float = 0.05) -> dict:
+    """返回左右脚的事件相位：触地（世界高度最低）与离地（升高超过阈值）。
+
+    事件相位是分段相位重映射的锚点：把「左脚触地 / 左脚离地 / 右脚触地 /
+    右脚离地」四个时刻在不同剪辑里对齐，混合时支撑期两端才不会错开。
+    """
+    anims = doc.get("animations", [])
+    if not anims:
+        return {}
+    an = anims[0]
+    nodes = doc["nodes"]
+    parent = {}
+    for i, n in enumerate(nodes):
+        for c in n.get("children", []):
+            parent[c] = i
+
+    def find_foot(side: str):
+        for i, n in enumerate(nodes):
+            name = n.get("name") or ""
+            if name.startswith("Ctrl") or "IK" in name or "FK" in name:
+                continue
+            if name.endswith("mixamorig:" + side + "Foot") or name.endswith(":" + side + "Foot"):
+                return i
+        return None
+
+    feet = {"left": find_foot("Left"), "right": find_foot("Right")}
+    if any(v is None for v in feet.values()):
+        return {}
+
+    dur = 0.0
+    for s in an["samplers"]:
+        acc = doc["accessors"][s["input"]]
+        if "max" in acc:
+            dur = max(dur, acc["max"][0])
+    if dur <= 0:
+        return {}
+
+    # 每条脚链只需从 root 到 foot 的节点，缓存各自的通道序列
+    chains = {}
+    for side, foot in feet.items():
+        chain = []
+        cur = foot
+        while cur is not None:
+            chain.append(cur)
+            cur = parent.get(cur)
+        chain.reverse()
+        chains[side] = chain
+
+    series = {}
+    for chain in chains.values():
+        for node in chain:
+            for path in ("translation", "rotation", "scale"):
+                key = (node, path)
+                if key not in series:
+                    series[key] = _channel_series(an, doc, blob, node, path)
+
+    tracks = {"left": [], "right": []}
+    for k in range(samples):
+        phase = k / samples
+        t = phase * dur
+        for side, chain in chains.items():
+            m = [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+            for node in chain:
+                n = nodes[node]
+                tr = _sample_series(series[(node, "translation")], t, False) or tuple(n.get("translation", (0, 0, 0)))
+                ro = _sample_series(series[(node, "rotation")], t, True) or tuple(n.get("rotation", (0, 0, 0, 1)))
+                sc = _sample_series(series[(node, "scale")], t, False) or tuple(n.get("scale", (1, 1, 1)))
+                m = _mat_mul(m, _local_mat(tr, ro, sc))
+            y = _mat_mul_point(m, (0.0, 0.0, 0.0))[1]
+            tracks[side].append(y)
+
+    out = {}
+    for side in ("left", "right"):
+        ys = tracks[side]
+        contact_index = min(range(samples), key=lambda i: ys[i])
+        min_y = ys[contact_index]
+        # 从触地点向后扫，脚升高超过阈值即视为离地
+        lift_index = None
+        for step in range(1, samples):
+            index = (contact_index + step) % samples
+            if ys[index] > min_y + lift_threshold:
+                lift_index = index
+                break
+        out["contact_" + side] = round(contact_index / samples, 3)
+        if lift_index is not None:
+            out["lift_" + side] = round(lift_index / samples, 3)
+    return out
+
+
 def describe(doc: dict, blob: bytes) -> dict:
     anims = doc.get("animations", [])
     an = anims[0]
@@ -93,7 +265,13 @@ def describe(doc: dict, blob: bytes) -> dict:
             stride = {
                 "horizontal": round(math.hypot(max(xs) - min(xs), max(zs) - min(zs)), 3),
                 "vertical": round(max(ys) - min(ys), 3),
+                # 净前进距离（首末差），比 max-min 更贴近「一个循环走了多远」
+                "net": round(math.hypot(xs[-1] - xs[0], zs[-1] - zs[0]), 3),
             }
+    gait = foot_ground_phase(doc, blob)
+    if gait and stride and dur > 0:
+        # 固有地速：一个循环的净位移 / 时长，步幅匹配与等效周期都靠它
+        gait["speed"] = round(stride["net"] / dur, 3)
     return {
         "animation": an.get("name"),
         "animation_count": len(anims),
@@ -103,6 +281,7 @@ def describe(doc: dict, blob: bytes) -> dict:
         "animated_nodes": len(animated),
         "has_mesh": bool(doc.get("meshes")),
         "stride": stride,
+        "gait": gait or None,
     }, animated
 
 
