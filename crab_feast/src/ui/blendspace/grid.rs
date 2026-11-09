@@ -3,9 +3,9 @@
 use bevy::{picking::pointer::PointerButton, prelude::*};
 
 use super::{
-    label, px_to_param, snap_point, to_px, ForceRebuild, GridLayer, ParamMarker, SampleDot,
-    SampleDrag, SampleLayer, SpaceEditor, DOT_COLORS, DOT_RADIUS, GRID_AXIS, GRID_BACKGROUND,
-    GRID_H, GRID_LINE, GRID_W, FRAME_BORDER, MARKER_COLOR, MUTED_TEXT,
+    DOT_COLORS, DOT_RADIUS, FRAME_BORDER, ForceRebuild, GRID_AXIS, GRID_BACKGROUND, GRID_H,
+    GRID_LINE, GRID_W, GridLayer, MARKER_COLOR, MUTED_TEXT, ParamMarker, SampleDot, SampleDrag,
+    SampleLayer, SpaceEditor, label, px_to_param, snap_point, to_px,
 };
 
 /// 网格外框的内边距：采样点贴在 ±1 边界时会伸出网格，这里留出余量
@@ -212,7 +212,11 @@ pub(super) fn rebuild_grid(
     force.0 = false;
     *last = editor.revision;
 
-    for child in children.get(layer).map(|list| list.to_vec()).unwrap_or_default() {
+    for child in children
+        .get(layer)
+        .map(|list| list.to_vec())
+        .unwrap_or_default()
+    {
         commands.entity(child).despawn();
     }
 
@@ -328,7 +332,10 @@ fn spawn_dot(
                 .map(|sample| sample.at)
                 .unwrap_or([0.0, 0.0]);
             editor.selected = Some(index);
-            editor.drag = Some(SampleDrag { index, start_at: at });
+            editor.drag = Some(SampleDrag {
+                index,
+                start_at: at,
+            });
         },
     );
 
@@ -387,7 +394,12 @@ pub(super) fn apply_sample_positions(
 
 pub(super) fn update_sample_selection(
     editor: Res<SpaceEditor>,
-    mut dots: Query<(&SampleDot, &mut BorderColor, &mut BackgroundColor, &mut Node)>,
+    mut dots: Query<(
+        &SampleDot,
+        &mut BorderColor,
+        &mut BackgroundColor,
+        &mut Node,
+    )>,
 ) {
     if !editor.is_changed() {
         return;
@@ -400,7 +412,11 @@ pub(super) fn update_sample_selection(
             Color::srgba(1.0, 1.0, 1.0, 0.4)
         });
         background.0 = DOT_COLORS[dot.index % DOT_COLORS.len()];
-        let radius = if selected { DOT_RADIUS + 2.0 } else { DOT_RADIUS };
+        let radius = if selected {
+            DOT_RADIUS + 2.0
+        } else {
+            DOT_RADIUS
+        };
         node.width = Val::Px(radius * 2.0);
         node.height = Val::Px(radius * 2.0);
     }
@@ -411,8 +427,16 @@ pub(super) fn update_marker(
     mut markers: Query<&mut Node, With<ParamMarker>>,
 ) {
     let point = [
-        editor.params.get(editor.doc.axis(0)).copied().unwrap_or(0.0),
-        editor.params.get(editor.doc.axis(1)).copied().unwrap_or(0.0),
+        editor
+            .params
+            .get(editor.doc.axis(0))
+            .copied()
+            .unwrap_or(0.0),
+        editor
+            .params
+            .get(editor.doc.axis(1))
+            .copied()
+            .unwrap_or(0.0),
     ];
     let px = to_px(point, editor.doc.axis_ranges());
     for mut node in &mut markers {

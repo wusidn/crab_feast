@@ -59,10 +59,6 @@ impl Pose {
         self.bones.is_empty()
     }
 
-    pub fn len(&self) -> usize {
-        self.bones.len()
-    }
-
     pub fn get(&self, id: AnimationTargetId) -> Option<&BonePose> {
         self.bones.get(&id)
     }
@@ -102,27 +98,7 @@ impl Pose {
         Self { bones }
     }
 
-    /// 以 `weight` 的比例把 `other` 混合进来（`weight=1` 即完全采用 other）
-    pub fn blend(&self, other: &Pose, weight: f32) -> Pose {
-        if weight <= 0.0 {
-            return self.clone();
-        }
-        if weight >= 1.0 {
-            return other.clone();
-        }
-        let mut out = self.clone();
-        for (id, bone) in &other.bones {
-            match out.bones.get_mut(id) {
-                Some(existing) => *existing = BonePose::lerp(*existing, *bone, weight),
-                None => {
-                    out.bones.insert(*id, *bone);
-                }
-            }
-        }
-        out
-    }
-
-    /// 原地按比例混入：等价于 `*self = self.blend(other, weight)` 但不克隆整张表
+    /// 以 `weight` 的比例把 `other` 混进自己（不分配新表）
     pub fn blend_in_place(&mut self, other: &Pose, weight: f32) {
         if weight <= 0.0 {
             return;
@@ -139,8 +115,8 @@ impl Pose {
 
     /// 按 (clip 权重, 姿态) 列表合成；权重会被重新归一到总和
     ///
-    /// 注意这里不能写成 `out = out.blend(pose, w)`：那样每混入一个剪辑都要
-    /// 克隆一次整张骨骼表（几十项 HashMap），4 个剪辑就是 4 次全量分配。
+    /// 注意这里不能写成「先克隆一份 out，再按比例合进去」：那样每混入一个
+    /// 剪辑都要克隆一次整张骨骼表（几十项 HashMap），4 个剪辑就是 4 次全量分配。
     pub fn combine(parts: &[(f32, Pose)]) -> Pose {
         let mut out = Pose::default();
         let mut accumulated = 0.0;
@@ -158,12 +134,5 @@ impl Pose {
             accumulated = next;
         }
         out
-    }
-
-    /// 两套骨架之间的骨骼对应关系不同时，用并集做一次对齐
-    pub fn merge_missing(&mut self, other: &Pose) {
-        for (id, bone) in &other.bones {
-            self.bones.entry(*id).or_insert(*bone);
-        }
     }
 }

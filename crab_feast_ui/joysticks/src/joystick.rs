@@ -1,6 +1,9 @@
-
-use bevy::{input::{ButtonState, mouse::MouseButtonInput, touch::TouchPhase}, picking::pointer::PointerId, prelude::*};
 use bevy::scene::Ready;
+use bevy::{
+    input::{ButtonState, mouse::MouseButtonInput, touch::TouchPhase},
+    picking::pointer::PointerId,
+    prelude::*,
+};
 
 pub struct JoystickPlugin;
 
@@ -88,7 +91,10 @@ impl Plugin for JoystickPlugin {
             .add_observer(joystick_on_remove)
             .add_systems(Update, joystick_on_release)
             .add_systems(Update, joystick_thumb_update)
-            .add_systems(Update, joystick_thumb_elastic_rebound_system.after(joystick_thumb_update));
+            .add_systems(
+                Update,
+                joystick_thumb_elastic_rebound_system.after(joystick_thumb_update),
+            );
     }
 }
 
@@ -199,19 +205,41 @@ fn joystick_on_remove(
     }
 }
 
+// 这个查询形状被 Observer::new 直接取函数指针，收进别名会让 Bevy 推不出
+// SystemParam 的具体类型，只能就地写全。
+#[expect(
+    clippy::type_complexity,
+    reason = "四个组件 + 两个过滤，写成别名反而编译不过"
+)]
 fn joystick_on_press(
     event: On<PointerPress>,
     mut commands: Commands,
     camera_query: Query<&Camera>,
-    mut joystick_state_query: Query<(&mut JoystickState, &ComputedNode, &Joystick, &UiGlobalTransform), (Without<JoystickDisabled>, Without<Activated>)>,
+    mut joystick_state_query: Query<
+        (
+            &mut JoystickState,
+            &ComputedNode,
+            &Joystick,
+            &UiGlobalTransform,
+        ),
+        (Without<JoystickDisabled>, Without<Activated>),
+    >,
 ) {
     let joystick_entity = event.event_target();
-    
-    let camera = camera_query.get(event.hit.camera).unwrap();
-    let viewport_rect_min = camera.logical_viewport_rect().map_or(Vec2::ZERO, |rect| rect.min);
-    let scale_factor = camera.computed.target_info.as_ref().map(|info| info.scale_factor).unwrap_or(1.0);
 
-    if let Ok((mut joystick_state, computed_node, joystick, ui_global_transform)) = joystick_state_query.get_mut(joystick_entity)
+    let camera = camera_query.get(event.hit.camera).unwrap();
+    let viewport_rect_min = camera
+        .logical_viewport_rect()
+        .map_or(Vec2::ZERO, |rect| rect.min);
+    let scale_factor = camera
+        .computed
+        .target_info
+        .as_ref()
+        .map(|info| info.scale_factor)
+        .unwrap_or(1.0);
+
+    if let Ok((mut joystick_state, computed_node, joystick, ui_global_transform)) =
+        joystick_state_query.get_mut(joystick_entity)
     {
         // 获取点击位置 logic （相对于窗口左上角的逻辑坐标系）
         let pointer_position = event.pointer.location().position;
@@ -219,9 +247,12 @@ fn joystick_on_press(
         // 获取 Joystick UI (相对于视口左上角的物理坐标系)
         let joystick_position = ui_global_transform.translation;
 
-        let max_distance = (computed_node.size / scale_factor).length() * joystick.thumb_max_distance_percent / 100.0 / 2.0;
+        let max_distance = (computed_node.size / scale_factor).length()
+            * joystick.thumb_max_distance_percent
+            / 100.0
+            / 2.0;
 
-        let activated = Activated { 
+        let activated = Activated {
             pointer: event.pointer.id,
             center_position: joystick_position / scale_factor + viewport_rect_min,
             max_distance,
@@ -269,45 +300,51 @@ fn joystick_on_release(
     mut deactivated_entities: Local<Vec<Entity>>,
     mut joystick_state_query: Query<&mut JoystickState>,
 ) {
-
     if joystick_activated_query.iter().count() == 0 {
         return;
     }
-    
+
     mouse_button_input_reader.read().for_each(|event| {
         if event.button != MouseButton::Left || event.state != ButtonState::Released {
             return;
         }
-        joystick_activated_query.iter().for_each(|(entity, activated)| {
-            if activated.pointer == PointerId::Mouse {
-                deactivated_entities.push(entity);
-            }
-        });
+        joystick_activated_query
+            .iter()
+            .for_each(|(entity, activated)| {
+                if activated.pointer == PointerId::Mouse {
+                    deactivated_entities.push(entity);
+                }
+            });
     });
 
     touch_input_reader.read().for_each(|event| {
         if event.phase != TouchPhase::Ended && event.phase != TouchPhase::Canceled {
             return;
         }
-        joystick_activated_query.iter().for_each(|(entity, activated)| {
-            if let PointerId::Touch(id) = activated.pointer {
-                if id == event.id {
+        joystick_activated_query
+            .iter()
+            .for_each(|(entity, activated)| {
+                if let PointerId::Touch(id) = activated.pointer
+                    && id == event.id
+                {
                     deactivated_entities.push(entity);
                 }
-            }
-        });
+            });
     });
 
     deactivated_entities.iter().for_each(|entity| {
         if let Ok((_, activated)) = joystick_activated_query.get(*entity) {
             if let Ok(mut joystick_state) = joystick_state_query.get_mut(*entity) {
-                commands.entity(*entity)
-                .remove::<Activated>()
-                .insert(ElasticRebound{
-                    offset: joystick_state.direction * joystick_state.force * activated.max_distance,
-                    duration: 0.1,
-                    ..Default::default()
-                });
+                commands
+                    .entity(*entity)
+                    .remove::<Activated>()
+                    .insert(ElasticRebound {
+                        offset: joystick_state.direction
+                            * joystick_state.force
+                            * activated.max_distance,
+                        duration: 0.1,
+                        ..Default::default()
+                    });
                 joystick_state.direction = Vec2::ZERO;
                 joystick_state.force = 0.0;
             }
@@ -318,24 +355,25 @@ fn joystick_on_release(
         }
     });
     deactivated_entities.clear();
-
 }
 
 fn joystick_thumb_update(
     mut joystick_query: Query<(&mut JoystickState, &Activated, &Children), Changed<JoystickState>>,
     mut transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
 ) {
-    joystick_query.iter_mut().for_each(|(joystick_state, activated, children)| {
-        children.iter().for_each(|child| {
-            if let Ok(mut thumb_transform) = transform_query.get_mut(child) {
-                let thumb_position = joystick_state.direction * joystick_state.force * activated.max_distance;
-                thumb_transform.translation.x = Val::Px(thumb_position.x);
-                thumb_transform.translation.y = Val::Px(thumb_position.y);
-            }
+    joystick_query
+        .iter_mut()
+        .for_each(|(joystick_state, activated, children)| {
+            children.iter().for_each(|child| {
+                if let Ok(mut thumb_transform) = transform_query.get_mut(child) {
+                    let thumb_position =
+                        joystick_state.direction * joystick_state.force * activated.max_distance;
+                    thumb_transform.translation.x = Val::Px(thumb_position.x);
+                    thumb_transform.translation.y = Val::Px(thumb_position.y);
+                }
+            });
         });
-    });
 }
-
 
 fn joystick_thumb_elastic_rebound_system(
     mut commands: Commands,
@@ -343,7 +381,7 @@ fn joystick_thumb_elastic_rebound_system(
     mut ui_transform_query: Query<&mut UiTransform, With<JoystickThumb>>,
     time: Res<Time>,
 ) {
-    for (entity, mut elastic_rebound, children) in joystick_thumb_elastic_rebound_query.iter_mut() { 
+    for (entity, mut elastic_rebound, children) in joystick_thumb_elastic_rebound_query.iter_mut() {
         elastic_rebound.time += time.delta_secs();
         let t = (elastic_rebound.time / elastic_rebound.duration).min(1.0);
         // 弹性插值公式：使用指数衰减和余弦函数模拟弹性效果
@@ -361,7 +399,7 @@ fn joystick_thumb_elastic_rebound_system(
         if t >= 1.0 {
             commands.entity(entity).remove::<ElasticRebound>();
             commands.trigger(JoystickEvent {
-                entity: entity,
+                entity,
                 event: JoystickInteraction::Rebound,
             });
         }

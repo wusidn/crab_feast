@@ -6,7 +6,9 @@
 //! 3. 需要自定义内容的页面，在 `MenuSet::Setup` 之后往 [`MenuPageBody`] 里挂子节点。
 
 use bevy::{
-    input::mouse::MouseScrollUnit,picking::pointer::PointerButton, prelude::*, state::state::States};
+    input::mouse::MouseScrollUnit, picking::pointer::PointerButton, prelude::*,
+    state::state::States,
+};
 
 use super::widgets;
 
@@ -275,10 +277,10 @@ fn keep_page_rows_unshrinkable(
 ) {
     for children in &bodies {
         for child in children.iter() {
-            if let Ok(mut node) = nodes.get_mut(child) {
-                if node.flex_shrink != 0.0 {
-                    node.flex_shrink = 0.0;
-                }
+            if let Ok(mut node) = nodes.get_mut(child)
+                && node.flex_shrink != 0.0
+            {
+                node.flex_shrink = 0.0;
             }
         }
     }
@@ -286,9 +288,7 @@ fn keep_page_rows_unshrinkable(
 
 fn setup_menu(mut commands: Commands, asset_server: Res<AssetServer>, config: Res<MenuConfig>) {
     let config = config.clone();
-    let font: Option<Handle<Font>> = config
-        .font_path
-        .map(|path| asset_server.load::<Font>(path));
+    let font: Option<Handle<Font>> = config.font_path.map(|path| asset_server.load::<Font>(path));
 
     spawn_icon(&mut commands);
 
@@ -453,23 +453,28 @@ fn spawn_page(
     // 返回按钮：根页面时等同于关闭抽屉
     let back = widgets::icon_button(commands, header, font, "‹".to_string(), 18.0);
 
-    commands
-        .entity(back)
-        .observe(
-            |mut click: On<PointerClick>,
-             mut menu: ResMut<MenuState>,
-             mut events: MessageWriter<MenuEvent>| {
-                if click.button != PointerButton::Primary {
-                    return;
-                }
-                click.propagate(false);
-                if let Some(event) = menu.back() {
-                    events.write(event);
-                }
-            },
-        );
+    commands.entity(back).observe(
+        |mut click: On<PointerClick>,
+         mut menu: ResMut<MenuState>,
+         mut events: MessageWriter<MenuEvent>| {
+            if click.button != PointerButton::Primary {
+                return;
+            }
+            click.propagate(false);
+            if let Some(event) = menu.back() {
+                events.write(event);
+            }
+        },
+    );
 
-    widgets::text(commands, header, font, title.to_string(), 16.0, widgets::TEXT_COLOR);
+    widgets::text(
+        commands,
+        header,
+        font,
+        title.to_string(),
+        16.0,
+        widgets::TEXT_COLOR,
+    );
 
     // 内容区：自动放子页面入口，应用可以继续往里挂控件；内容超出时纵向滚动
     let body = commands
@@ -500,7 +505,8 @@ fn spawn_page(
                 MouseScrollUnit::Pixel => scroll.y,
             }
             .clamp(-MAX_SCROLL_STEP, MAX_SCROLL_STEP);
-            let (Ok(mut position), Ok(computed)) = (positions.get_mut(body), nodes.get(body)) else {
+            let (Ok(mut position), Ok(computed)) = (positions.get_mut(body), nodes.get(body))
+            else {
                 return;
             };
             // 可滚动距离 = 内容高度 - 可视高度（ComputedNode 是物理像素，换算回逻辑像素）
@@ -516,7 +522,12 @@ fn spawn_page(
 }
 
 /// 页面里的一行入口
-fn spawn_menu_item(commands: &mut Commands, body: Entity, page: &MenuPageDef, font: Option<&Handle<Font>>) {
+fn spawn_menu_item(
+    commands: &mut Commands,
+    body: Entity,
+    page: &MenuPageDef,
+    font: Option<&Handle<Font>>,
+) {
     let target = page.id;
     let item_title = page.title;
     let item_description = page.description;
@@ -560,7 +571,14 @@ fn spawn_menu_item(commands: &mut Commands, body: Entity, page: &MenuPageDef, fo
         })
         .id();
 
-    widgets::text(commands, texts, font, item_title.to_string(), 14.0, widgets::TEXT_COLOR);
+    widgets::text(
+        commands,
+        texts,
+        font,
+        item_title.to_string(),
+        14.0,
+        widgets::TEXT_COLOR,
+    );
 
     widgets::text(
         commands,
@@ -571,7 +589,14 @@ fn spawn_menu_item(commands: &mut Commands, body: Entity, page: &MenuPageDef, fo
         widgets::LABEL_COLOR,
     );
 
-    widgets::text(commands, row, font, "›".to_string(), 16.0, widgets::LABEL_COLOR);
+    widgets::text(
+        commands,
+        row,
+        font,
+        "›".to_string(),
+        16.0,
+        widgets::LABEL_COLOR,
+    );
 }
 
 fn cleanup_menu(mut commands: Commands, roots: Query<Entity, With<MenuRoot>>) {
@@ -591,10 +616,10 @@ fn menu_hotkeys(
         if let Some(event) = menu.toggle() {
             events.write(event);
         }
-    } else if keys.just_pressed(KeyCode::Escape) {
-        if let Some(event) = menu.back() {
-            events.write(event);
-        }
+    } else if keys.just_pressed(KeyCode::Escape)
+        && let Some(event) = menu.back()
+    {
+        events.write(event);
     }
 }
 
@@ -604,12 +629,7 @@ fn advance_menu(mut menu: ResMut<MenuState>, time: Res<Time>) {
 
     let target = if menu.open { 1.0 } else { 0.0 };
     let state = &mut *menu;
-    step_drawer_spring(
-        &mut state.drawer,
-        &mut state.drawer_velocity,
-        target,
-        delta,
-    );
+    step_drawer_spring(&mut state.drawer, &mut state.drawer_velocity, target, delta);
 
     let finished = if let Some(transition) = menu.transition.as_mut() {
         transition.t = (transition.t + delta / SLIDE_SECONDS).min(1.0);
@@ -648,16 +668,29 @@ fn ease_out_cubic(t: f32) -> f32 {
 }
 
 /// 把抽屉位置、每一页的横向偏移、图标的退场状态写回 UI
+// 三个查询的形状写成别名 Bevy 会推不出 SystemParam，只能就地写全。
+#[expect(clippy::type_complexity)]
 fn sync_menu_layout(
     menu: Res<MenuState>,
-    mut panels: Query<&mut Node, (With<MenuPanelRoot>, Without<MenuPageRoot>, Without<MenuIcon>)>,
+    mut panels: Query<
+        &mut Node,
+        (
+            With<MenuPanelRoot>,
+            Without<MenuPageRoot>,
+            Without<MenuIcon>,
+        ),
+    >,
     mut pages: Query<
         (&MenuPageRoot, &mut Node, &mut GlobalZIndex),
         (Without<MenuPanelRoot>, Without<MenuIcon>),
     >,
     mut icons: Query<
         (&mut Node, &mut UiTransform),
-        (With<MenuIcon>, Without<MenuPanelRoot>, Without<MenuPageRoot>),
+        (
+            With<MenuIcon>,
+            Without<MenuPanelRoot>,
+            Without<MenuPageRoot>,
+        ),
     >,
 ) {
     let drawer = menu.drawer.clamp(0.0, 1.0);

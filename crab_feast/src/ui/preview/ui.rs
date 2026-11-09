@@ -3,18 +3,19 @@
 //! 页面里的通用积木（文字、小标题、按钮、下拉框、滑动条）来自
 //! `crate::ui::menu::widgets`，这里只负责挂业务标记、观察者与状态刷新。
 
+use crate::ui::menu::widgets;
 use bevy::{
     picking::pointer::PointerButton,
     prelude::*,
     ui_widgets::{SliderRange, SliderValue, ValueChange, slider_self_update},
 };
-use crate::ui::menu::widgets;
+
+use crate::anim::{AnimCatalog, AnimSelection, SPEED_RANGE};
 
 use super::{
-    DropdownKind, PreviewAction, PreviewButton, PreviewCatalog, PreviewDropdownItem,
-    PreviewDropdownLabel, PreviewDropdownPopup, PreviewDropdownTrigger, PreviewRootMotionLabel,
-    PreviewSpeedFill, PreviewSpeedLabel, PreviewSpeedSlider, PreviewSpeedThumb, PreviewState,
-    SPEED_RANGE,
+    DropdownKind, PreviewAction, PreviewButton, PreviewDropdownItem, PreviewDropdownLabel,
+    PreviewDropdownPopup, PreviewDropdownTrigger, PreviewRootMotionLabel, PreviewSpeedFill,
+    PreviewSpeedLabel, PreviewSpeedSlider, PreviewSpeedThumb, PreviewUi,
 };
 
 /// 在菜单抽屉的「动画预览」页面里搭建内容区
@@ -22,8 +23,8 @@ pub(crate) fn build_page(
     commands: &mut Commands,
     panel: Entity,
     asset_server: &AssetServer,
-    catalog: &PreviewCatalog,
-    state: &PreviewState,
+    catalog: &AnimCatalog,
+    state: &AnimSelection,
 ) {
     let font: Handle<Font> = asset_server.load("fonts/PingFang-SC-Regular.ttf");
 
@@ -60,7 +61,7 @@ pub(crate) fn build_page(
         &font,
         DropdownKind::Animation,
         &clip_names,
-        state.animation,
+        state.clip,
     );
 
     widgets::heading(commands, panel, Some(&font), "播放倍速");
@@ -100,9 +101,7 @@ pub(crate) fn build_page(
         13.0,
         widgets::LABEL_COLOR,
     );
-    commands
-        .entity(motion_label)
-        .insert(PreviewRootMotionLabel);
+    commands.entity(motion_label).insert(PreviewRootMotionLabel);
 
     let hint = widgets::text(
         commands,
@@ -134,13 +133,13 @@ fn dropdown(
         .entity(parts.trigger)
         .insert(PreviewDropdownTrigger)
         .observe(
-            move |mut click: On<PointerClick>, mut state: ResMut<PreviewState>| {
+            move |mut click: On<PointerClick>, mut ui: ResMut<PreviewUi>| {
                 if click.button != PointerButton::Primary {
                     return;
                 }
                 // 阻断冒泡，否则面板根节点的"点空白收起"会立刻把它关掉
                 click.propagate(false);
-                state.dropdown_open = if state.dropdown_open == Some(kind) {
+                ui.dropdown_open = if ui.dropdown_open == Some(kind) {
                     None
                 } else {
                     Some(kind)
@@ -160,23 +159,25 @@ fn dropdown(
             .entity(item)
             .insert(PreviewDropdownItem { kind, index })
             .observe(
-                move |mut click: On<PointerClick>, mut state: ResMut<PreviewState>| {
+                move |mut click: On<PointerClick>,
+                      mut ui: ResMut<PreviewUi>,
+                      mut selection: ResMut<AnimSelection>| {
                     if click.button != PointerButton::Primary {
                         return;
                     }
                     click.propagate(false);
                     match kind {
-                        DropdownKind::Character => state.character = index,
-                        DropdownKind::Animation => state.animation = index,
+                        DropdownKind::Character => selection.character = index,
+                        DropdownKind::Animation => selection.clip = index,
                     }
-                    state.dropdown_open = None;
+                    ui.dropdown_open = None;
                 },
             );
     }
 }
 
 /// 倍速滑动条：外观由 widgets 生成，滑块位置仍由预览自己跟随播放进度
-fn speed_slider(commands: &mut Commands, panel: Entity, state: &PreviewState) {
+fn speed_slider(commands: &mut Commands, panel: Entity, state: &AnimSelection) {
     let (min, max) = SPEED_RANGE;
     let parts = widgets::slider(commands, panel, state.speed, min, max, 0.05);
 
@@ -184,7 +185,7 @@ fn speed_slider(commands: &mut Commands, panel: Entity, state: &PreviewState) {
         .entity(parts.root)
         .insert(PreviewSpeedSlider)
         .observe(
-            |change: On<ValueChange<f32>>, mut state: ResMut<PreviewState>| {
+            |change: On<ValueChange<f32>>, mut state: ResMut<AnimSelection>| {
                 // 滑块是连续值，按 0.05 对齐，避免显示成 1.03x 这种零碎数字
                 state.speed = (change.value * 20.0).round() / 20.0;
             },
@@ -196,7 +197,7 @@ fn speed_slider(commands: &mut Commands, panel: Entity, state: &PreviewState) {
 }
 
 pub(super) fn update_button_styles(
-    state: Res<PreviewState>,
+    state: Res<AnimSelection>,
     mut buttons: Query<(&PreviewButton, &mut BackgroundColor), Without<PreviewDropdownItem>>,
 ) {
     if !state.is_changed() {
@@ -219,18 +220,19 @@ pub(super) fn update_button_styles(
 
 /// 下拉框的浮层显隐、触发器里显示的当前值、选中项高亮
 pub(super) fn update_dropdown(
-    state: Res<PreviewState>,
-    catalog: Res<PreviewCatalog>,
+    state: Res<AnimSelection>,
+    ui: Res<PreviewUi>,
+    catalog: Res<AnimCatalog>,
     mut popups: Query<(&PreviewDropdownPopup, &mut Node), Without<PreviewDropdownItem>>,
     mut labels: Query<(&PreviewDropdownLabel, &mut Text), Without<PreviewDropdownItem>>,
     mut items: Query<(&PreviewDropdownItem, &mut BackgroundColor), Without<PreviewDropdownPopup>>,
 ) {
-    if !state.is_changed() {
+    if !state.is_changed() && !ui.is_changed() {
         return;
     }
 
     for (popup, mut node) in &mut popups {
-        let desired = if state.dropdown_open == Some(popup.0) {
+        let desired = if ui.dropdown_open == Some(popup.0) {
             Display::Flex
         } else {
             Display::None
@@ -288,7 +290,7 @@ pub(super) fn update_speed_thumb(
 }
 
 pub(super) fn update_labels(
-    state: Res<PreviewState>,
+    state: Res<AnimSelection>,
     mut speed_labels: Query<&mut Text, (With<PreviewSpeedLabel>, Without<PreviewRootMotionLabel>)>,
     mut motion_labels: Query<&mut Text, (With<PreviewRootMotionLabel>, Without<PreviewSpeedLabel>)>,
 ) {
@@ -309,21 +311,21 @@ pub(super) fn update_labels(
     }
 }
 
-fn selected_index(state: &PreviewState, kind: DropdownKind) -> usize {
+fn selected_index(state: &AnimSelection, kind: DropdownKind) -> usize {
     match kind {
         DropdownKind::Character => state.character,
-        DropdownKind::Animation => state.animation,
+        DropdownKind::Animation => state.clip,
     }
 }
 
-fn current_label(state: &PreviewState, catalog: &PreviewCatalog, kind: DropdownKind) -> String {
+fn current_label(state: &AnimSelection, catalog: &AnimCatalog, kind: DropdownKind) -> String {
     match kind {
         DropdownKind::Character => catalog
             .character(state.character)
             .map(|character| character.name.clone())
             .unwrap_or_else(|| "无角色".to_string()),
         DropdownKind::Animation => catalog
-            .clip(state.animation)
+            .clip(state.clip)
             .map(|clip| clip.to_string())
             .unwrap_or_else(|| "无动画".to_string()),
     }
@@ -354,7 +356,7 @@ fn button(
         .entity(button)
         .insert(PreviewButton(action))
         .observe(
-            move |click: On<PointerClick>, mut state: ResMut<PreviewState>| {
+            move |click: On<PointerClick>, mut state: ResMut<AnimSelection>| {
                 if click.button != PointerButton::Primary {
                     return;
                 }

@@ -5,6 +5,7 @@ use bevy::{
 };
 use crab_feast_library::platform::PlatformInfo;
 
+mod anim;
 mod assets;
 mod camera;
 mod input;
@@ -16,35 +17,37 @@ pub use assets::GameAssets;
 pub use state::GameState;
 
 pub fn build_app(app: &mut App) {
-    app.insert_resource(PlatformInfo::current()).add_plugins((
-        camera::CameraPlugin,
-        FpsOverlayPlugin {
-            config: FpsOverlayConfig {
-                text_config: TextFont {
-                    // Here we define size of our overlay
-                    font_size: FontSize::Rem(1.0),
-                    // If we want, we can use a custom font
-                    font: default(),
-                    // We could also disable font smoothing,
-                    font_smoothing: FontSmoothing::default(),
-                    ..default()
-                },
-                // We can also set the refresh interval for the FPS counter
-                refresh_interval: core::time::Duration::from_millis(100),
-                enabled: true,
-                frame_time_graph_config: FrameTimeGraphConfig {
+    app.insert_resource(PlatformInfo::current())
+        .insert_resource(input::InputSmoothing::new(0.5)) // 平滑系数：0.5（值越小越平滑）
+        .add_plugins((
+            camera::CameraPlugin,
+            FpsOverlayPlugin {
+                config: FpsOverlayConfig {
+                    text_config: TextFont {
+                        // Here we define size of our overlay
+                        font_size: FontSize::Rem(1.0),
+                        // If we want, we can use a custom font
+                        font: default(),
+                        // We could also disable font smoothing,
+                        font_smoothing: FontSmoothing::default(),
+                        ..default()
+                    },
+                    // We can also set the refresh interval for the FPS counter
+                    refresh_interval: core::time::Duration::from_millis(100),
                     enabled: true,
-                    // The minimum acceptable fps
-                    min_fps: 30.0,
-                    // The target fps
-                    target_fps: 60.0,
+                    frame_time_graph_config: FrameTimeGraphConfig {
+                        enabled: true,
+                        // The minimum acceptable fps
+                        min_fps: 30.0,
+                        // The target fps
+                        target_fps: 75.0,
+                    },
+                    ..Default::default()
                 },
-                ..Default::default()
             },
-        },
-        assets::AssetLoadingPlugin,
-        ui::UiPlugin,
-        scene::ScenePlugin,
-    ));
-
+            anim::AnimPlugin,
+            assets::AssetLoadingPlugin,
+            ui::UiPlugin,
+            scene::ScenePlugin,
+        ));
 }

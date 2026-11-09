@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     blendspace::{self, Sample2D},
-    clip::ClipSet,
+    clip::{ClipMeta, ClipSet},
     pose::{BonePose, Pose},
 };
 
@@ -115,17 +115,17 @@ impl BlendSpaceDoc {
             return false;
         };
         let mut changed = false;
-        for axis in 0..2 {
+        for (axis, range) in ranges.iter_mut().enumerate() {
             let Some((min, max)) = sample_span(&self.samples, axis) else {
                 continue;
             };
-            let span = (ranges[axis][1] - ranges[axis][0]).abs().max(1e-6);
-            if min < ranges[axis][0] {
-                ranges[axis][0] = min - span * 0.02;
+            let span = (range[1] - range[0]).abs().max(1e-6);
+            if min < range[0] {
+                range[0] = min - span * 0.02;
                 changed = true;
             }
-            if max > ranges[axis][1] {
-                ranges[axis][1] = max + span * 0.02;
+            if max > range[1] {
+                range[1] = max + span * 0.02;
                 changed = true;
             }
         }
@@ -188,22 +188,29 @@ impl BlendSpaceDoc {
                 (sample.at[0] * 100.0).round() as i32,
                 (sample.at[1] * 100.0).round() as i32,
             ];
-            if seen.iter().any(|(other, clip)| *other == key && *clip == sample.clip) {
-                issues.push(format!("{} 坐标上有重复的 {} 采样点", format_point(sample.at), sample.clip));
+            if seen
+                .iter()
+                .any(|(other, clip)| *other == key && *clip == sample.clip)
+            {
+                issues.push(format!(
+                    "{} 坐标上有重复的 {} 采样点",
+                    format_point(sample.at),
+                    sample.clip
+                ));
             }
             seen.push((key, &sample.clip));
         }
         if let Some(ranges) = self.ranges {
-            for axis in 0..2 {
+            for (axis, range) in ranges.iter().enumerate() {
                 let Some((min, max)) = sample_span(&self.samples, axis) else {
                     continue;
                 };
-                if min < ranges[axis][0] - 1e-4 || max > ranges[axis][1] + 1e-4 {
+                if min < range[0] - 1e-4 || max > range[1] + 1e-4 {
                     issues.push(format!(
                         "{} 轴范围 [{:.2}, {:.2}] 没包住采样点 [{:.2}, {:.2}]，滑杆会有一侧调不到",
                         self.axis(axis),
-                        ranges[axis][0],
-                        ranges[axis][1],
+                        range[0],
+                        range[1],
                         min,
                         max
                     ));
@@ -236,6 +243,8 @@ pub struct SpaceEvalOutput {
     pub pose: Pose,
     pub root_delta: Vec3,
     pub clip_weights: Vec<(String, f32)>,
+    /// 混合输出的等效地速（米/秒，只给大小），见 [`blended_ground_speed`]
+    pub ground_speed: f32,
     pub issues: Vec<String>,
     pub point: [f32; 2],
 }
@@ -272,10 +281,11 @@ pub fn average_events(sources: &[(f32, [Option<f32>; 4])]) -> [Option<f32>; 4] {
     for slot in 0..4 {
         let mut items: Vec<(f32, f32)> = Vec::new();
         for (weight, events) in sources {
-            if let Some(phase) = events[slot] {
-                if weight.is_finite() && *weight > 0.0 {
-                    items.push((*weight, phase.rem_euclid(1.0)));
-                }
+            if let Some(phase) = events[slot]
+                && weight.is_finite()
+                && *weight > 0.0
+            {
+                items.push((*weight, phase.rem_euclid(1.0)));
             }
         }
         if items.is_empty() {
@@ -311,10 +321,7 @@ pub fn average_events(sources: &[(f32, [Option<f32>; 4])]) -> [Option<f32>; 4] {
 /// 事件顺序固定为 `[左脚触地, 左脚离地, 右脚触地, 右脚离地]`。
 /// 首末事件的缺口由最后一段环绕补上，因此映射天然闭合、不会逐周期漂移。
 /// 事件不足两个、或参考相位挤在一起时返回空表（调用方退回恒等映射）。
-pub fn gait_segments(
-    events: &[Option<f32>; 4],
-    reference: &[Option<f32>; 4],
-) -> Vec<(f32, f32)> {
+pub fn gait_segments(events: &[Option<f32>; 4], reference: &[Option<f32>; 4]) -> Vec<(f32, f32)> {
     let mut pairs: Vec<(f32, f32)> = (0..4)
         .filter_map(|index| match (reference[index], events[index]) {
             (Some(u), Some(l)) => Some((u.rem_euclid(1.0), l.rem_euclid(1.0))),
@@ -325,7 +332,10 @@ pub fn gait_segments(
         return Vec::new();
     }
     pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-    if pairs.windows(2).any(|window| (window[1].0 - window[0].0).abs() < 1e-3) {
+    if pairs
+        .windows(2)
+        .any(|window| (window[1].0 - window[0].0).abs() < 1e-3)
+    {
         return Vec::new();
     }
     // 解缠绕：相邻差归一到 [0,1)，让本地相位随参考相位单调
@@ -355,12 +365,11 @@ pub fn warp_phase(phase: f32, points: &[(f32, f32)]) -> f32 {
     let count = points.len();
     let base = points[0].0;
     let u = (phase - base).rem_euclid(1.0) + base;
-    let mut index = count - 1;
-    for k in 0..count {
-        if points[k].0 <= u {
-            index = k;
-        }
-    }
+    // 取最后一个起点 ≤ u 的分段；整表起点都在 u 之后时退回最后一段（环绕段）
+    let index = points
+        .iter()
+        .rposition(|&(start, _)| start <= u)
+        .unwrap_or(count - 1);
     let (u0, l0) = points[index];
     let (u1, l1) = if index + 1 < count {
         points[index + 1]
@@ -370,6 +379,28 @@ pub fn warp_phase(phase: f32, points: &[(f32, f32)]) -> f32 {
     let span = (u1 - u0).max(1e-6);
     let t = ((u - u0) / span).clamp(0.0, 1.0);
     (l0 + t * (l1 - l0)).rem_euclid(1.0)
+}
+
+/// 混合输出的等效地速（米/秒）：`Σ w·|净步幅| / 时长`。
+///
+/// 与 [`effective_period`] 是同一个模型的两面：相位按 `1 / T_ref` 推进，
+/// 一个周期里各剪辑贡献的位移按权重相加，得到的地速正好就是这个加权和，
+/// 所以拿它去驱动角色位移不会滑步。
+///
+/// 取绝对值是因为倒放（后退）只改变方向、不改变脚底走过的距离；
+/// 净步幅未知的剪辑（Idle / 一次性动作）按 0 计入，会自然把档位稀释下来。
+pub fn blended_ground_speed(weighted: &[(f32, f32, f32)]) -> f32 {
+    let mut total = 0.0f32;
+    for (stride, duration, weight) in weighted {
+        if *duration > f32::EPSILON
+            && stride.abs() > f32::EPSILON
+            && weight.is_finite()
+            && *weight > 0.0
+        {
+            total += stride.abs() / *duration * weight;
+        }
+    }
+    total
 }
 
 pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceEvalOutput {
@@ -388,37 +419,29 @@ pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceE
             pose: Pose::default(),
             root_delta: Vec3::ZERO,
             clip_weights: Vec::new(),
+            ground_speed: 0.0,
             issues,
             point,
         };
     }
+
+    // 权重键先解析成采样项（剪辑名 + 播放方向 + 元数据），下面两趟求值共用，
+    // 每帧只查一次 ClipSet。
+    let plans = build_plans(ctx, &weights);
 
     // 参考时长：让输出地速严格等于「权重加权的各剪辑地速」。
     //
     // 相位推进速度是 1/T_ref，混合输出的地速 = Σw·S / T_ref。
     // 要把这个值做到 Σw·v（v = S/T），T_ref 必须取 Σw·S / Σw·v；
     // 直接用 Σw·T 只是近似，走跑档之间会偏 8%~9%。
-    let mut weighted: Vec<(f32, f32, f32)> = Vec::with_capacity(weights.len());
-    let mut duration_sum = 0.0;
-    let mut event_sources: Vec<(f32, [Option<f32>; 4])> = Vec::with_capacity(weights.len());
-    for (key, weight) in &weights {
-        let (clip, reverse) = blendspace::split_key(key);
-        let meta = ctx.clips.meta(ctx.clip_assets, clip);
-        duration_sum += meta.duration.max(0.0) * weight;
-        weighted.push((meta.stride, meta.duration, *weight));
-        // 反转播放的剪辑在时间轴上整个掉头，事件相位也要跟着镜像
-        let mut events = meta.gait_events;
-        if reverse {
-            events = events.map(|event| event.map(|phase| (1.0 - phase).rem_euclid(1.0)));
-        }
-        event_sources.push((*weight, events));
-    }
+    let weighted: Vec<(f32, f32, f32)> = plans.iter().map(SamplePlan::stride_speed).collect();
+    let duration_sum: f32 = plans
+        .iter()
+        .map(|plan| plan.meta.duration.max(0.0) * plan.weight)
+        .sum();
+    let ground_speed = blended_ground_speed(&weighted);
     let reference_duration = effective_period(&weighted)
-        .or(if duration_sum > f32::EPSILON {
-            Some(duration_sum)
-        } else {
-            None
-        })
+        .or_else(|| (duration_sum > f32::EPSILON).then_some(duration_sum))
         .unwrap_or(1.0);
     let dt = ctx.dt * ctx.speed_scale * doc.speed;
     *ctx.phase = (*ctx.phase + dt / reference_duration).rem_euclid(1.0);
@@ -427,30 +450,19 @@ pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceE
     // 统一时间轴：当前权重下的事件加权平均。独占剪辑时它等于该剪辑自己的
     // 事件，重映射退化为恒等（不改变单段动画的节奏）；混合时它落在两者之间，
     // 双方各改一半，四个事件（含支撑期两端）精确对齐。
+    let event_sources: Vec<(f32, [Option<f32>; 4])> = plans
+        .iter()
+        .map(|plan| (plan.weight, plan.events()))
+        .collect();
     let reference = average_events(&event_sources);
 
-    let mut parts: Vec<(f32, Pose)> = Vec::with_capacity(weights.len());
-    for (key, weight) in &weights {
-        let (clip, reverse) = blendspace::split_key(key);
-        let meta = ctx.clips.meta(ctx.clip_assets, clip);
-        let duration = meta.duration;
-        // 相位重映射：把「左脚触地 / 左脚离地 / 右脚触地 / 右脚离地」四个事件
-        // 对齐到统一时间轴，支撑期两端都不再错开。
-        let mut events = meta.gait_events;
-        if reverse {
-            events = events.map(|event| event.map(|p| (1.0 - p).rem_euclid(1.0)));
-        }
-        let points = gait_segments(&events, &reference);
-        let local_phase = warp_phase(phase, &points);
-        // 反转播放：同一相位从剪辑尾往头走，用来做后退之类的动作
-        let time = if reverse {
-            (duration - local_phase * duration).rem_euclid(duration.max(f32::EPSILON))
-        } else {
-            local_phase * duration
-        };
-        let pose = sample_clip(ctx, clip, time);
-        parts.push((*weight, pose));
-    }
+    let parts: Vec<(f32, Pose)> = plans
+        .iter()
+        .map(|plan| {
+            let time = plan.sample_time(phase, &reference);
+            (plan.weight, sample_clip(ctx, &plan.clip, time))
+        })
+        .collect();
 
     let pose = Pose::combine(&parts);
     let root_delta = ctx
@@ -466,13 +478,69 @@ pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceE
         pose,
         root_delta,
         // 对外显示用剪辑名，不带反转后缀
-        clip_weights: weights
+        clip_weights: plans
             .iter()
-            .map(|(key, weight)| (blendspace::split_key(key).0.to_string(), *weight))
+            .map(|plan| (plan.clip.clone(), plan.weight))
             .collect(),
+        ground_speed,
         issues,
         point,
     }
+}
+
+/// 一个参与本次混合的采样项：剪辑 + 播放方向 + 权重 + 已解析的元数据。
+struct SamplePlan {
+    clip: String,
+    reverse: bool,
+    weight: f32,
+    meta: ClipMeta,
+}
+
+impl SamplePlan {
+    /// 步态事件按播放方向对齐后的结果：倒放时时间轴整个掉头，相位要跟着镜像。
+    fn events(&self) -> [Option<f32>; 4] {
+        if self.reverse {
+            self.meta
+                .gait_events
+                .map(|event| event.map(|phase| (1.0 - phase).rem_euclid(1.0)))
+        } else {
+            self.meta.gait_events
+        }
+    }
+
+    /// `(净步幅, 时长, 权重)`：等效周期与混合地速都由这三元组算出。
+    fn stride_speed(&self) -> (f32, f32, f32) {
+        (self.meta.stride, self.meta.duration, self.weight)
+    }
+
+    /// 统一相位 → 该剪辑的采样时刻。先把四个步态事件对齐到 `reference`，
+    /// 倒放时再从剪辑尾部往头走（后退一类动作）。
+    fn sample_time(&self, phase: f32, reference: &[Option<f32>; 4]) -> f32 {
+        let duration = self.meta.duration;
+        let points = gait_segments(&self.events(), reference);
+        let local_phase = warp_phase(phase, &points);
+        if self.reverse {
+            (duration - local_phase * duration).rem_euclid(duration.max(f32::EPSILON))
+        } else {
+            local_phase * duration
+        }
+    }
+}
+
+/// 把权重键（可能带 `#rev` 后缀）解析成采样项，顺带把剪辑元数据查出来。
+fn build_plans(ctx: &SpaceEvalContext, weights: &[(String, f32)]) -> Vec<SamplePlan> {
+    weights
+        .iter()
+        .map(|(key, weight)| {
+            let (clip, reverse) = blendspace::split_key(key);
+            SamplePlan {
+                clip: clip.to_string(),
+                reverse,
+                weight: *weight,
+                meta: ctx.clips.meta(ctx.clip_assets, clip),
+            }
+        })
+        .collect()
 }
 
 fn sample_clip(ctx: &SpaceEvalContext, clip: &str, time: f32) -> Pose {
@@ -559,7 +627,10 @@ mod tests {
         let b = [Some(0.05), None, None, None];
         let reference = average_events(&[(0.5, a), (0.5, b)]);
         let value = reference[0].unwrap();
-        assert!(value < 1e-3 || value > 0.999, "环绕平均应落在 0 附近，实际 {value}");
+        assert!(
+            value < 1e-3 || value > 0.999,
+            "环绕平均应落在 0 附近，实际 {value}"
+        );
     }
 
     /// 事件不足两个时退回恒等映射，不能炸。
@@ -567,16 +638,21 @@ mod tests {
     fn warp_without_events_is_identity() {
         let points: Vec<(f32, f32)> = Vec::new();
         assert!((warp_phase(0.42, &points) - 0.42).abs() < 1e-6);
-        let sparse = gait_segments(&[Some(0.4), None, None, None], &[Some(0.3), None, None, None]);
+        let sparse = gait_segments(
+            &[Some(0.4), None, None, None],
+            &[Some(0.3), None, None, None],
+        );
         assert!(sparse.is_empty());
     }
 
     /// 改坐标成「yaw × 带符号 speed」后，规则网格上的插值必须落在预期剪辑上。
     #[test]
     fn yaw_speed_grid_interpolates() {
-        use crate::anim::blendspace::Sample2D;
-        let mut doc = BlendSpaceDoc::default();
-        doc.ranges = Some([[-90.0, 90.0], [-1.0, 1.0]]);
+        use crate::anim::core::blendspace::Sample2D;
+        let mut doc = BlendSpaceDoc {
+            ranges: Some([[-90.0, 90.0], [-1.0, 1.0]]),
+            ..BlendSpaceDoc::default()
+        };
         let walk = [
             (-90.0, "LeftStrafeWalking", false),
             (0.0, "Walking", false),
@@ -653,12 +729,40 @@ mod tests {
         assert_eq!(key, "RightStrafeWalking");
         // 斜向没有素材点，必须由相邻两列合成
         let (key, weight) = top([-45.0, 0.5]);
-        assert!(key == "Walking" || key == "LeftStrafeWalking", "斜向应为两列混合，实际 {key}");
+        assert!(
+            key == "Walking" || key == "LeftStrafeWalking",
+            "斜向应为两列混合，实际 {key}"
+        );
         assert!((weight - 0.5).abs() < 1e-3, "斜向应各半，实际 {weight}");
         // 走↔跑之间是两档同向剪辑的线性混合
         let (key, weight) = top([0.0, 0.75]);
-        assert!(key == "Walking" || key == "Running", "中间档应为走跑混合，实际 {key}");
+        assert!(
+            key == "Walking" || key == "Running",
+            "中间档应为走跑混合，实际 {key}"
+        );
         assert!((weight - 0.5).abs() < 1e-3, "走跑应各半，实际 {weight}");
+    }
+
+    /// 等效地速与等效周期是同一个模型的两面：混合输出的地速必须严格等于
+    /// `Σ w·|步幅| / T_ref`，否则按这个值驱动角色位移就会滑步。
+    #[test]
+    fn blended_speed_matches_period_and_dilutes_with_idle() {
+        let walk = (1.190, 1.033);
+        let run = (2.114, 0.700);
+        let weighted = [(walk.0, walk.1, 0.5), (run.0, run.1, 0.5)];
+        let period = effective_period(&weighted).expect("有步幅时应给出周期");
+        let by_phase = (0.5 * walk.0 + 0.5 * run.0) / period;
+        assert!(
+            (blended_ground_speed(&weighted) - by_phase).abs() < 1e-3,
+            "地速应与相位推进模型一致"
+        );
+        // Idle（净步幅 0）占一半权重时，地速减半：档位被稀释是正确行为
+        let half = blended_ground_speed(&[(0.0, 8.333, 0.5), (walk.0, walk.1, 0.5)]);
+        assert!((half - 0.5 * walk.0 / walk.1).abs() < 1e-4, "实际 {half}");
+        // 倒放只改方向，不该让地速变号或变小
+        let back = blended_ground_speed(&[(-run.0, run.1, 1.0)]);
+        assert!((back - run.0 / run.1).abs() < 1e-4, "实际 {back}");
+        assert!(blended_ground_speed(&[(0.0, 8.333, 1.0)]) <= f32::EPSILON);
     }
 
     /// 纯 Idle（净位移为 0）不能参与速度换算，必须走时长回退。
@@ -672,8 +776,10 @@ mod tests {
     /// 文档不写 ranges 时按采样点跨度推导，角度轴不会再被当成归一化轴。
     #[test]
     fn missing_ranges_derive_from_samples() {
-        let mut doc = BlendSpaceDoc::default();
-        doc.params = ["yaw".to_string(), "speed".to_string()];
+        let mut doc = BlendSpaceDoc {
+            params: ["yaw".to_string(), "speed".to_string()],
+            ..BlendSpaceDoc::default()
+        };
         doc.samples.push(Sample2D {
             at: [-90.0, -1.0],
             clip: "LeftStrafe".into(),
@@ -687,8 +793,14 @@ mod tests {
 
         let yaw = doc.range(0);
         let speed = doc.range(1);
-        assert!(yaw[0] < -90.0 && yaw[1] > 90.0, "yaw 轴应覆盖 ±90，实际 {yaw:?}");
-        assert!(speed[0] < -1.0 && speed[1] > 1.0, "speed 轴应覆盖 ±1，实际 {speed:?}");
+        assert!(
+            yaw[0] < -90.0 && yaw[1] > 90.0,
+            "yaw 轴应覆盖 ±90，实际 {yaw:?}"
+        );
+        assert!(
+            speed[0] < -1.0 && speed[1] > 1.0,
+            "speed 轴应覆盖 ±1，实际 {speed:?}"
+        );
         // 归一化余量不该把角度轴压回 ±1
         assert!(yaw[1] > 45.0);
     }
@@ -696,8 +808,10 @@ mod tests {
     /// 显式范围太窄时 fit_ranges 会扩张到包住采样点，validate 也能提前报出来。
     #[test]
     fn narrow_ranges_are_fitted_and_reported() {
-        let mut doc = BlendSpaceDoc::default();
-        doc.ranges = Some([[-90.0, 90.0], [0.0, 1.0]]);
+        let mut doc = BlendSpaceDoc {
+            ranges: Some([[-90.0, 90.0], [0.0, 1.0]]),
+            ..BlendSpaceDoc::default()
+        };
         doc.samples.push(Sample2D {
             at: [0.0, -1.0],
             clip: "Running".into(),
@@ -705,7 +819,9 @@ mod tests {
         });
         let before = doc.validate();
         assert!(
-            before.iter().any(|issue| issue.contains("speed") && issue.contains("没包住")),
+            before
+                .iter()
+                .any(|issue| issue.contains("speed") && issue.contains("没包住")),
             "validate 应报出 speed 轴调不到负值，实际 {before:?}"
         );
         assert!(doc.fit_ranges(), "负向采样点越界时应触发扩张");
@@ -724,7 +840,10 @@ mod tests {
             reverse: false,
         });
         let json = serde_json::to_string(&doc).unwrap();
-        assert!(!json.contains("ranges"), "未指定范围时不该写入 ranges：{json}");
+        assert!(
+            !json.contains("ranges"),
+            "未指定范围时不该写入 ranges：{json}"
+        );
         let back: BlendSpaceDoc = serde_json::from_str(&json).unwrap();
         assert!(back.range(0)[0] < -90.0, "反序列化后应按采样点推导");
 
@@ -739,16 +858,15 @@ mod tests {
 #[cfg(test)]
 mod bench {
     use super::*;
-    use bevy::animation::{animated_field, AnimationClip, AnimationTargetId};
+    use bevy::animation::{AnimationClip, AnimationTargetId, animated_field};
 
     /// 诊断用：按真实骨架规模（169 个 target、3 通道、30 关键帧）量一次
-    /// 4 剪辑混合的单帧求值成本。`cargo test -p crab_feast_library bench_pose -- --ignored --nocapture`
+    /// 4 剪辑混合的单帧求值成本。`cargo test -p crab_feast bench_pose -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn bench_pose_sampling() {
         let names: Vec<Name> = (0..169).map(|i| Name::new(format!("Bone{i}"))).collect();
-        let ids: Vec<AnimationTargetId> =
-            names.iter().map(|name| AnimationTargetId::from_name(name)).collect();
+        let ids: Vec<AnimationTargetId> = names.iter().map(AnimationTargetId::from_name).collect();
 
         let mut clip = AnimationClip::default();
         for (index, id) in ids.iter().enumerate() {
@@ -792,10 +910,8 @@ mod bench {
             );
         }
 
-        let rest: HashMap<AnimationTargetId, BonePose> = ids
-            .iter()
-            .map(|id| (*id, BonePose::IDENTITY))
-            .collect();
+        let rest: HashMap<AnimationTargetId, BonePose> =
+            ids.iter().map(|id| (*id, BonePose::IDENTITY)).collect();
 
         const FRAMES: usize = 600;
         let start = std::time::Instant::now();

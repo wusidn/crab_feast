@@ -1,18 +1,11 @@
 //! 混合空间采样：把参数空间里的一个点换算成「若干剪辑 + 权重」。
 //!
-//! 1D 用相邻两点线性插值；2D 对齐 UE 的做法，先三角剖分、
-//! 再用重心坐标求权重，落在凸包外时投影到最近的三角形。
+//! 对齐 Unreal 的 Blend Space 2D：先三角剖分、再用重心坐标求权重，
+//! 落在凸包外时投影到最近的三角形；规则网格走双线性插值。
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-
-/// 一维采样点
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Sample1D {
-    pub value: f32,
-    pub clip: String,
-}
 
 /// 二维采样点：参数坐标 + 剪辑名
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -64,39 +57,6 @@ fn merge(weights: Vec<(String, f32)>) -> Vec<(String, f32)> {
         .collect();
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     out
-}
-
-/// 一维采样：返回 (clip, weight)，权重和为 1
-pub fn weights_1d(samples: &[Sample1D], value: f32) -> Vec<(String, f32)> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted: Vec<&Sample1D> = samples.iter().collect();
-    sorted.sort_by(|a, b| a.value.partial_cmp(&b.value).unwrap_or(std::cmp::Ordering::Equal));
-
-    if value <= sorted[0].value {
-        return merge(vec![(sorted[0].clip.clone(), 1.0)]);
-    }
-    let last = sorted[sorted.len() - 1];
-    if value >= last.value {
-        return merge(vec![(last.clip.clone(), 1.0)]);
-    }
-
-    for pair in sorted.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        if value >= a.value && value <= b.value {
-            let span = b.value - a.value;
-            let t = if span <= f32::EPSILON {
-                0.0
-            } else {
-                (value - a.value) / span
-            };
-            return merge(vec![(a.clip.clone(), 1.0 - t), (b.clip.clone(), t)]);
-        }
-    }
-
-    merge(vec![(last.clip.clone(), 1.0)])
 }
 
 fn barycentric(a: [f32; 2], b: [f32; 2], c: [f32; 2], p: [f32; 2]) -> Option<[f32; 3]> {
@@ -187,9 +147,18 @@ pub fn weights_2d(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)> {
         if raw[0] >= -1e-5 && raw[1] >= -1e-5 && raw[2] >= -1e-5 {
             let weights = clamped(raw);
             return merge(vec![
-                (playback_key(&samples[i0].clip, samples[i0].reverse), weights[0]),
-                (playback_key(&samples[i1].clip, samples[i1].reverse), weights[1]),
-                (playback_key(&samples[i2].clip, samples[i2].reverse), weights[2]),
+                (
+                    playback_key(&samples[i0].clip, samples[i0].reverse),
+                    weights[0],
+                ),
+                (
+                    playback_key(&samples[i1].clip, samples[i1].reverse),
+                    weights[1],
+                ),
+                (
+                    playback_key(&samples[i2].clip, samples[i2].reverse),
+                    weights[2],
+                ),
             ]);
         }
 
@@ -210,9 +179,18 @@ pub fn weights_2d(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)> {
 
     if let Some((_, weights, i0, i1, i2)) = best {
         return merge(vec![
-            (playback_key(&samples[i0].clip, samples[i0].reverse), weights[0]),
-            (playback_key(&samples[i1].clip, samples[i1].reverse), weights[1]),
-            (playback_key(&samples[i2].clip, samples[i2].reverse), weights[2]),
+            (
+                playback_key(&samples[i0].clip, samples[i0].reverse),
+                weights[0],
+            ),
+            (
+                playback_key(&samples[i1].clip, samples[i1].reverse),
+                weights[1],
+            ),
+            (
+                playback_key(&samples[i2].clip, samples[i2].reverse),
+                weights[2],
+            ),
         ]);
     }
 
@@ -238,12 +216,12 @@ fn axis_cell(axis: &[f32], value: f32) -> (usize, usize, f32) {
     if axis.len() < 2 {
         return (0, 0, 0.0);
     }
-    let mut left = 0usize;
-    for index in 0..axis.len() - 1 {
-        if value >= axis[index] {
-            left = index;
-        }
-    }
+    // 取最后一个起点 ≤ value 的格子；整条轴都在 value 之后时退回第一格
+    let left = axis
+        .iter()
+        .take(axis.len() - 1)
+        .rposition(|&start| value >= start)
+        .unwrap_or(0);
     let span = axis[left + 1] - axis[left];
     let t = if span.abs() <= 1e-6 {
         0.0
@@ -261,9 +239,9 @@ fn weights_grid(
     point: [f32; 2],
 ) -> Vec<(String, f32)> {
     let find = |x: f32, y: f32| -> Option<&Sample2D> {
-        samples.iter().find(|sample| {
-            (sample.at[0] - x).abs() < 1e-4 && (sample.at[1] - y).abs() < 1e-4
-        })
+        samples
+            .iter()
+            .find(|sample| (sample.at[0] - x).abs() < 1e-4 && (sample.at[1] - y).abs() < 1e-4)
     };
     let (x0, x1, tx) = axis_cell(xs, point[0]);
     let (y0, y1, ty) = axis_cell(ys, point[1]);
@@ -289,8 +267,7 @@ fn inverse_distance(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)>
     let mut nearest: Vec<(f32, String)> = samples
         .iter()
         .map(|sample| {
-            let distance =
-                (sample.at[0] - point[0]).powi(2) + (sample.at[1] - point[1]).powi(2);
+            let distance = (sample.at[0] - point[0]).powi(2) + (sample.at[1] - point[1]).powi(2);
             (distance, playback_key(&sample.clip, sample.reverse))
         })
         .collect();
@@ -307,27 +284,6 @@ fn inverse_distance(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn one_dimensional_interpolates() {
-        let samples = vec![
-            Sample1D {
-                value: 0.0,
-                clip: "idle".into(),
-            },
-            Sample1D {
-                value: 2.0,
-                clip: "walk".into(),
-            },
-            Sample1D {
-                value: 6.0,
-                clip: "run".into(),
-            },
-        ];
-        let weights = weights_1d(&samples, 1.0);
-        assert_eq!(weights.len(), 2);
-        assert!((weights.iter().map(|w| w.1).sum::<f32>() - 1.0).abs() < 1e-5);
-    }
 
     #[test]
     fn two_dimensional_weights_sum_to_one() {

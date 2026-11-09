@@ -60,14 +60,6 @@ impl MixerCore {
             character: character.into(),
         }
     }
-
-    pub fn param(&self, axis: &str) -> f32 {
-        self.params.get(axis).copied().unwrap_or(0.0)
-    }
-
-    pub fn set_param(&mut self, axis: &str, value: f32) {
-        self.params.insert(axis.to_string(), value);
-    }
 }
 
 /// 任何实现了这个 trait 的类型都能注册到预览。
@@ -80,11 +72,11 @@ pub trait BlendMixer: Resource {
 #[macro_export]
 macro_rules! impl_blend_mixer {
     ($ty:ident) => {
-        impl $crate::anim::BlendMixer for $ty {
-            fn core(&self) -> &$crate::anim::MixerCore {
+        impl $crate::anim::core::BlendMixer for $ty {
+            fn core(&self) -> &$crate::anim::core::MixerCore {
                 &self.0
             }
-            fn core_mut(&mut self) -> &mut $crate::anim::MixerCore {
+            fn core_mut(&mut self) -> &mut $crate::anim::core::MixerCore {
                 &mut self.0
             }
         }

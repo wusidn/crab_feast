@@ -15,8 +15,6 @@ pub type ClipId = String;
 pub struct ClipMeta {
     /// 时长（秒），用于相位同步与播放倍率；为 0 时回落到资源本身的时长
     pub duration: f32,
-    /// 是否循环（一次性动作走 clamp）
-    pub looped: bool,
     /// 一个循环的净前进距离（米），用于步幅匹配；未知时为 0
     pub stride: f32,
     /// 步态事件在**本地相位**上的位置，顺序固定为
@@ -29,7 +27,6 @@ impl Default for ClipMeta {
     fn default() -> Self {
         Self {
             duration: 0.0,
-            looped: true,
             stride: 0.0,
             gait_events: [None; 4],
         }
@@ -67,14 +64,6 @@ impl ClipSet {
 
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.handles.keys().map(|key| key.as_str())
-    }
-
-    pub fn len(&self) -> usize {
-        self.handles.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.handles.is_empty()
     }
 
     /// 已加载剪辑的时长；资源未就绪时返回 `None`

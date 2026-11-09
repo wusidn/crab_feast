@@ -266,7 +266,7 @@ fn on_rotate_plane_press(
         .map(|camera| {
             camera
                 .logical_viewport_size()
-                .map(|viewport_size| event.pointer.position.x < viewport_size.x as f32 / 2.0)
+                .map(|viewport_size| event.pointer.position.x < viewport_size.x / 2.0)
                 .unwrap_or(true)
         });
     if hit_left.unwrap_or(true) {
@@ -315,7 +315,8 @@ fn on_keyboard_event(
     move_input_joystick_query: Query<Entity, With<MoveInputJoystick>>,
     mut joystick_marionette_query: Query<(Entity, &mut JoystickMarionette)>,
 ) {
-    let walk_speed = 0.65;
+    // 档位量级，不是米/秒：混合空间里 ±0.5 是走档、±1 是跑档
+    let walk_speed = 0.75;
     let run_speed = 1.0;
 
     let mut direction = Vec2::ZERO;
@@ -365,7 +366,7 @@ fn on_keyboard_event(
             joystick_marionette.force = speed;
         } else {
             commands.entity(entity).insert(JoystickMarionette {
-                direction: direction,
+                direction,
                 force: speed,
                 ..Default::default()
             });

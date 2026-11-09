@@ -6,10 +6,8 @@
 //! - 混合系统、参数、采样点管理、存取都挂在菜单的「混合空间」页面里
 //!   （[`fill_menu_page`]，页面 id 为 [`BLEND_SPACE_PAGE`]）。
 
-pub(crate) mod driver;
 mod grid;
 mod inspector;
-mod registry;
 
 use std::collections::HashMap;
 
@@ -21,14 +19,14 @@ use bevy::{
     ui_widgets::SliderValue,
 };
 
-use crab_feast_library::anim::{BlendSpaceDoc, ClipSet};
-
 use crate::{
-    ui::menu::{widgets, MenuConfig, MenuEvent, MenuPageBody, MenuPageDef, MenuState, DRAWER_WIDTH},
     GameState,
+    anim::core::BlendSpaceDoc,
+    anim::{AnimFocus, AnimSelection, AnimationSet, MixerCache, MixerEdit},
+    ui::menu::{
+        DRAWER_WIDTH, MenuConfig, MenuEvent, MenuPageBody, MenuPageDef, MenuState, widgets,
+    },
 };
-
-use driver::PoseDriver;
 
 /// 网格尺寸（像素）：横轴铺开、纵轴压扁的长方形，贴在屏幕下方
 pub const GRID_W: f32 = 640.0;
@@ -83,6 +81,8 @@ pub struct SpaceEditor {
     pub open: bool,
     /// 当前预览/编辑的混合系统（对应 `MixerRegistry` 的顺序）
     pub mixer: usize,
+    /// 当前文档属于哪个角色，保存与载入按它拼路径
+    pub character: String,
     /// 当前文档来自哪个混合器，用于切换时重新载入
     pub loaded_key: Option<String>,
     /// 当前混合系统是否在游戏中启用
@@ -123,15 +123,13 @@ impl Default for SpaceEditor {
         Self {
             open: false,
             mixer: 0,
+            character: String::new(),
             loaded_key: None,
             enabled: true,
             doc: BlendSpaceDoc::default(),
             revision: 0,
             selected: None,
-            params: HashMap::from([
-                ("yaw".to_string(), 0.0),
-                ("speed".to_string(), 0.5),
-            ]),
+            params: HashMap::from([("yaw".to_string(), 0.0), ("speed".to_string(), 0.5)]),
             status: String::new(),
             drag: None,
             gesture_travel: 0.0,
@@ -241,13 +239,8 @@ pub struct BlendSpaceEditorPlugin;
 impl Plugin for BlendSpaceEditorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SpaceEditor>()
-            .init_resource::<ClipSet>()
-            .init_resource::<PoseDriver>()
             .init_resource::<ForceRebuild>()
-            .init_resource::<registry::MixerRegistry>()
-            .init_resource::<registry::MixerCache>()
             .add_systems(Startup, register_menu_page)
-            .add_systems(OnEnter(GameState::Game), registry::init_mixers)
             .add_systems(
                 Update,
                 (
@@ -263,7 +256,6 @@ impl Plugin for BlendSpaceEditorPlugin {
             .add_systems(
                 Update,
                 (
-                    driver::sync_clip_set,
                     grid::rebuild_grid,
                     grid::apply_sample_positions,
                     grid::update_sample_selection,
@@ -277,17 +269,13 @@ impl Plugin for BlendSpaceEditorPlugin {
                     sync_enabled_label,
                     switch_mixer_keys,
                     sync_dropdown,
-                    registry::sync_mixers,
+                    load_editor_state,
+                    publish_edit,
                     widgets::update_slider_styling,
                 )
                     .chain()
-                    .run_if(in_state(GameState::Game)),
-            )
-            .add_systems(
-                PostUpdate,
-                driver::drive_pose
-                    .after(bevy::app::AnimationSystems)
-                    .before(bevy::transform::TransformSystems::Propagate)
+                    // 本帧的编辑要赶在动画系统应用参数之前交出去，否则拖滑杆会慢一帧
+                    .in_set(AnimationSet::Publish)
                     .run_if(in_state(GameState::Game)),
             );
     }
@@ -312,11 +300,7 @@ pub const BLEND_SPACE_PAGE: &str = "blend_space";
 
 /// 把「混合空间」注册成菜单一级入口：网格停靠屏幕下方，控制项都在这个页面里
 fn register_menu_page(mut config: ResMut<MenuConfig>) {
-    if config
-        .pages
-        .iter()
-        .any(|page| page.id == BLEND_SPACE_PAGE)
-    {
+    if config.pages.iter().any(|page| page.id == BLEND_SPACE_PAGE) {
         return;
     }
     config.pages.push(MenuPageDef::section(
@@ -419,10 +403,7 @@ fn build_grid_area(commands: &mut Commands, parent: Entity) -> Entity {
 }
 
 /// 抽屉展开多少，网格就在剩下的左侧空白区域居中
-fn sync_dock_inset(
-    menu: Res<MenuState>,
-    mut roots: Query<&mut Node, With<EditorRoot>>,
-) {
+fn sync_dock_inset(menu: Res<MenuState>, mut roots: Query<&mut Node, With<EditorRoot>>) {
     let pad = Val::Px(DRAWER_WIDTH * menu.drawer_progress());
     for mut node in &mut roots {
         if node.padding.right != pad {
@@ -437,7 +418,7 @@ fn fill_menu_page(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     editor: Res<SpaceEditor>,
-    cache: Res<registry::MixerCache>,
+    cache: Res<MixerCache>,
     bodies: Query<(Entity, &MenuPageBody)>,
     roots: Query<Entity, With<SpacePageRoot>>,
     mut last: Local<(usize, usize)>,
@@ -479,13 +460,13 @@ fn fill_menu_page(
         ))
         .id();
     // 点页面空白处收起下拉框（触发器和选项都 propagate(false)，不会误触发）
-    commands.entity(root).observe(
-        |click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+    commands
+        .entity(root)
+        .observe(|click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
             if click.button == PointerButton::Primary && editor.open_dropdown.is_some() {
                 editor.open_dropdown = None;
             }
-        },
-    );
+        });
     build_page_content(&mut commands, root, &font, &editor, &cache);
 }
 
@@ -494,7 +475,7 @@ fn build_page_content(
     root: Entity,
     font: &Handle<Font>,
     editor: &SpaceEditor,
-    cache: &registry::MixerCache,
+    cache: &MixerCache,
 ) {
     // 混合系统切换（下拉框）
     label(commands, root, font, "混合系统", 12.0, MUTED_TEXT);
@@ -513,7 +494,11 @@ fn build_page_content(
         selected,
     );
     for (index, item) in parts.items.into_iter().enumerate() {
-        let key = cache.mixers.get(index).map(|mixer| mixer.key.clone()).unwrap_or_default();
+        let key = cache
+            .mixers
+            .get(index)
+            .map(|mixer| mixer.key.clone())
+            .unwrap_or_default();
         commands.entity(item).observe(
             move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
                 if click.button != PointerButton::Primary {
@@ -531,7 +516,14 @@ fn build_page_content(
         );
     }
 
-    let status = label(commands, root, font, editor.status.clone(), 11.0, MUTED_TEXT);
+    let status = label(
+        commands,
+        root,
+        font,
+        editor.status.clone(),
+        11.0,
+        MUTED_TEXT,
+    );
     commands.entity(status).insert(StatusText);
 
     // 参数
@@ -601,11 +593,11 @@ fn build_page_content(
     let root_text = label(commands, root_button, font, "根运动：关", 11.0, TEXT_COLOR);
     commands.entity(root_text).insert(RootMotionLabel);
     commands.entity(root_button).observe(
-        move |click: On<PointerClick>, mut driver: ResMut<PoseDriver>| {
+        move |click: On<PointerClick>, mut selection: ResMut<AnimSelection>| {
             if click.button != PointerButton::Primary {
                 return;
             }
-            driver.root_motion = !driver.root_motion;
+            selection.root_motion = !selection.root_motion;
         },
     );
 
@@ -716,14 +708,23 @@ fn spawn_dropdown(
                 };
             },
         );
-    commands.entity(parts.popup).insert(BlendDropdownPopup(kind));
+    commands
+        .entity(parts.popup)
+        .insert(BlendDropdownPopup(kind));
     parts
 }
 
 /// 按 `open_dropdown` 显隐浮层
+// 两组查询的形状写成别名 Bevy 会推不出 SystemParam，只能就地写全。
+#[expect(clippy::type_complexity)]
 fn sync_dropdown(
     editor: Res<SpaceEditor>,
-    mut popups: Query<(&BlendDropdownPopup, &DropdownAnchor, &mut Node, &mut ScrollPosition)>,
+    mut popups: Query<(
+        &BlendDropdownPopup,
+        &DropdownAnchor,
+        &mut Node,
+        &mut ScrollPosition,
+    )>,
     mut ui: ParamSet<(
         Query<(&ComputedNode, &UiGlobalTransform)>,
         Query<(&Node, Option<&ChildOf>), Without<BlendDropdownPopup>>,
@@ -774,11 +775,11 @@ fn sync_dropdown(
                     break;
                 };
                 current = parent;
-                if let Ok((parent_style, _)) = nodes.get(parent) {
-                    if parent_style.overflow.y != OverflowAxis::Visible {
-                        found = Some(parent);
-                        break;
-                    }
+                if let Ok((parent_style, _)) = nodes.get(parent)
+                    && parent_style.overflow.y != OverflowAxis::Visible
+                {
+                    found = Some(parent);
+                    break;
                 }
             }
             found
@@ -804,8 +805,16 @@ fn sync_dropdown(
         // 高度按 8px 取整，避免每帧微调布局
         let max_height = Val::Px(((available.min(300.0)) / 8.0).floor().max(2.0) * 8.0);
 
-        let want_top = if upward { Val::Auto } else { Val::Percent(100.0) };
-        let want_bottom = if upward { Val::Percent(100.0) } else { Val::Auto };
+        let want_top = if upward {
+            Val::Auto
+        } else {
+            Val::Percent(100.0)
+        };
+        let want_bottom = if upward {
+            Val::Percent(100.0)
+        } else {
+            Val::Auto
+        };
         if node.top != want_top || node.bottom != want_bottom {
             node.top = want_top;
             node.bottom = want_bottom;
@@ -821,10 +830,61 @@ fn sync_dropdown(
     }
 }
 
+/// 把当前选中的混合器载入编辑器：换系统或换角色时重新取文档与参数。
+/// 只读快照，写回走 [`publish_edit`]。
+fn load_editor_state(
+    cache: Res<MixerCache>,
+    mut editor: ResMut<SpaceEditor>,
+    mut rebuild: ResMut<ForceRebuild>,
+) {
+    let Some(snapshot) = cache.mixers.get(editor.mixer) else {
+        return;
+    };
+    if editor.loaded_key.as_deref() == Some(snapshot.key.as_str())
+        && editor.character == snapshot.character
+    {
+        return;
+    }
+    editor.loaded_key = Some(snapshot.key.clone());
+    editor.character = snapshot.character.clone();
+    editor.doc = snapshot.space.clone();
+    editor.params = snapshot.params.clone();
+    editor.enabled = snapshot.enabled;
+    editor.selected = None;
+    editor.revision = editor.revision.wrapping_add(1);
+    rebuild.0 = true;
+}
+
+/// 把编辑器的工作副本交给动画系统；面板关掉后参数所有权交还游戏逻辑。
+fn publish_edit(
+    mut edit: ResMut<MixerEdit>,
+    mut focus: ResMut<AnimFocus>,
+    editor: Res<SpaceEditor>,
+) {
+    let key = editor.open.then(|| editor.loaded_key.clone()).flatten();
+    match &key {
+        Some(id) => focus.focus(id),
+        None => focus.clear(),
+    }
+    if edit.mixer != key {
+        edit.mixer = key;
+    }
+    let Some(_) = edit.mixer else {
+        return;
+    };
+    if edit.doc != editor.doc {
+        edit.doc = editor.doc.clone();
+    }
+    if edit.params != editor.params {
+        edit.params = editor.params.clone();
+    }
+    edit.enabled = editor.enabled;
+}
+
 /// 面板打开时用数字键 1..9 切换混合系统
 fn switch_mixer_keys(
     keys: Res<ButtonInput<KeyCode>>,
-    cache: Res<registry::MixerCache>,
+    cache: Res<MixerCache>,
     mut editor: ResMut<SpaceEditor>,
 ) {
     // 只在网格打开时接管数字键，避免影响游戏本身的按键
@@ -880,16 +940,21 @@ fn sync_status(editor: Res<SpaceEditor>, mut texts: Query<&mut Text, With<Status
     }
 }
 
-fn sync_weight_text(
-    editor: Res<SpaceEditor>,
-    mut texts: Query<&mut Text, With<WeightText>>,
-) {
+fn sync_weight_text(editor: Res<SpaceEditor>, mut texts: Query<&mut Text, With<WeightText>>) {
     if !editor.is_changed() {
         return;
     }
     let point = [
-        editor.params.get(editor.doc.axis(0)).copied().unwrap_or(0.0),
-        editor.params.get(editor.doc.axis(1)).copied().unwrap_or(0.0),
+        editor
+            .params
+            .get(editor.doc.axis(0))
+            .copied()
+            .unwrap_or(0.0),
+        editor
+            .params
+            .get(editor.doc.axis(1))
+            .copied()
+            .unwrap_or(0.0),
     ];
     let weights = editor.doc.weights(point);
     let hint = if weights.is_empty() {
@@ -909,10 +974,7 @@ fn sync_weight_text(
     }
 }
 
-fn sync_param_labels(
-    editor: Res<SpaceEditor>,
-    mut labels: Query<(&ParamValue, &mut Text)>,
-) {
+fn sync_param_labels(editor: Res<SpaceEditor>, mut labels: Query<(&ParamValue, &mut Text)>) {
     if !editor.is_changed() {
         return;
     }
@@ -956,17 +1018,20 @@ fn sync_param_sliders(
 }
 
 fn sync_root_motion_label(
-    driver: Res<PoseDriver>,
+    selection: Res<AnimSelection>,
     mut labels: Query<&mut Text, With<RootMotionLabel>>,
 ) {
-    if !driver.is_changed() {
+    if !selection.is_changed() {
         return;
     }
-    let desired = if driver.root_motion { "根运动：开" } else { "根运动：关" };
+    let desired = if selection.root_motion {
+        "根运动：开"
+    } else {
+        "根运动：关"
+    };
     for mut text in &mut labels {
         if text.0 != desired {
             text.0 = desired.to_string();
         }
     }
 }
-
