@@ -73,6 +73,9 @@ pub struct PoseDriver {
     pub point: [f32; 2],
     /// 当前混合输出的等效地速（米/秒），角色实际移动速度按它走
     pub ground_speed: f32,
+    /// 当前混合输出的两只脚支撑权重 `[左, 右]`（0 = 空中，1 = 踩实），
+    /// 脚部 IK 用它决定什么时候把脚钉在地上
+    pub contacts: [f32; 2],
     /// 本帧是否求值过混合空间（权重与地速这些数值可用）
     pub evaluated: bool,
     /// 上一帧是否真的由混合空间写了姿态（单条剪辑的根运动要让位）
@@ -129,6 +132,7 @@ pub(crate) fn drive_pose(
         issues,
         point,
         ground_speed,
+        contacts,
         evaluated,
         active,
     } = &mut *driver;
@@ -149,6 +153,7 @@ pub(crate) fn drive_pose(
     let mut last_point = [0.0, 0.0];
     let mut last_root_delta = Vec3::ZERO;
     let mut last_ground_speed = 0.0;
+    let mut last_contacts = [0.0; 2];
     let mut any = false;
 
     // 预览聚焦时只驱动那一个；关闭编辑器后按「启用」顺序驱动当前角色的混合器
@@ -195,6 +200,7 @@ pub(crate) fn drive_pose(
         last_issues = output.issues.clone();
         last_point = output.point;
         last_root_delta = output.root_delta;
+        last_contacts = output.contacts;
         // 多个混合器叠加时取最后一个求值者的地速：真正带动位移的总是它
         last_ground_speed = output.ground_speed;
     }
@@ -203,6 +209,7 @@ pub(crate) fn drive_pose(
     *issues = last_issues;
     *point = last_point;
     *ground_speed = if any { last_ground_speed } else { 0.0 };
+    *contacts = if any { last_contacts } else { [0.0; 2] };
     *evaluated = any;
     // 没写骨骼就不能声称自己拥有姿态，否则单条剪辑的根运动补偿会一直让位
     *active = any && !preview;

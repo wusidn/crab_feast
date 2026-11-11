@@ -112,7 +112,7 @@ impl Default for AnimSelection {
 
 /// 当前场景里的角色模型实体（`WorldAssetRoot` 持有者）
 #[derive(Component)]
-struct AnimModelRoot;
+pub(crate) struct AnimModelRoot;
 
 #[derive(Resource, Default)]
 pub struct AnimRuntime {

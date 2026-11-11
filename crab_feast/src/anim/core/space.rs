@@ -245,6 +245,8 @@ pub struct SpaceEvalOutput {
     pub clip_weights: Vec<(String, f32)>,
     /// 混合输出的等效地速（米/秒，只给大小），见 [`blended_ground_speed`]
     pub ground_speed: f32,
+    /// 两只脚的支撑权重 `[左, 右]`（0 = 空中，1 = 踩实），见 [`blended_contacts`]
+    pub contacts: [f32; 2],
     pub issues: Vec<String>,
     pub point: [f32; 2],
 }
@@ -445,6 +447,7 @@ pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceE
             root_delta: Vec3::ZERO,
             clip_weights: Vec::new(),
             ground_speed: 0.0,
+            contacts: [0.0; 2],
             issues,
             point,
         };
@@ -483,6 +486,7 @@ pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceE
         .map(|plan| (plan.weight, plan.events()))
         .collect();
     let reference = average_events(&event_sources);
+    let contacts = blended_contacts(&plans, phase, &reference);
 
     let parts: Vec<(f32, Pose)> = plans
         .iter()
@@ -511,8 +515,72 @@ pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceE
             .map(|plan| (plan.clip.clone(), plan.weight))
             .collect(),
         ground_speed,
+        contacts,
         issues,
         point,
+    }
+}
+
+/// 支撑窗口边缘的柔化宽度（剪辑本地相位）。没有它，锁脚会在「触地」那一帧
+/// 以 0→1 的台阶切入，膝盖会弹一下；有了它，落地与抬脚都是几帧的淡入淡出。
+const CONTACT_FADE: f32 = 0.06;
+
+/// 单只脚在一个剪辑的本地相位上「有多实在地踩在地上」。
+///
+/// 事件表顺序固定为 `[左脚触地, 左脚离地, 右脚触地, 右脚离地]`。
+/// 窗口长度按模 1 计算（支撑期可以跨过剪辑末尾），两端各留 [`CONTACT_FADE`] 的斜面。
+fn support_window(phase: f32, contact: Option<f32>, lift: Option<f32>) -> f32 {
+    let (Some(contact), Some(lift)) = (contact, lift) else {
+        return 0.0;
+    };
+    let length = (lift - contact).rem_euclid(1.0);
+    if length <= 1e-4 {
+        return 0.0;
+    }
+    let into = (phase - contact).rem_euclid(1.0);
+    if into >= length {
+        return 0.0;
+    }
+    let fade = CONTACT_FADE.min(length * 0.5);
+    if fade <= f32::EPSILON {
+        return 1.0;
+    }
+    (into / fade).min((length - into) / fade).clamp(0.0, 1.0)
+}
+
+/// 单个剪辑在本地相位上的两只脚支撑权重 `[左, 右]`
+fn clip_support(events: [Option<f32>; 4], phase: f32) -> [f32; 2] {
+    [
+        support_window(phase, events[0], events[1]),
+        support_window(phase, events[2], events[3]),
+    ]
+}
+
+/// 混合输出的两脚支撑权重：按各剪辑权重加权平均。
+///
+/// 权重全为零（例如纯 Idle 没有任何步态事件）时输出 0：脚部 IK 自然不介入，
+/// 站着不动时不需要锁脚。
+fn blended_contacts(
+    plans: &[SamplePlan],
+    phase: f32,
+    reference: &[Option<f32>; 4],
+) -> [f32; 2] {
+    let mut sum = [0.0f32; 2];
+    let mut total = 0.0;
+    for plan in plans {
+        if !(plan.weight.is_finite() && plan.weight > 0.0) || plan.meta.duration <= f32::EPSILON {
+            continue;
+        }
+        let local = plan.local_phase(phase, reference);
+        let support = clip_support(plan.contact_events(), local);
+        sum[0] += support[0] * plan.weight;
+        sum[1] += support[1] * plan.weight;
+        total += plan.weight;
+    }
+    if total > f32::EPSILON {
+        [sum[0] / total, sum[1] / total]
+    } else {
+        [0.0; 2]
     }
 }
 
@@ -554,6 +622,35 @@ impl SamplePlan {
         let points = gait_segments(&self.events(), reference);
         let local_phase = warp_phase(phase, &points);
         local_phase * duration
+    }
+
+    /// 本帧该剪辑的**本地相位**（0..1），不管正放倒放。
+    fn local_phase(&self, phase: f32, reference: &[Option<f32>; 4]) -> f32 {
+        let duration = self.meta.duration;
+        if duration <= f32::EPSILON {
+            return 0.0;
+        }
+        (self.sample_time(phase, reference) / duration).rem_euclid(1.0)
+    }
+
+    /// 支撑判定用的触地/离地事件。
+    ///
+    /// 倒放不是「把同一组数取反」：时间轴倒过来以后，原来着地的那一帧对应的是离地。
+    /// 所以先对调触/离槽位再镜像相位，得到的窗口才和正放一致（见
+    /// `reverse_clip_gait_event_slot_swap` 那条经验）。
+    fn contact_events(&self) -> [Option<f32>; 4] {
+        let [contact_left, lift_left, contact_right, lift_right] = self.meta.gait_events;
+        if self.reverse {
+            let mirror = |phase: Option<f32>| phase.map(|value| (1.0 - value).rem_euclid(1.0));
+            [
+                mirror(lift_left),
+                mirror(contact_left),
+                mirror(lift_right),
+                mirror(contact_right),
+            ]
+        } else {
+            [contact_left, lift_left, contact_right, lift_right]
+        }
     }
 }
 
@@ -692,6 +789,112 @@ mod tests {
         let empty = average_events(&[]);
         assert!((reverse_only.sample_time(0.0, &empty) - 0.0).abs() < 1e-5);
         assert!((reverse_only.sample_time(0.5, &empty) - 1.033 / 2.0).abs() < 1e-4);
+    }
+
+    /// 支撑窗口必须落在触地 / 离地事件之间，两端有斜坡，跳过周期末尾也能接上
+    #[test]
+    fn support_windows_follow_the_gait_events() {
+        let walk = [Some(0.312), Some(0.781), Some(0.823), Some(0.281)];
+        // 支撑期中段：左脚完全踩实、右脚完全在空中
+        assert!((clip_support(walk, 0.5)[0] - 1.0).abs() < 1e-5);
+        assert_eq!(clip_support(walk, 0.5)[1], 0.0);
+        // 右脚的窗口跨过周期末尾（0.823 → 1.281），相位 0 应当仍在支撑期
+        assert_eq!(clip_support(walk, 0.0)[0], 0.0);
+        assert!((clip_support(walk, 0.0)[1] - 1.0).abs() < 1e-5);
+        // 触地 / 离地那一帧权重从 0 起、到 0 收：锁脚不会一上来就满权重
+        assert!(clip_support(walk, 0.312)[0] < 1e-4);
+        assert!(clip_support(walk, 0.781)[0] < 1e-4);
+        // 没有事件表的剪辑（例如纯 Idle）不产生支撑
+        assert_eq!(clip_support([None; 4], 0.5), [0.0, 0.0]);
+    }
+
+    /// 倒放剪辑的支撑窗口必须是正放窗口的时间镜像 + 触/离槽位对调，
+    /// 否则混合时一半的脚会被判成「在空中」
+    #[test]
+    fn reverse_contacts_mirror_the_forward_window() {
+        let meta = ClipMeta {
+            duration: 1.0,
+            stride: 1.19,
+            gait_events: [Some(0.312), Some(0.781), Some(0.823), Some(0.281)],
+            ..ClipMeta::default()
+        };
+        let forward = SamplePlan {
+            clip: "Walking".to_string(),
+            reverse: false,
+            weight: 1.0,
+            meta: meta.clone(),
+        };
+        let reverse = SamplePlan {
+            clip: "Walking".to_string(),
+            reverse: true,
+            weight: 1.0,
+            meta,
+        };
+        let forward_events = forward.contact_events();
+        let reverse_events = reverse.contact_events();
+        for step in 0..=50 {
+            let phase = step as f32 / 50.0;
+            // 倒放采样时刻是 1-phase，所以这里的镜像要对齐到 (1 - phase)
+            let mirrored = clip_support(forward_events, (1.0 - phase).rem_euclid(1.0));
+            let reversed = clip_support(reverse_events, phase);
+            for foot in 0..2 {
+                assert!(
+                    (reversed[foot] - mirrored[foot]).abs() < 1e-4,
+                    "phase {phase} 脚 {foot}: 倒放 {reversed:?} vs 正放镜像 {mirrored:?}"
+                );
+            }
+        }
+    }
+
+    /// 混合权重按剪辑权重归一到总和：权重怎么缩放都不该改变支撑判定
+    #[test]
+    fn blended_contacts_normalize_weights() {
+        let walk = ClipMeta {
+            duration: 1.0,
+            stride: 1.19,
+            gait_events: [Some(0.312), Some(0.781), Some(0.823), Some(0.281)],
+            ..ClipMeta::default()
+        };
+        let reference = average_events(&[(1.0, walk.gait_events)]);
+        let single = vec![SamplePlan {
+            clip: "Walking".to_string(),
+            reverse: false,
+            weight: 1.0,
+            meta: walk.clone(),
+        }];
+        let scaled = vec![
+            SamplePlan {
+                clip: "Walking".to_string(),
+                reverse: false,
+                weight: 1.7,
+                meta: walk.clone(),
+            },
+            SamplePlan {
+                clip: "Walking".to_string(),
+                reverse: false,
+                weight: 0.3,
+                meta: walk,
+            },
+        ];
+        for phase in [0.0, 0.25, 0.5, 0.75] {
+            let a = blended_contacts(&single, phase, &reference);
+            let b = blended_contacts(&scaled, phase, &reference);
+            assert!((a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5, "{phase}: {a:?} vs {b:?}");
+        }
+        // 触地事件表不完整（例如 Idle 只有触地没有离地）时判定为不踩实
+        let incomplete = vec![SamplePlan {
+            clip: "Idle".to_string(),
+            reverse: false,
+            weight: 1.0,
+            meta: ClipMeta {
+                duration: 1.0,
+                stride: 0.0,
+                gait_events: [Some(0.969), None, Some(0.51), None],
+                ..ClipMeta::default()
+            },
+        }];
+        let empty = average_events(&[]);
+        assert_eq!(blended_contacts(&incomplete, 0.5, &empty), [0.0, 0.0]);
     }
 
     /// 诊断用：直接按文档权重沿整圈扫 yaw，看采样时刻有没有跳变 / 倒退。

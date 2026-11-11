@@ -20,12 +20,17 @@ pub mod locomotion;
 pub mod mixers;
 
 mod driver;
+mod foot_ik;
 mod spaces;
 
 use bevy::prelude::*;
 
 pub use character::{AnimCatalog, AnimSelection, SPEED_RANGE};
 pub use driver::{AnimFocus, PoseDriver};
+// `FootIk` 是联机角色管理 / 调试面板要读的公共句柄，当前单人流程还没用到
+#[allow(unused_imports)]
+pub use foot_ik::FootIk;
+pub use foot_ik::FootIkSettings;
 pub use mixers::{MixerCache, MixerEdit, load_space_doc, save_space_doc};
 
 use self::core::ClipSet;
@@ -52,6 +57,7 @@ impl Plugin for AnimPlugin {
             character::CharacterPlugin,
             mixers::MixerPlugin,
             locomotion::LocomotionPlugin,
+            foot_ik::FootIkPlugin,
         ))
         .init_resource::<PoseDriver>()
         // 剪辑集合与步态元数据由动画系统持有，编辑器只负责往里改文档
