@@ -43,6 +43,8 @@ assets/scenes/load_scene_example-new.scn.ron
 
 # assets
 /assets/characters
+# 生成出来的玩家设置（移动设置等）
+/assets/settings
 
 # 源模型 FBX（单文件几十~上百 MB，本地保留，不入库）
 /assets/source/character/rigs/

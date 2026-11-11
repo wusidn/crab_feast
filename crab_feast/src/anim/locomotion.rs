@@ -15,11 +15,6 @@ use super::core::{BlendMixer, MixerCore};
 use super::driver::{AnimFocus, PoseDriver, drive_pose};
 use super::mixers::{LocomotionMixer, LookMixer, RegisteredMixer};
 
-/// 原地转向的姿态权重映射：误差小于 `TURN_MIN_DEG` 不碰转向剪辑，
-/// 大于 `TURN_FULL_DEG` 就完全交给 LeftTurn / RightTurn。
-const TURN_MIN_DEG: f32 = 8.0;
-const TURN_FULL_DEG: f32 = 70.0;
-
 pub struct LocomotionPlugin;
 
 impl Plugin for LocomotionPlugin {
@@ -61,13 +56,20 @@ fn sync_move_speed(driver: Res<PoseDriver>, mut controllers: Query<&mut Movement
 
 /// 移动意图 + 朝向误差 → `yaw` / `speed`。
 ///
-/// 两个分支都读 [`FacingState::error_deg`]，因为混合空间的 yaw 轴本来就是
-/// 「相对角色正前方的偏角」：
-/// - 在走：这个角就是走位方向与脸向的夹角，侧向 / 倒退剪辑负责把脚带对方向；
-/// - 站着但在追相机：同一个位置放的是 LeftTurn / RightTurn（见 spaces.rs），
-///   误差越大权重越高，于是转相机时角色用转向动画跟过来。
+/// 走起来时 `yaw` 就是走位方向与脸向的夹角（混合空间的 yaw 轴本来就是
+/// 「相对角色正前方的偏角」，现在覆盖整圈 ±180°），侧向 / 反放的走跑剪辑
+/// 负责把脚带对方向。
+///
+/// 站着的时候一律回 `(0, 0)` 也就是 Idle：原地转身靠 [`FacingState`] 驱动的
+/// 身体旋转本身，不再往混合空间里送偏角。采样点布局里没有「原地转向」这一档
+/// （见 spaces.rs 的默认定义），硬送偏角只会混出侧移走的姿态——脚在原地踏步，
+/// 人却在转，看着更假。
+///
+/// 不额外降速：之前试过按误差收速度，结果是「转身期间被拽慢」，观感更像拖沓
+/// 而不是转身。
 fn drive_locomotion(
     focus: Res<AnimFocus>,
+    time: Res<Time>,
     avatars: Query<(&FacingState, &LocomotionIntent)>,
     mut mixer: ResMut<LocomotionMixer>,
 ) {
@@ -75,30 +77,78 @@ fn drive_locomotion(
         return;
     }
 
-    let (mut yaw, mut speed) = match avatars.iter().next() {
-        Some((state, intent)) => {
-            // 混合空间的偏角右正左负，error_deg 是「需要绕 +Y 转」即左转为正，符号相反
-            let right_deg = -state.error_deg;
-            if intent.magnitude > 1e-3 {
-                (right_deg, intent.magnitude)
-            } else {
-                // 原地转向：把误差映射到 0..±90，端点正好落在纯转向剪辑上
-                let amount = ((right_deg.abs() - TURN_MIN_DEG) / (TURN_FULL_DEG - TURN_MIN_DEG))
-                    .clamp(0.0, 1.0);
-                (right_deg.signum() * amount * 90.0, 0.0)
-            }
-        }
-        None => (0.0, 0.0),
-    };
+    let [yaw, speed] = params_for(
+        avatars.iter().next().map(|(state, intent)| {
+            (
+                state.error_deg,
+                if intent.magnitude > 1e-3 {
+                    intent.magnitude
+                } else {
+                    0.0
+                },
+            )
+        }),
+    );
 
-    // 空间只覆盖 ±90°：更大的偏角折回半球，倒退由速度符号承担（见空间定义）
-    if yaw.abs() > 90.0 {
-        yaw = yaw.signum() * (180.0 - yaw.abs());
-        speed = -speed;
+    // 参数轴限速：参数一跳，权重就跟着跳，姿态就是一帧台阶。yaw 现在覆盖整圈，
+    // 所以限速要按**最短弧**走，否则 180° 附近抖一下会让参数绕一整圈。
+    let dt = time.delta_secs();
+    let axes = mixer.core().space.params.clone();
+    let core = mixer.core_mut();
+    let mut values = [yaw, speed];
+    for (index, axis) in axes.iter().enumerate() {
+        let Some(current) = core.params.get(axis).copied() else {
+            continue;
+        };
+        // 轴名对不上（编辑器里改过轴序）就不限速，宁可跳也别限错轴
+        values[index] = match axis.as_str() {
+            "yaw" => slew_deg(current, values[index], PARAM_SLEW[0] * dt),
+            "speed" => slew(current, values[index], PARAM_SLEW[1] * dt),
+            _ => values[index],
+        };
     }
-
-    write_params(mixer.core_mut(), [yaw, speed]);
+    write_params(core, values);
 }
+
+/// 角度归一到 (-180, 180]
+fn wrap_deg(deg: f32) -> f32 {
+    (deg + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// 按最短弧限速：跨 ±180 时不绕远路
+fn slew_deg(current: f32, target: f32, max_step: f32) -> f32 {
+    let delta = wrap_deg(target - current);
+    wrap_deg(current + delta.clamp(-max_step, max_step))
+}
+
+fn slew(current: f32, target: f32, max_step: f32) -> f32 {
+    let delta = target - current;
+    if delta.abs() > max_step {
+        current + delta.signum() * max_step
+    } else {
+        target
+    }
+}
+
+/// 朝向误差 + 移动幅度 → `yaw` / `speed`（未经限速的原始目标）。
+///
+/// `error_deg` 是「还需绕 +Y 转多少」，左转为正；混合空间的 yaw 右正左负，所以取反。
+/// 就这么直给：yaw 覆盖整圈 ±180°，速度恒为正，转身时参数沿圆周连续滑动，
+/// 不需要折回、不需要给速度翻符号。
+fn params_for(avatar: Option<(f32, f32)>) -> [f32; 2] {
+    let Some((error_deg, magnitude)) = avatar else {
+        return [0.0, 0.0];
+    };
+    if magnitude <= 1e-3 {
+        // 站住不动：没有移动方向可言，偏角也别送，直接站姿
+        return [0.0, 0.0];
+    }
+    [-error_deg, magnitude]
+}
+
+/// 参数轴每帧最大变化量（`yaw` 度/秒，`speed` 单位/秒），顺序同空间定义的轴。
+/// 只用来消台阶，别当成滤波：正常操作下这一项几乎不生效。
+const PARAM_SLEW: [f32; 2] = [700.0, 20.0];
 
 /// 相机与角色的朝向差 → `yaw` / `pitch`。
 ///
@@ -133,5 +183,65 @@ fn write_params(core: &mut MixerCore, values: [f32; 2]) {
     let axes = core.space.params.clone();
     for (axis, value) in axes.iter().zip(values) {
         core.params.insert(axis.clone(), value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_sends_no_direction() {
+        assert_eq!(params_for(None), [0.0, 0.0]);
+        assert_eq!(params_for(Some((120.0, 0.0))), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn forward_keeps_full_speed() {
+        let [yaw, speed] = params_for(Some((0.0, 1.0)));
+        assert_eq!(yaw, 0.0);
+        assert!((speed - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sideways_keeps_full_speed() {
+        // 侧向走和正走同速：转身是身体的事，不该把地速一起拽下来
+        let [yaw, speed] = params_for(Some((-90.0, 0.5)));
+        assert!((yaw - 90.0).abs() < 1e-6);
+        assert!((speed - 0.5).abs() < 1e-6, "{speed}");
+    }
+
+    #[test]
+    fn any_direction_keeps_speed_positive() {
+        // 整圈都不给速度翻符号：翻符号必然经过 speed=0，而那里只有 Idle，
+        // 转身时腿就会闪一下。这是 A 方案要守住的不变量。
+        for error in [0.0, 45.0, 90.0, 91.0, 120.0, 150.0, 179.0, 180.0,
+                      -45.0, -91.0, -150.0, -180.0] {
+            let [yaw, speed] = params_for(Some((error, 0.8)));
+            assert!((speed - 0.8).abs() < 1e-6, "error {error} speed {speed}");
+            assert!((yaw + error).abs() < 1e-6, "error {error} yaw {yaw}");
+        }
+    }
+
+    #[test]
+    fn yaw_sweeps_the_whole_circle_monotonically() {
+        // 身体从正后方转到正前方：yaw 一路 -180 → 0，中途没有回折、没有翻符号
+        let mut last = params_for(Some((180.0, 1.0)))[0];
+        assert!((last + 180.0).abs() < 1e-6, "{last}");
+        for deg in (0..=179).rev() {
+            let yaw = params_for(Some((deg as f32, 1.0)))[0];
+            assert!(yaw >= last - 1e-6, "deg {deg}: {yaw} < {last}");
+            last = yaw;
+        }
+        assert!(last.abs() < 1e-6, "{last}");
+    }
+
+    #[test]
+    fn yaw_slew_takes_the_short_way_round() {
+        // 179 → -179 是同一处，最短弧只差 2°，不该绕 358°
+        let step = slew_deg(179.0, -181.0, 700.0 * 0.016);
+        assert!((step.abs() - 180.0).abs() < 1e-3 || step > 175.0, "{step}");
+        let near = slew_deg(170.0, 180.0, 5.0);
+        assert!((near - 175.0).abs() < 1e-6, "{near}");
     }
 }

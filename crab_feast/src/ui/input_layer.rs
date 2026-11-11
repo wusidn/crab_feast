@@ -2,7 +2,6 @@ use std::any::TypeId;
 
 use bevy::{
     animation::{AnimatedBy, AnimationEntityMut, AnimationEvaluationError, AnimationTargetId},
-    input::keyboard::Key,
     picking::pointer::PointerId,
     platform::collections::HashSet,
     prelude::*,
@@ -15,7 +14,7 @@ use crab_feast_ui_joysticks::{
 use crab_feast_library::platform::PlatformInfo;
 use crab_feast_ui_joysticks::JoystickMarionettePlugin;
 
-use crate::input::{LookInput, MovementInput};
+use crate::input::{LookInput, MoveGait, MovementInput};
 
 pub struct InputPlugin;
 
@@ -39,6 +38,7 @@ impl Plugin for InputPlugin {
         app.add_plugins(JoystickPlugin)
             .init_resource::<LookInputIgnorePointers>()
             .init_resource::<MovementInput>()
+            .init_resource::<MoveGait>()
             .add_systems(OnEnter(crate::GameState::Game), Self::setup)
             .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
 
@@ -311,16 +311,21 @@ fn on_rotate_plane_drag(
 fn on_keyboard_event(
     mut commands: Commands,
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    key_input: Res<ButtonInput<Key>>,
+    mut gait: ResMut<MoveGait>,
     move_input_joystick_query: Query<Entity, With<MoveInputJoystick>>,
     mut joystick_marionette_query: Query<(Entity, &mut JoystickMarionette)>,
 ) {
-    // 档位量级，不是米/秒：混合空间里 ±0.5 是走档、±1 是跑档
-    let walk_speed = 0.75;
-    let run_speed = 1.0;
+    // Shift 是切档键：按一下在走 / 跑之间切换，不用按住。
+    // 只有「这一帧刚按下」才切，按住不放不会反复翻转。
+    if keyboard_input.just_pressed(KeyCode::ShiftLeft)
+        || keyboard_input.just_pressed(KeyCode::ShiftRight)
+    {
+        gait.toggle();
+    }
+    // 档位量级，不是米/秒：混合空间里 0.5 是走档、1.0 是跑档
+    let speed = gait.speed();
 
     let mut direction = Vec2::ZERO;
-    let mut speed = walk_speed;
 
     let is_pressed = [
         KeyCode::KeyW,
@@ -353,10 +358,6 @@ fn on_keyboard_event(
             direction += offset;
         }
     });
-
-    if key_input.pressed(Key::Shift) {
-        speed = run_speed;
-    }
 
     direction = direction.normalize_or_zero();
 

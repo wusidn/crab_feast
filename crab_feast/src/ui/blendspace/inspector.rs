@@ -1,4 +1,8 @@
 //! 检查器：参数滑杆、采样点列表、剪辑选择、存取。
+//!
+//! 两段内容各自是一棵 `bsn!` 子树：
+//! - [`params_scene`]：混合系统的说明、启用开关、参数滑杆、播放速度，跟着整页一起生成；
+//! - [`inspector_scene`]：采样点列表与选中项详情，文档或选择变化时整段重建。
 
 use bevy::{
     ecs::system::SystemParam,
@@ -13,149 +17,113 @@ use crate::{
 };
 
 use super::{
-    EnabledLabel, HINT_COLOR, InspectorBody, MUTED_TEXT, ParamValue, SpaceEditor, TEXT_COLOR,
-    WARN_COLOR, WeightText, label,
+    CLIP_DROPDOWN, EnabledLabel, HINT_COLOR, InspectorBody, MUTED_TEXT, ParamSlider, ParamValue,
+    SpaceEditor, TEXT_COLOR, WARN_COLOR, WeightText,
 };
 
-pub(super) fn build_params(
-    commands: &mut Commands,
-    root: Entity,
-    font: &Handle<Font>,
-    editor: &SpaceEditor,
-    cache: &MixerCache,
-) {
-    if let Some(mixer) = cache.mixers.get(editor.mixer) {
-        label(
-            commands,
-            root,
-            font,
-            mixer.description.clone(),
-            9.0,
-            MUTED_TEXT,
-        );
+/// 参数区：说明 + 启用开关 + 两个轴的滑杆 + 播放速度滑杆
+pub(super) fn params_scene(editor: &SpaceEditor, cache: &MixerCache) -> impl Scene + use<> {
+    let mut parts: Vec<Box<dyn Scene>> = Vec::new();
 
-        let toggle_row = commands
-            .spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    ..default()
-                },
-                ChildOf(root),
-            ))
-            .id();
-        label(commands, toggle_row, font, "游戏中启用", 10.0, MUTED_TEXT);
-        let caption = if editor.enabled {
-            "开".to_string()
-        } else {
-            "关".to_string()
-        };
+    if let Some(mixer) = cache.mixers.get(editor.mixer) {
+        let description = mixer.description.clone();
+        parts.push(Box::new(bsn! {
+            @{widgets::text(description, 9.0, MUTED_TEXT)}
+        }));
+
+        let caption = if editor.enabled { "开" } else { "关" }.to_string();
         let title = mixer.title.clone();
-        let button = widgets::button(commands, toggle_row, Some(font), caption);
-        commands.entity(button).insert(EnabledLabel);
-        commands.entity(button).observe(
-            move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
-                if click.button != PointerButton::Primary {
-                    return;
-                }
-                click.propagate(false);
-                editor.enabled = !editor.enabled;
-                editor.status = format!(
-                    "混合系统「{}」已{}",
-                    title,
-                    if editor.enabled { "启用" } else { "停用" }
-                );
-                editor.revision = editor.revision.wrapping_add(1);
-            },
-        );
+        parts.push(Box::new(bsn! {
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(6.0),
+            }
+            Children [
+                @{widgets::text("游戏中启用", 10.0, MUTED_TEXT)}
+                --
+                @{widgets::button(caption)}
+                EnabledLabel
+                on(move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+                    if click.button != PointerButton::Primary {
+                        return;
+                    }
+                    click.propagate(false);
+                    editor.enabled = !editor.enabled;
+                    editor.status = format!(
+                        "混合系统「{}」已{}",
+                        title,
+                        if editor.enabled { "启用" } else { "停用" }
+                    );
+                    editor.revision = editor.revision.wrapping_add(1);
+                })
+            ]
+        }));
     }
 
     for axis in 0..2 {
         let name = editor.doc.axis(axis).to_string();
-        let row = commands
-            .spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(2.0),
-                    ..default()
-                },
-                ChildOf(root),
-            ))
-            .id();
-
-        let caption = commands
-            .spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    ..default()
-                },
-                ChildOf(row),
-            ))
-            .id();
         let value = editor.params.get(&name).copied().unwrap_or(0.0);
-        let text_entity = label(
-            commands,
-            caption,
-            font,
-            format!("{name} = {value:.2}"),
-            11.0,
-            MUTED_TEXT,
-        );
-        commands
-            .entity(text_entity)
-            .insert(ParamValue { slot: axis });
-
         // 滑杆范围跟文档自身对齐：yaw 是角度、speed 是归一化速度，量纲不同
         let range = editor.doc.range(axis);
         let step = ((range[1] - range[0]) / 200.0).max(0.001);
-        let parts = widgets::slider(commands, row, value, range[0], range[1], step);
         let key = name.clone();
-        commands
-            .entity(parts.root)
-            .insert(super::ParamSlider { slot: axis })
-            .observe(
-                move |change: On<ValueChange<f32>>, mut editor: ResMut<SpaceEditor>| {
-                    editor.params.insert(key.clone(), change.value);
-                },
-            )
-            .observe(slider_self_update);
-    }
-
-    let row = commands
-        .spawn((
+        parts.push(Box::new(bsn! {
             Node {
                 width: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(2.0),
-                margin: UiRect::top(Val::Px(6.0)),
-                ..default()
-            },
-            ChildOf(root),
-        ))
-        .id();
-    let speed_text = label(
-        commands,
-        row,
-        font,
-        format!("播放速度 {:.2}x", editor.doc.speed),
-        11.0,
-        MUTED_TEXT,
-    );
-    commands.entity(speed_text).insert(ParamValue { slot: 2 });
-    let parts = widgets::slider(commands, row, editor.doc.speed, 0.1, 3.0, 0.05);
-    commands
-        .entity(parts.root)
-        .insert(super::ParamSlider { slot: 2 })
-        .observe(
-            move |change: On<ValueChange<f32>>, mut editor: ResMut<SpaceEditor>| {
+            }
+            Children [
+                Text::new(format!("{name} = {value:.2}"))
+                TextFont { font_size: FontSize::Px(11.0) }
+                TextColor(MUTED_TEXT)
+                ParamValue { slot: axis }
+                --
+                @{widgets::slider(value, range[0], range[1], step)}
+                ParamSlider { slot: axis }
+                on(slider_self_update)
+                on(move |change: On<ValueChange<f32>>, mut editor: ResMut<SpaceEditor>| {
+                    editor.params.insert(key.clone(), change.value);
+                })
+            ]
+        }));
+    }
+
+    let speed = editor.doc.speed;
+    parts.push(Box::new(bsn! {
+        Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(2.0),
+            margin: UiRect::top(Val::Px(6.0)),
+        }
+        Children [
+            Text::new(format!("播放速度 {:.2}x", speed))
+            TextFont { font_size: FontSize::Px(11.0) }
+            TextColor(MUTED_TEXT)
+            ParamValue { slot: 2 }
+            --
+            @{widgets::slider(speed, 0.1, 3.0, 0.05)}
+            ParamSlider { slot: 2 }
+            on(slider_self_update)
+            on(|change: On<ValueChange<f32>>, mut editor: ResMut<SpaceEditor>| {
                 editor.doc.speed = change.value;
-            },
-        )
-        .observe(slider_self_update);
+            })
+        ]
+    }));
+
+    bsn! {
+        Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(4.0),
+        }
+        Children [
+            {parts}
+        ]
+    }
 }
 
 /// 重建检查器要读的只读输入：角色清单 + 当前选中的角色。
@@ -167,7 +135,6 @@ pub(super) struct InspectorRead<'w> {
 
 pub(super) fn rebuild_inspector(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
     editor: ResMut<SpaceEditor>,
     read: InspectorRead,
     bodies: Query<(Entity, Option<&Children>), With<InspectorBody>>,
@@ -188,35 +155,30 @@ pub(super) fn rebuild_inspector(
         commands.entity(child).despawn();
     }
 
-    let font: Handle<Font> = asset_server.load("fonts/PingFang-SC-Regular.ttf");
-    let clips = read
-        .catalog
-        .character(read.selection.character)
+    commands.spawn_scene(inspector_scene(
+        body,
+        &editor,
+        &read.catalog,
+        &read.selection,
+    ));
+}
+
+/// 采样点区：列表 + 当前位置添加 + 选中项详情 + 当前权重
+fn inspector_scene(
+    body: Entity,
+    editor: &SpaceEditor,
+    catalog: &AnimCatalog,
+    selection: &AnimSelection,
+) -> impl Scene + use<> {
+    let clips = catalog
+        .character(selection.character)
         .map(|def| def.clips.clone())
         .unwrap_or_default();
+    let mut parts: Vec<Box<dyn Scene>> = Vec::new();
 
     // 采样点列表
     for (index, sample) in editor.doc.samples.iter().enumerate() {
         let selected = editor.selected == Some(index);
-        let row = commands
-            .spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(if selected {
-                    Color::srgba(0.28, 0.42, 0.72, 0.55)
-                } else {
-                    Color::srgba(0.0, 0.0, 0.0, 0.0)
-                }),
-                ChildOf(body),
-            ))
-            .id();
         let text = format!(
             "#{index}  {}{}  ({:.2}, {:.2})",
             sample.clip,
@@ -224,28 +186,37 @@ pub(super) fn rebuild_inspector(
             sample.at[0],
             sample.at[1]
         );
-        let text_entity = label(&mut commands, row, &font, text, 11.0, TEXT_COLOR);
-        let _ = text_entity;
-
-        commands.entity(row).observe(
-            move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+        let background = if selected {
+            Color::srgba(0.28, 0.42, 0.72, 0.55)
+        } else {
+            Color::NONE
+        };
+        parts.push(Box::new(bsn! {
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(6.0),
+                padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+            }
+            BackgroundColor(background)
+            on(move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
                 if click.button != PointerButton::Primary {
                     return;
                 }
                 click.propagate(false);
                 editor.selected = Some(index);
-            },
-        );
+            })
+            Children [
+                @{widgets::text(text, 11.0, TEXT_COLOR)}
+            ]
+        }));
     }
 
-    let add = widgets::button(
-        &mut commands,
-        body,
-        Some(&font),
-        "在当前位置添加采样点".to_string(),
-    );
-    commands.entity(add).observe(
-        move |mut click: On<PointerClick>,
+    parts.push(Box::new(bsn! {
+        @{widgets::button("在当前位置添加采样点")}
+        on(move |mut click: On<PointerClick>,
               mut editor: ResMut<SpaceEditor>,
               catalog: Res<AnimCatalog>,
               selection: Res<AnimSelection>| {
@@ -290,79 +261,43 @@ pub(super) fn rebuild_inspector(
             editor.selected = Some(index);
             editor.status = format!("在 ({:.2}, {:.2}) 添加了 {}", point[0], point[1], clip);
             editor.revision = editor.revision.wrapping_add(1);
-        },
-    );
+        })
+    }));
 
     // 选中采样点详情
     if let Some(index) = editor.selected
         && let Some(sample) = editor.doc.samples.get(index).cloned()
     {
-        label(
-            &mut commands,
-            body,
-            &font,
-            format!("采样点 #{index} 的剪辑"),
-            11.0,
-            MUTED_TEXT,
-        );
+        parts.push(Box::new(bsn! {
+            @{widgets::text(
+                format!("采样点 #{index} 的剪辑"),
+                11.0,
+                MUTED_TEXT,
+            )}
+        }));
 
         // 反转播放：勾选框（用于做后退）
-        let check_row = commands
-            .spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(8.0),
-                    padding: UiRect::axes(Val::Px(4.0), Val::Px(3.0)),
-                    ..default()
-                },
-                ChildOf(body),
-            ))
-            .id();
-        let box_entity = commands
-            .spawn((
-                Node {
-                    width: Val::Px(15.0),
-                    height: Val::Px(15.0),
-                    flex_shrink: 0.0,
-                    border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(3.0)),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                BackgroundColor(if sample.reverse {
-                    widgets::BUTTON_SELECTED
-                } else {
-                    widgets::BUTTON_IDLE
-                }),
-                BorderColor::all(widgets::BORDER_SOFT),
-                ChildOf(check_row),
-            ))
-            .id();
-        if sample.reverse {
-            commands.spawn((
+        let mark: Vec<_> = if sample.reverse {
+            vec![bsn! {
                 Node {
                     width: Val::Px(7.0),
                     height: Val::Px(7.0),
                     border_radius: BorderRadius::all(Val::Px(1.5)),
-                    ..default()
-                },
-                BackgroundColor(super::TEXT_COLOR),
-                ChildOf(box_entity),
-            ));
-        }
-        label(
-            &mut commands,
-            check_row,
-            &font,
-            "反转播放（后退）".to_string(),
-            11.0,
-            TEXT_COLOR,
-        );
-        commands.entity(check_row).observe(
-            move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+                }
+                BackgroundColor(TEXT_COLOR)
+            }]
+        } else {
+            Vec::new()
+        };
+        parts.push(Box::new(bsn! {
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                padding: UiRect::axes(Val::Px(4.0), Val::Px(3.0)),
+            }
+            on(move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
                 if click.button != PointerButton::Primary {
                     return;
                 }
@@ -377,43 +312,43 @@ pub(super) fn rebuild_inspector(
                     editor.status = format!("采样点 #{index} 播放方向 → {state}");
                 }
                 editor.revision = editor.revision.wrapping_add(1);
-            },
-        );
+            })
+            Children [
+                Node {
+                    width: Val::Px(15.0),
+                    height: Val::Px(15.0),
+                    flex_shrink: 0.0,
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(3.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                }
+                BackgroundColor({if sample.reverse {
+                    widgets::BUTTON_SELECTED
+                } else {
+                    widgets::BUTTON_IDLE
+                }})
+                BorderColor::all(widgets::BORDER_SOFT)
+                Children [
+                    {mark}
+                ]
+                --
+                @{widgets::text("反转播放（后退）", 11.0, TEXT_COLOR)}
+            ]
+        }));
 
-        // 剪辑选择（下拉框）
+        // 剪辑选择（下拉框）：选中结果由 `mod::apply_dropdown_pick` 写回
         let selected_clip = clips
             .iter()
             .position(|clip| clip == &sample.clip)
             .unwrap_or(0);
-        let parts = super::spawn_dropdown(
-            &mut commands,
-            body,
-            &font,
-            super::BlendDropdown::Clip,
-            &clips,
-            selected_clip,
-        );
-        for (clip_index, item) in parts.items.into_iter().enumerate() {
-            let clip = clips.get(clip_index).cloned().unwrap_or_default();
-            commands.entity(item).observe(
-                move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
-                    if click.button != PointerButton::Primary {
-                        return;
-                    }
-                    click.propagate(false);
-                    editor.open_dropdown = None;
-                    if let Some(sample) = editor.doc.samples.get_mut(index) {
-                        sample.clip = clip.clone();
-                    }
-                    editor.revision = editor.revision.wrapping_add(1);
-                    editor.status = format!("采样点 #{index} → {clip}");
-                },
-            );
-        }
+        parts.push(Box::new(bsn! {
+            @{widgets::dropdown(CLIP_DROPDOWN, &clips, selected_clip)}
+        }));
 
-        let remove = widgets::button(&mut commands, body, Some(&font), "删除该采样点".to_string());
-        commands.entity(remove).observe(
-            move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+        parts.push(Box::new(bsn! {
+            @{widgets::button("删除该采样点")}
+            on(move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
                 if click.button != PointerButton::Primary {
                     return;
                 }
@@ -423,8 +358,8 @@ pub(super) fn rebuild_inspector(
                     editor.status = format!("已删除采样点 #{index}");
                     editor.revision = editor.revision.wrapping_add(1);
                 }
-            },
-        );
+            })
+        }));
     }
 
     // 当前权重
@@ -457,25 +392,29 @@ pub(super) fn rebuild_inspector(
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    let weight_text = label(
-        &mut commands,
-        body,
-        &font,
-        format!("当前权重：{hint}"),
-        11.0,
-        HINT_COLOR,
-    );
-    commands.entity(weight_text).insert(WeightText);
+    parts.push(Box::new(bsn! {
+        Text::new(format!("当前权重：{hint}"))
+        TextFont { font_size: FontSize::Px(11.0) }
+        TextColor(HINT_COLOR)
+        WeightText
+    }));
 
     for issue in editor.doc.validate() {
-        label(
-            &mut commands,
-            body,
-            &font,
-            format!("! {issue}"),
-            11.0,
-            WARN_COLOR,
-        );
+        parts.push(Box::new(bsn! {
+            @{widgets::text(format!("! {issue}"), 11.0, WARN_COLOR)}
+        }));
+    }
+
+    bsn! {
+        Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(4.0),
+        }
+        ChildOf(body)
+        Children [
+            {parts}
+        ]
     }
 }
 

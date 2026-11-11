@@ -59,145 +59,90 @@ fn merge(weights: Vec<(String, f32)>) -> Vec<(String, f32)> {
     out
 }
 
-fn barycentric(a: [f32; 2], b: [f32; 2], c: [f32; 2], p: [f32; 2]) -> Option<[f32; 3]> {
-    let denominator = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
-    if denominator.abs() <= f32::EPSILON {
-        return None;
-    }
-    let w0 = ((b[1] - c[1]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[1])) / denominator;
-    let w1 = ((c[1] - a[1]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[1])) / denominator;
-    let w2 = 1.0 - w0 - w1;
-    Some([w0, w1, w2])
-}
-
-fn clamped(weights: [f32; 3]) -> [f32; 3] {
-    let w = [
-        weights[0].max(0.0),
-        weights[1].max(0.0),
-        weights[2].max(0.0),
-    ];
-    let total = w[0] + w[1] + w[2];
-    if total <= f32::EPSILON {
-        [1.0, 0.0, 0.0]
-    } else {
-        [w[0] / total, w[1] / total, w[2] / total]
-    }
-}
-
-/// 2D 采样：三角剖分 + 重心坐标；采样点不足或退化时退回最近邻反距离权重
+/// 2D 采样：布局与算法解耦——怎么摆点都可以。
+///
+/// - **（可能缺格的）规则网格** → 双线性插值，单元格缺角就跳过再归一化；
+/// - **任意其它布局** → 反距离权重（见 [`local_distance_weights`](#fn-local_distance_weights)）。
+///
+/// 这里不做三角剖分。以前用「以离质心最近的采样点为扇心的扇形剖分」，它隐含假设
+/// 采样点绕中心呈星形分布：网格缺角、或有点与扇心共线时，三角形会退化被跳过，
+/// 于是同一份数据在 yaw 为正的一侧走一条路径、为负的一侧走另一条，速度和档位
+/// 都静默跑偏。反距离权重对采样点的位置和数量没有任何要求——共线、重叠、
+/// 缺角、单点都能算，镜像坐标得到镜像权重。
 pub fn weights_2d(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)> {
     if samples.is_empty() {
         return Vec::new();
     }
-    if samples.len() < 3 {
-        return inverse_distance(samples, point);
-    }
 
-    // 采样点排成规则网格时（典型如「yaw × speed」），按格子做双线性插值。
-    // 扇形三角剖分假设点围绕中心分布，对矩形网格会把相邻列错连成斜三角，
-    // 使侧向采样点被投影到别的行上。
+    // 规则网格（典型如「yaw × speed」）按格子做双线性插值：局部、精确、可预测，
+    // 也是「四个角各占多少」这种直觉唯一成立的情形
     if let Some((xs, ys)) = grid_axes(samples) {
-        return weights_grid(samples, &xs, &ys, point);
-    }
-
-    // 以离中心最近的采样点为扇心，按角度排序后扇形三角剖分。
-    // 位移混合空间的采样点通常是「一圈方向 + 可选中心」，这一步等价于三角剖分。
-    let centroid = {
-        let (mut x, mut y) = (0.0f32, 0.0f32);
-        for sample in samples {
-            x += sample.at[0];
-            y += sample.at[1];
-        }
-        [x / samples.len() as f32, y / samples.len() as f32]
-    };
-    let hub = samples
-        .iter()
-        .enumerate()
-        .min_by(|a, b| {
-            let da = (a.1.at[0] - centroid[0]).powi(2) + (a.1.at[1] - centroid[1]).powi(2);
-            let db = (b.1.at[0] - centroid[0]).powi(2) + (b.1.at[1] - centroid[1]).powi(2);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-
-    let origin = samples[hub].at;
-    let mut ring: Vec<usize> = (0..samples.len()).filter(|index| *index != hub).collect();
-    ring.sort_by(|a, b| {
-        let angle_a = (samples[*a].at[1] - origin[1]).atan2(samples[*a].at[0] - origin[0]);
-        let angle_b = (samples[*b].at[1] - origin[1]).atan2(samples[*b].at[0] - origin[0]);
-        angle_a
-            .partial_cmp(&angle_b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut triangles: Vec<(usize, usize, usize)> = Vec::new();
-    for index in 0..ring.len() {
-        let a = ring[index];
-        let b = ring[(index + 1) % ring.len()];
-        triangles.push((hub, a, b));
-    }
-
-    let mut best: Option<(f32, [f32; 3], usize, usize, usize)> = None;
-    for (i0, i1, i2) in triangles {
-        let (a, b, c) = (samples[i0].at, samples[i1].at, samples[i2].at);
-        let Some(raw) = barycentric(a, b, c, point) else {
-            continue;
-        };
-        if raw[0] >= -1e-5 && raw[1] >= -1e-5 && raw[2] >= -1e-5 {
-            let weights = clamped(raw);
-            return merge(vec![
-                (
-                    playback_key(&samples[i0].clip, samples[i0].reverse),
-                    weights[0],
-                ),
-                (
-                    playback_key(&samples[i1].clip, samples[i1].reverse),
-                    weights[1],
-                ),
-                (
-                    playback_key(&samples[i2].clip, samples[i2].reverse),
-                    weights[2],
-                ),
-            ]);
-        }
-
-        let weights = clamped(raw);
-        let projected = [
-            a[0] * weights[0] + b[0] * weights[1] + c[0] * weights[2],
-            a[1] * weights[0] + b[1] * weights[1] + c[1] * weights[2],
-        ];
-        let distance = (projected[0] - point[0]).powi(2) + (projected[1] - point[1]).powi(2);
-        if best
-            .as_ref()
-            .map(|entry| distance < entry.0)
-            .unwrap_or(true)
-        {
-            best = Some((distance, weights, i0, i1, i2));
+        let weights = weights_grid(samples, &xs, &ys, point);
+        // 整个单元格四角全缺（编辑器把一行/一列整排删了）时双线性给不出任何权重，
+        // 再退回距离权重——否则这一片参数区域会「没有可用的采样点」，姿态直接空掉
+        if !weights.is_empty() {
+            return weights;
         }
     }
 
-    if let Some((_, weights, i0, i1, i2)) = best {
-        return merge(vec![
-            (
-                playback_key(&samples[i0].clip, samples[i0].reverse),
-                weights[0],
-            ),
-            (
-                playback_key(&samples[i1].clip, samples[i1].reverse),
-                weights[1],
-            ),
-            (
-                playback_key(&samples[i2].clip, samples[i2].reverse),
-                weights[2],
-            ),
-        ]);
-    }
-
-    inverse_distance(samples, point)
+    local_distance_weights(samples, point)
 }
 
-/// 采样点是否排成规则网格：两轴各自去重后，组合数正好等于采样数
+/// 不规则布局：按 `1/距离²` 加权，只纳入**两倍最近距离**以内的采样点。
+///
+/// 半径只取最近点的两倍，是为了让权重保持局部：一圈方向点 + 中心点时，
+/// 22.5° 那种落在两个方向中间的位置只会吃到相邻两个方向的权重（邻居到它的
+/// 距离是 0.39、中心的 1.0 已经出了半径），和三角剖分的直觉一致；
+/// 而真正相隔很远的采样点不会隔着大半个参数空间来掺一脚。
+///
+/// 恰好落在某个采样点上时该点独占（距离为 0，权重发散），否则按距离衰减。
+fn local_distance_weights(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)> {
+    let distance_sq = |sample: &Sample2D| {
+        (sample.at[0] - point[0]).powi(2) + (sample.at[1] - point[1]).powi(2)
+    };
+    let nearest = samples
+        .iter()
+        .map(distance_sq)
+        .fold(f32::INFINITY, f32::min);
+
+    // 正好压在采样点上：独占，避免 1/0
+    if nearest <= 1e-12 {
+        return merge(
+            samples
+                .iter()
+                .filter(|sample| distance_sq(sample) <= 1e-12)
+                .map(|sample| (playback_key(&sample.clip, sample.reverse), 1.0))
+                .collect(),
+        );
+    }
+
+    // 半径按平方保存，省一次开方：nearest 已经是距离平方，两倍距离即 4 倍平方
+    let radius_sq = nearest * 4.0;
+    let weighted: Vec<(String, f32)> = samples
+        .iter()
+        .filter_map(|sample| {
+            let d2 = distance_sq(sample);
+            (d2 <= radius_sq).then(|| {
+                (
+                    playback_key(&sample.clip, sample.reverse),
+                    1.0 / d2.max(f32::MIN_POSITIVE),
+                )
+            })
+        })
+        .collect();
+    merge(weighted)
+}
+
+/// 采样点是否排成规则网格：两轴各自去重后，组合数正好等于采样数。
+///
+/// 允许**缺格**：编辑器里删掉几个采样点（典型如把 speed=0 行的转向点删了）之后，
+/// 网格仍然成立，`weights_grid` 会把缺掉的角跳过再归一化。以前这里要求
+/// `组合数 == 采样数`，缺一个点就退回扇形三角剖分，结果整片区域被投影到
+/// 错误的三角形上——yaw 为正的那半边会混进 Idle / Walking，速度莫名其妙掉一半，
+/// 而 yaw 为负的那半边一切正常（因为扇心在 Idle，剖分天然不对称）。
+///
+/// 覆盖率下限 0.6 用来把「环形/扇形布局」挡在外面：一圈 8 个方向点去重后
+/// 组合数远大于采样数，覆盖率很低，仍然走反距离权重。
 fn grid_axes(samples: &[Sample2D]) -> Option<(Vec<f32>, Vec<f32>)> {
     let mut xs: Vec<f32> = samples.iter().map(|sample| sample.at[0]).collect();
     xs.sort_by(|a, b| a.total_cmp(b));
@@ -205,10 +150,19 @@ fn grid_axes(samples: &[Sample2D]) -> Option<(Vec<f32>, Vec<f32>)> {
     let mut ys: Vec<f32> = samples.iter().map(|sample| sample.at[1]).collect();
     ys.sort_by(|a, b| a.total_cmp(b));
     ys.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
-    if xs.len() * ys.len() != samples.len() || (xs.len() < 2 && ys.len() < 2) {
+    if xs.len() < 2 || ys.len() < 2 {
         return None;
     }
-    Some((xs, ys))
+    let cells = xs.len() * ys.len();
+    if cells < samples.len() {
+        return None;
+    }
+    let coverage = samples.len() as f32 / cells as f32;
+    if cells == samples.len() || coverage >= 0.6 {
+        Some((xs, ys))
+    } else {
+        None
+    }
 }
 
 /// 在排好序的轴上定位：返回 `(左索引, 右索引, 左侧占比)`，超出范围时夹到端点
@@ -263,24 +217,6 @@ fn weights_grid(
     merge(out)
 }
 
-fn inverse_distance(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)> {
-    let mut nearest: Vec<(f32, String)> = samples
-        .iter()
-        .map(|sample| {
-            let distance = (sample.at[0] - point[0]).powi(2) + (sample.at[1] - point[1]).powi(2);
-            (distance, playback_key(&sample.clip, sample.reverse))
-        })
-        .collect();
-    nearest.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    nearest.truncate(3);
-
-    let weights: Vec<(String, f32)> = nearest
-        .into_iter()
-        .map(|(distance, clip)| (clip, 1.0 / (distance + 1e-4)))
-        .collect();
-    merge(weights)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +252,159 @@ mod tests {
         ];
         let weights = weights_2d(&samples, [0.5, 0.5]);
         assert!((weights.iter().map(|w| w.1).sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    /// 采样点随便摆也行：布局不构成网格时走反距离权重，镜像坐标必须得到镜像权重。
+    ///
+    /// 这是「任意位置、任意数量」的底线要求：以前扇形剖分对这种散乱布局会
+    /// 一侧落在三角形内、另一侧落在三角形外，权重根本不对称。
+    #[test]
+    fn scattered_layout_is_mirror_symmetric() {
+        let layout: [(f32, f32, &str); 7] = [
+            (-90.0, 1.0, "left"),
+            (90.0, 1.0, "right"),
+            (-90.0, -1.0, "left_back"),
+            (90.0, -1.0, "right_back"),
+            (-30.0, 0.4, "left_in"),
+            (30.0, 0.4, "right_in"),
+            (0.0, 0.0, "idle"),
+        ];
+        fn mirror(clip: &str) -> &str {
+            match clip {
+                "left" => "right",
+                "left_in" => "right_in",
+                "left_back" => "right_back",
+                "right" => "left",
+                "right_in" => "left_in",
+                "right_back" => "left_back",
+                other => other,
+            }
+        }
+        let samples: Vec<Sample2D> = layout
+            .iter()
+            .map(|(x, y, clip)| Sample2D {
+                at: [*x, *y],
+                clip: clip.to_string(),
+                reverse: false,
+            })
+            .collect();
+
+        for point in [[12.0, 0.6], [60.0, 0.3], [-12.0, 0.8], [0.0, -0.6]] {
+            let mut a = weights_2d(&samples, point);
+            let mut b = weights_2d(&samples, [-point[0], point[1]]);
+            a.sort_by(|x, y| x.0.cmp(&y.0));
+            b.sort_by(|x, y| x.0.cmp(&y.0));
+            assert_eq!(a.len(), b.len(), "{point:?}: {a:?} vs {b:?}");
+            for ((clip_a, weight_a), (clip_b, weight_b)) in a.iter().zip(&b) {
+                assert_eq!(mirror(clip_a), clip_b, "{point:?}: {a:?} vs {b:?}");
+                assert!(
+                    (weight_a - weight_b).abs() < 1e-5,
+                    "{point:?}: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    /// 一圈方向点 + 中心点：方向之间只该吃到相邻两个方向，中心点不该隔着半径掺进来。
+    #[test]
+    fn ring_layout_blends_two_neighbours() {
+        let samples: Vec<Sample2D> = (0..8)
+            .map(|step| {
+                let angle = step as f32 * std::f32::consts::TAU / 8.0;
+                Sample2D {
+                    at: [angle.cos(), angle.sin()],
+                    clip: format!("dir{step}"),
+                    reverse: false,
+                }
+            })
+            .chain(std::iter::once(Sample2D {
+                at: [0.0, 0.0],
+                clip: "idle".to_string(),
+                reverse: false,
+            }))
+            .collect();
+
+        // 22.5° 落在 dir0 与 dir1 正中间
+        let angle = std::f32::consts::TAU / 16.0;
+        let weights = weights_2d(&samples, [angle.cos(), angle.sin()]);
+        assert_eq!(weights.len(), 2, "实际 {weights:?}");
+        assert!(weights.iter().all(|(clip, _)| clip != "idle"));
+        assert!((weights[0].1 - weights[1].1).abs() < 1e-4);
+    }
+
+    /// 网格里整格缺角：双线性拿不到四角，必须退回距离权重，不能整片空掉。
+    #[test]
+    fn empty_grid_cell_falls_back_to_distance_weights() {
+        let mut samples = Vec::new();
+        for x in 0..4 {
+            for y in 0..4 {
+                // 挖掉中间那一格 (1..2, 1..2) 的两个整数角
+                if (x, y) == (1, 1) || (x, y) == (2, 1) || (x, y) == (1, 2) || (x, y) == (2, 2) {
+                    continue;
+                }
+                samples.push(Sample2D {
+                    at: [x as f32, y as f32],
+                    clip: format!("c{x}_{y}"),
+                    reverse: false,
+                });
+            }
+        }
+        let weights = weights_2d(&samples, [1.5, 1.5]);
+        assert!(!weights.is_empty(), "空格子不该返回空权重");
+        assert!((weights.iter().map(|w| w.1).sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    /// 缺格不算破格：删掉 speed=0 行的两个转向点后，仍要按网格插值。
+    ///
+    /// 回归用例——Amy 的 locomotion.json 曾经只有 13 个点（缺 (±90, 0)），
+    /// 网格检测失败退回扇形剖分，正 yaw 一侧整片混进 Walking/Idle，速度掉一半。
+    #[test]
+    fn grid_with_missing_cells_still_interpolates() {
+        let rows: [f32; 5] = [-1.0, -0.5, 0.0, 0.5, 1.0];
+        let cols: [f32; 3] = [-90.0, 0.0, 90.0];
+        let mut samples = Vec::new();
+        for y in rows {
+            for x in cols {
+                // 只缺 (±90, 0) 这两个角，其余照旧
+                if (x.abs() - 90.0).abs() < 1e-6 && y.abs() < 1e-6 {
+                    continue;
+                }
+                // 正前方这一列按档位分开命名，才能看出插值有没有跨行跳档
+                let clip = if x < 0.0 {
+                    format!("left_{y}")
+                } else if x > 0.0 {
+                    format!("right_{y}")
+                } else {
+                    // 正前方这一列按档位各自命名，才能看出插值有没有跨行跳档
+                    format!("front_{y}")
+                };
+                samples.push(Sample2D {
+                    at: [x, y],
+                    clip,
+                    reverse: y < 0.0,
+                });
+            }
+        }
+        assert_eq!(samples.len(), 13);
+
+        // yaw 正负两侧必须对称：+2° 与 -2° 都应当几乎完全是正前方的跑档剪辑，
+        // 而不是一侧 Running、另一侧 Walking
+        let positive = weights_2d(&samples, [2.0, 1.0]);
+        let negative = weights_2d(&samples, [-2.0, 1.0]);
+        let top = |list: &[(String, f32)]| {
+            list.iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(clip, _)| clip.clone())
+                .unwrap()
+        };
+        assert_eq!(top(&positive), "front_1", "实际 {positive:?}");
+        assert_eq!(top(&negative), "front_1", "实际 {negative:?}");
+
+        // 网格中央的走档点不能被跨行跳过：0.75 必须是 走档 / 跑档 各一半
+        let mid = weights_2d(&samples, [0.0, 0.75]);
+        let mut sorted = mid.clone();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        assert_eq!(sorted.len(), 2, "实际 {mid:?}");
+        assert!((sorted[0].1 - 0.5).abs() < 1e-4, "实际 {mid:?}");
     }
 }

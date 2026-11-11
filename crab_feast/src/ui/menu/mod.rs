@@ -7,8 +7,6 @@
 
 use bevy::prelude::*;
 
-use crate::GameState;
-
 mod drawer;
 pub(crate) mod widgets;
 
@@ -20,12 +18,10 @@ pub struct GameMenuPlugin;
 
 impl Plugin for GameMenuPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(MenuConfig {
-            root_title: "功能菜单",
-            font_path: Some("fonts/PingFang-SC-Regular.ttf"),
-            toggle_keys: vec![KeyCode::F2, KeyCode::Backquote],
-            pages: Vec::new(),
-        })
-        .add_plugins(MenuPlugin::new(GameState::Game));
+        // 初始化 MenuConfig 使用默认值；页面积木的展开状态与浮层摆位由它们自己维护
+        app.init_resource::<MenuConfig>().add_plugins((
+            widgets::WidgetPlugin,
+            MenuPlugin::new(crate::GameState::Game),
+        ));
     }
 }

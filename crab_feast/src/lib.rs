@@ -10,6 +10,7 @@ mod assets;
 mod camera;
 mod input;
 mod scene;
+mod settings;
 mod state;
 mod ui;
 
@@ -18,7 +19,7 @@ pub use state::GameState;
 
 pub fn build_app(app: &mut App) {
     app.insert_resource(PlatformInfo::current())
-        .insert_resource(input::InputSmoothing::new(0.5)) // 平滑系数：0.5（值越小越平滑）
+        .insert_resource(input::MovementSettings::default()) // 移动设置
         .add_plugins((
             camera::CameraPlugin,
             FpsOverlayPlugin {
@@ -47,6 +48,7 @@ pub fn build_app(app: &mut App) {
             },
             anim::AnimPlugin,
             assets::AssetLoadingPlugin,
+            settings::SettingsPlugin,
             ui::UiPlugin,
             scene::ScenePlugin,
         ));

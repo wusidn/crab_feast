@@ -13,48 +13,73 @@ pub fn game_spaces() -> Vec<BlendSpaceSpec> {
         BlendSpaceSpec {
             id: "locomotion".to_string(),
             title: "移动混合".to_string(),
-            description: "移动混合：朝向 × 速度，yaw 只覆盖前后半球的左右偏角，前后由速度符号承担"
+            description: "移动混合：朝向 × 速度，yaw 覆盖整圈（±180°），速度恒为非负"
                 .to_string(),
             params: [
                 ParamSpec::new(
                     "yaw",
                     "朝向",
-                    "移动方向相对角色正前方的偏角：0 正前、-90 正左、90 正右；超过 90 的部分等价于速度取负。speed=0 行的 ±90 是原地转向剪辑",
-                    -90.0,
-                    90.0,
+                    "移动方向相对角色正前方的偏角：0 正前、-90 正左、90 正右、±180 正后；整圈连续，不做折回",
+                    -180.0,
+                    180.0,
                     0.0,
                 ),
                 ParamSpec::new(
                     "speed",
                     "速度",
-                    "沿当前朝向的带符号速度：0 静止、±0.5 走档、±1 跑档，负值即倒退（倒着走）",
-                    -1.0,
+                    "沿当前朝向的速度量级：0 静止、0.5 走档、1 跑档；倒退由「反放」采样承担，不用负值",
+                    0.0,
                     1.0,
                     0.5,
                 ),
             ],
             speed: 1.0,
-            // 规则网格：三列朝向 × 带符号的走/跑两档。负速度层就是把同一档剪辑
-            // 的播放方向翻转（人没转身、脚往回跨）。斜向不单独放点，
-            // 由相邻两列的插值合成，避免给没有素材的方向硬绑一个剪辑。
-            // speed=0 行的左右两端放转向剪辑：只有「松手 + 朝向没对上」会采样到这里，
-            // 中间仍是 Idle，所以小角度误差只微微侧身，大角度才真的转身。
+            // 7 列朝向 × 走/跑两档，斜向由相邻两点插值合成，不给没有素材的方向
+            // 硬绑一个剪辑。
+            //
+            // ±180 两列是「反放的走 / 跑」：人朝前、脚往后迈，就是倒退。
+            //
+            // 素材里没有「45° 斜后走」这类剪辑，所以只要两套步法同时有权重，
+            // 腿就必然处在「交叉迈步」的中间态。这个中间态没法消掉，只能压短：
+            //  0°~60°   钉死正走（重复采样同一剪辑 → 权重独占）
+            //  60°~90°  30° 交叉淡入（180°/s 下 0.17s）换到横移
+            //  90°~150° 钉死横移
+            //  150°~180° 30° 交叉淡出，换到反放走路（真正的倒退）
+            // 以前 0°~90° 全程线性淡入，交叉态持续 0.5s，腿一直是「半走半步」。
+            //
+            // 关键：速度**不再用符号表示前后**。以前 180° 要折回 ±90 再给负速度，
+            // 那条路径必然穿过 speed=0，而 speed=0 上只有 Idle——转身时腿会闪一下。
+            // 现在整圈连续，转身是参数沿圆周从 180 滑到 0。
+            // speed=0 每一列都放 Idle：整行都是 Idle 才算「静止」，
+            // 否则某个朝向静止会退化成 0.5 行的侧移姿势。
             default_samples: vec![
-                ([-90.0, 0.0], "LeftTurn".to_string(), false),
+                ([-180.0, 0.0], "Idle".to_string(), false),
+                ([-150.0, 0.0], "Idle".to_string(), false),
+                ([-90.0, 0.0], "Idle".to_string(), false),
+                ([-60.0, 0.0], "Idle".to_string(), false),
                 ([0.0, 0.0], "Idle".to_string(), false),
-                ([90.0, 0.0], "RightTurn".to_string(), false),
-                ([-90.0, -0.5], "LeftStrafeWalking".to_string(), true),
-                ([0.0, -0.5], "Walking".to_string(), true),
-                ([90.0, -0.5], "RightStrafeWalking".to_string(), true),
+                ([60.0, 0.0], "Idle".to_string(), false),
+                ([90.0, 0.0], "Idle".to_string(), false),
+                ([150.0, 0.0], "Idle".to_string(), false),
+                ([180.0, 0.0], "Idle".to_string(), false),
+                ([-150.0, 0.5], "LeftStrafeWalking".to_string(), false),
                 ([-90.0, 0.5], "LeftStrafeWalking".to_string(), false),
+                ([-60.0, 0.5], "Walking".to_string(), false),
                 ([0.0, 0.5], "Walking".to_string(), false),
+                ([60.0, 0.5], "Walking".to_string(), false),
                 ([90.0, 0.5], "RightStrafeWalking".to_string(), false),
-                ([-90.0, -1.0], "LeftStrafe".to_string(), true),
-                ([0.0, -1.0], "Running".to_string(), true),
-                ([90.0, -1.0], "RightStrafe".to_string(), true),
+                ([150.0, 0.5], "RightStrafeWalking".to_string(), false),
+                ([-180.0, 0.5], "Walking".to_string(), true),
+                ([180.0, 0.5], "Walking".to_string(), true),
+                ([-150.0, 1.0], "LeftStrafe".to_string(), false),
                 ([-90.0, 1.0], "LeftStrafe".to_string(), false),
+                ([-60.0, 1.0], "Running".to_string(), false),
                 ([0.0, 1.0], "Running".to_string(), false),
+                ([60.0, 1.0], "Running".to_string(), false),
                 ([90.0, 1.0], "RightStrafe".to_string(), false),
+                ([150.0, 1.0], "RightStrafe".to_string(), false),
+                ([-180.0, 1.0], "Running".to_string(), true),
+                ([180.0, 1.0], "Running".to_string(), true),
             ],
         },
         BlendSpaceSpec {

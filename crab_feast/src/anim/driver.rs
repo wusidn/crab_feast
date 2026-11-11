@@ -225,22 +225,6 @@ pub(crate) fn drive_pose(
         transform.translation =
             skeleton.base_translation + Vec3::new(last_root_delta.x, 0.0, last_root_delta.z);
     }
-
-    // 同步 Avatar 的朝向到模型根节点
-    // Avatar 是模型的父节点，其 rotation 决定了模型的世界朝向
-    let avatar_entity = runtime.model.unwrap_or(model);
-    if let Ok(avatar_transform) = transforms.get(avatar_entity) {
-        // 先计算 Avatar 的偏航角
-        let avatar_yaw = avatar_transform.rotation.to_euler(EulerRot::ZYX).1;
-        // 再修改模型的 rotation
-        if let Ok(mut model_transform) = transforms.get_mut(model) {
-            // 应用 Avatar 的偏航角到模型
-            let mut model_rot = model_transform.rotation.to_euler(EulerRot::ZYX);
-            model_rot.1 = avatar_yaw;
-            model_transform.rotation =
-                Quat::from_euler(EulerRot::ZYX, model_rot.0, model_rot.1, model_rot.2);
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

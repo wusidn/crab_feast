@@ -338,23 +338,48 @@ pub fn gait_segments(events: &[Option<f32>; 4], reference: &[Option<f32>; 4]) ->
     {
         return Vec::new();
     }
-    // 解缠绕：相邻差归一到 [0,1)，让本地相位随参考相位单调
-    for index in 1..pairs.len() {
-        let mut delta = pairs[index].1 - pairs[index - 1].1;
-        while delta < 0.0 {
-            delta += 1.0;
+
+    // 解缠绕后要求：本地相位随参考相位单调，且整表跨度不超过一个周期。
+    //
+    // 两档剪辑的事件**槽位顺序**不一定一致（A 的「右脚触地」可能排在「左脚离地」
+    // 之前，B 相反；倒放剪辑的触/离还会对调）。硬按槽位配对再解缠绕，遇到顺序
+    // 相反的那一对会多补一整圈，跨度就超过 1。早先这里直接退回空表（恒等映射），
+    // 于是权重稍变，映射就在「有」和「没有」之间切一帧，本地时间被拽走半圈，
+    // 腿看上去「抽一下」。现在把造成整圈跳变的那一对剔掉，保留其余锚点——
+    // 映射始终存在，只随权重平滑变化。
+    loop {
+        let first = pairs[0].1;
+        let mut locals = Vec::with_capacity(pairs.len());
+        locals.push(first);
+        for index in 1..pairs.len() {
+            let mut delta = pairs[index].1 - locals[index - 1];
+            delta -= delta.floor();
+            locals.push(locals[index - 1] + delta);
         }
-        while delta >= 1.0 {
-            delta -= 1.0;
+        let span = *locals.last().unwrap() - first;
+        if span <= 1.0 + 1e-3 {
+            if span < 0.3 {
+                // 事件挤在半圈以内，统一轴本身没有参考价值，退回恒等
+                return Vec::new();
+            }
+            for (pair, local) in pairs.iter_mut().zip(&locals) {
+                pair.1 = *local;
+            }
+            return pairs;
         }
-        pairs[index].1 = pairs[index - 1].1 + delta;
+        // 跨度超过一个周期：剔掉贡献最大那一跳所在的锚点
+        if pairs.len() <= 3 {
+            return Vec::new();
+        }
+        let mut worst = (1, -1.0_f32);
+        for index in 1..locals.len() {
+            let delta = locals[index] - locals[index - 1];
+            if delta > worst.1 {
+                worst = (index, delta);
+            }
+        }
+        pairs.remove(worst.0);
     }
-    let span = pairs[pairs.len() - 1].1 - pairs[0].1;
-    // 首末差必须小于一个周期，剩下的缺口由「最后事件 → 首事件」的环绕段补上
-    if !(0.3..=1.0).contains(&span) {
-        return Vec::new();
-    }
-    pairs
 }
 
 /// 把统一相位按分段表映射到剪辑本地相位（表为空时恒等）。
@@ -450,8 +475,11 @@ pub fn evaluate_space(doc: &BlendSpaceDoc, ctx: &mut SpaceEvalContext) -> SpaceE
     // 统一时间轴：当前权重下的事件加权平均。独占剪辑时它等于该剪辑自己的
     // 事件，重映射退化为恒等（不改变单段动画的节奏）；混合时它落在两者之间，
     // 双方各改一半，四个事件（含支撑期两端）精确对齐。
+    // 统一时间轴只由**正放**剪辑决定：倒放的是同一套动作倒着播，它的「触/离」
+    // 在时间轴上本来就是反的，混进参考里会把整张映射拽偏（见 `sample_time`）。
     let event_sources: Vec<(f32, [Option<f32>; 4])> = plans
         .iter()
+        .filter(|plan| !plan.reverse)
         .map(|plan| (plan.weight, plan.events()))
         .collect();
     let reference = average_events(&event_sources);
@@ -497,15 +525,14 @@ struct SamplePlan {
 }
 
 impl SamplePlan {
-    /// 步态事件按播放方向对齐后的结果：倒放时时间轴整个掉头，相位要跟着镜像。
+    /// 正放剪辑的步态事件。
+    ///
+    /// 倒放剪辑**不走**这套重映射（见 [`SamplePlan::sample_time`]）：正放时一个
+    /// 周期里触地和离地是按时间顺序排的，倒着播以后这个顺序整个反了，
+    /// 和正放剪辑按槽位配对凑不出单调映射——硬配必然绕一个整圈，
+    /// 权重一动映射就翻脸，脚被拽着瞬移。
     fn events(&self) -> [Option<f32>; 4] {
-        if self.reverse {
-            self.meta
-                .gait_events
-                .map(|event| event.map(|phase| (1.0 - phase).rem_euclid(1.0)))
-        } else {
-            self.meta.gait_events
-        }
+        self.meta.gait_events
     }
 
     /// `(净步幅, 时长, 权重)`：等效周期与混合地速都由这三元组算出。
@@ -517,13 +544,16 @@ impl SamplePlan {
     /// 倒放时再从剪辑尾部往头走（后退一类动作）。
     fn sample_time(&self, phase: f32, reference: &[Option<f32>; 4]) -> f32 {
         let duration = self.meta.duration;
+        // 倒放剪辑不参与分段重映射：正放的一个周期里，触地和离地是按时间顺序
+        // 排列的；倒过来放以后这个顺序整个反了，和正放剪辑的槽位配对**凑不出**
+        // 单调映射——硬配必然要绕一个整圈，权重一动映射就翻脸，脚被拽着瞬移。
+        // 所以倒放只用全局相位反向采样：节奏由统一时间轴给，脚怎么迈由剪辑自己决定。
+        if self.reverse {
+            return (duration - phase.rem_euclid(1.0) * duration).rem_euclid(duration.max(f32::EPSILON));
+        }
         let points = gait_segments(&self.events(), reference);
         let local_phase = warp_phase(phase, &points);
-        if self.reverse {
-            (duration - local_phase * duration).rem_euclid(duration.max(f32::EPSILON))
-        } else {
-            local_phase * duration
-        }
+        local_phase * duration
     }
 }
 
@@ -592,6 +622,279 @@ mod tests {
         assert!((shifted - (0.406 + 1.0)).abs() < 1e-3 || (shifted - 0.406).abs() < 1e-3);
     }
 
+    /// 横移 ↔ 反放走路 的过渡带上，两个剪辑的采样时刻都不许跳。
+    ///
+    /// 倒放剪辑按全局相位反向采样、不做分段重映射；统一时间轴也只由正放剪辑建。
+    /// 这样权重怎么变都不会挪动任何人的本地时间（以前硬配对会绕整圈，脚被拽着瞬移）。
+    #[test]
+    fn reverse_blend_keeps_sample_time_smooth() {
+        let strafe = ClipMeta {
+            duration: 1.033,
+            stride: 1.234,
+            gait_events: [Some(0.312), Some(0.802), Some(0.792), Some(0.302)],
+            ..ClipMeta::default()
+        };
+        let walk = ClipMeta {
+            duration: 1.033,
+            stride: 1.190,
+            gait_events: [Some(0.312), Some(0.781), Some(0.823), Some(0.281)],
+            ..ClipMeta::default()
+        };
+        let phase = 0.37_f32;
+        let mut prev: Option<(f32, f32)> = None;
+        for step in 0..=20 {
+            let rev_weight = step as f32 / 20.0;
+            let plans = [
+                SamplePlan {
+                    clip: "LeftStrafeWalking".to_string(),
+                    reverse: false,
+                    weight: 1.0 - rev_weight,
+                    meta: strafe.clone(),
+                },
+                SamplePlan {
+                    clip: "Walking".to_string(),
+                    reverse: true,
+                    weight: rev_weight,
+                    meta: walk.clone(),
+                },
+            ];
+            let sources: Vec<(f32, [Option<f32>; 4])> = plans
+                .iter()
+                .filter(|plan| !plan.reverse)
+                .map(|plan| (plan.weight, plan.events()))
+                .collect();
+            let reference = average_events(&sources);
+            let now = (
+                plans[0].sample_time(phase, &reference),
+                plans[1].sample_time(phase, &reference),
+            );
+            if let Some(before) = prev {
+                for (index, (a, b)) in [(before.0, now.0), (before.1, now.1)].into_iter().enumerate() {
+                    let mut delta = (b - a).rem_euclid(1.0);
+                    if delta > 0.5 {
+                        delta -= 1.0;
+                    }
+                    assert!(
+                        delta.abs() < 0.02,
+                        "第 {index} 个剪辑在权重 {rev_weight:.2} 处跳了 {delta:+.4}"
+                    );
+                }
+            }
+            prev = Some(now);
+        }
+        // 纯倒放：相位反向，一个周期倒着走完
+        let reverse_only = SamplePlan {
+            clip: "Walking".to_string(),
+            reverse: true,
+            weight: 1.0,
+            meta: walk,
+        };
+        let empty = average_events(&[]);
+        assert!((reverse_only.sample_time(0.0, &empty) - 0.0).abs() < 1e-5);
+        assert!((reverse_only.sample_time(0.5, &empty) - 1.033 / 2.0).abs() < 1e-4);
+    }
+
+    /// 诊断用：直接按文档权重沿整圈扫 yaw，看采样时刻有没有跳变 / 倒退。
+    #[test]
+    #[ignore = "诊断用，手动 --ignored 跑"]
+    fn sweep_yaw_sample_time_continuity() {
+        use crate::anim::core::blendspace::{Sample2D, split_key};
+        let meta = |events: [Option<f32>; 4], stride: f32, duration: f32| ClipMeta {
+            duration,
+            stride,
+            gait_events: events,
+            ..ClipMeta::default()
+        };
+        let clips: Vec<(&str, ClipMeta)> = vec![
+            (
+                "Walking",
+                meta([Some(0.312), Some(0.781), Some(0.823), Some(0.281)], 1.190, 1.033),
+            ),
+            (
+                "Running",
+                meta([Some(0.406), Some(0.625), Some(0.927), Some(0.135)], 2.114, 0.700),
+            ),
+            (
+                "LeftStrafeWalking",
+                meta([Some(0.312), Some(0.802), Some(0.792), Some(0.302)], 1.234, 1.033),
+            ),
+            (
+                "RightStrafeWalking",
+                meta([Some(0.312), Some(0.802), Some(0.792), Some(0.302)], 1.234, 1.033),
+            ),
+            (
+                "LeftStrafe",
+                meta([Some(0.417), Some(0.656), Some(0.917), Some(0.188)], 2.079, 0.667),
+            ),
+            (
+                "RightStrafe",
+                meta([Some(0.417), Some(0.656), Some(0.917), Some(0.188)], 2.079, 0.667),
+            ),
+        ];
+        let lookup = |clip: &str| -> ClipMeta {
+            clips
+                .iter()
+                .find(|(name, _)| *name == clip)
+                .map(|(_, meta)| meta.clone())
+                .unwrap_or_default()
+        };
+
+        // 与 spaces.rs 默认布局一致
+        let mut doc = BlendSpaceDoc {
+            ranges: Some([[-180.0, 180.0], [0.0, 1.0]]),
+            ..BlendSpaceDoc::default()
+        };
+        let mut push = |at: [f32; 2], clip: &str, reverse: bool| {
+            doc.samples.push(Sample2D {
+                at,
+                clip: clip.to_string(),
+                reverse,
+            });
+        };
+        for yaw in [-180.0, -150.0, -90.0, -60.0, 0.0, 60.0, 90.0, 150.0, 180.0] {
+            push([yaw, 0.0], "Idle", false);
+        }
+        for (yaw, clip) in [
+            (-150.0, "LeftStrafeWalking"),
+            (-90.0, "LeftStrafeWalking"),
+            (-60.0, "Walking"),
+            (0.0, "Walking"),
+            (60.0, "Walking"),
+            (90.0, "RightStrafeWalking"),
+            (150.0, "RightStrafeWalking"),
+        ] {
+            push([yaw, 0.5], clip, false);
+        }
+        for (yaw, clip) in [
+            (-150.0, "LeftStrafe"),
+            (-90.0, "LeftStrafe"),
+            (-60.0, "Running"),
+            (0.0, "Running"),
+            (60.0, "Running"),
+            (90.0, "RightStrafe"),
+            (150.0, "RightStrafe"),
+        ] {
+            push([yaw, 1.0], clip, false);
+        }
+        for (yaw, clip) in [(-180.0, "Walking"), (180.0, "Walking")] {
+            push([yaw, 0.5], clip, true);
+        }
+        for (yaw, clip) in [(-180.0, "Running"), (180.0, "Running")] {
+            push([yaw, 1.0], clip, true);
+        }
+
+        // 细查 -162..-146 这一段
+        {
+            let mut yaw = -162.0_f32;
+            while yaw <= -146.0 {
+                let weights = doc.weights([yaw, 0.5]);
+                let plans: Vec<SamplePlan> = weights
+                    .iter()
+                    .map(|(key, weight)| {
+                        let (clip, reverse) = split_key(key);
+                        SamplePlan {
+                            clip: clip.to_string(),
+                            reverse,
+                            weight: *weight,
+                            meta: lookup(clip),
+                        }
+                    })
+                    .collect();
+                let sources: Vec<(f32, [Option<f32>; 4])> = plans
+                    .iter()
+                    .filter(|plan| !plan.reverse)
+                    .map(|plan| (plan.weight, plan.events()))
+                    .collect();
+                let reference = average_events(&sources);
+                let times: Vec<String> = plans
+                    .iter()
+                    .map(|plan| {
+                        format!(
+                            "{}:{:.4}{}",
+                            plan.clip,
+                            plan.sample_time(0.37, &reference),
+                            if plan.reverse { "(rev)" } else { "" }
+                        )
+                    })
+                    .collect();
+                println!("  {yaw:6.1} ref={:?} → {}", reference.map(|e| e.map(|v| (v * 1000.0).round() / 1000.0)), times.join(" "));
+                yaw += 1.0;
+            }
+        }
+
+        for (speed, label) in [(0.5_f32, "走"), (1.0_f32, "跑")] {
+            let mut prev: Option<Vec<(String, f32)>> = None;
+            let mut worst = (0.0_f32, 0.0_f32, String::new());
+            let mut rewinds = 0;
+            let mut worst_rewind = (0.0_f32, 0.0_f32);
+            let mut yaw = -180.0_f32;
+            while yaw <= 180.0 {
+                let weights = doc.weights([yaw, speed]);
+                let plans: Vec<SamplePlan> = weights
+                    .iter()
+                    .map(|(key, weight)| {
+                        let (clip, reverse) = split_key(key);
+                        SamplePlan {
+                            clip: clip.to_string(),
+                            reverse,
+                            weight: *weight,
+                            meta: lookup(clip),
+                        }
+                    })
+                    .collect();
+                let sources: Vec<(f32, [Option<f32>; 4])> = plans
+                    .iter()
+                    .filter(|plan| !plan.reverse)
+                    .map(|plan| (plan.weight, plan.events()))
+                    .collect();
+                let reference = average_events(&sources);
+                let phase = 0.37_f32;
+                let times: Vec<(String, f32)> = plans
+                    .iter()
+                    .map(|plan| {
+                        (
+                            format!("{}{}", plan.clip, if plan.reverse { "#rev" } else { "" }),
+                            plan.sample_time(phase, &reference),
+                        )
+                    })
+                    .collect();
+                if let Some(before) = &prev {
+                    for (clip, time) in &times {
+                        if let Some((_, old)) = before.iter().find(|(c, _)| c == clip) {
+                            let mut delta = (*time - *old).rem_euclid(1.0);
+                            if delta > 0.5 {
+                                delta -= 1.0;
+                            }
+                            let rate = delta.abs() / 0.25;
+                            if rate > worst.0 {
+                                worst = (rate, yaw, clip.clone());
+                            }
+                            if delta.abs() > 0.01 {
+                                println!(
+                                    "    !! yaw {yaw:.2} {clip} delta {delta:+.4} (旧 {old:.4} → 新 {time:.4}，权重 {:.3}, 参考 {:?})",
+                                    plans.iter().find(|p2| &p2.clip == clip).map(|p2| p2.weight).unwrap_or(0.0),
+                                    reference.map(|e| e.map(|v| (v * 1000.0).round() / 1000.0))
+                                );
+                            }
+                            if delta < -1e-4 {
+                                rewinds += 1;
+                                if delta < worst_rewind.1 {
+                                    worst_rewind = (yaw, delta);
+                                }
+                            }
+                        }
+                    }
+                }
+                prev = Some(times);
+                yaw += 0.25;
+            }
+            println!(
+                "[{label}] 采样时刻最大跳变 {:.4} 周期/度 @ yaw {:.2}（{}）；倒退帧 {rewinds} 个，最负 {:.4} @ yaw {:.2}",
+                worst.0, worst.1, worst.2, worst_rewind.1, worst_rewind.0
+            );
+        }
+    }
+
     /// 独占剪辑时统一轴就是它自己，重映射必须退化为恒等，不改原节奏。
     #[test]
     fn average_single_source_is_identity() {
@@ -645,55 +948,56 @@ mod tests {
         assert!(sparse.is_empty());
     }
 
-    /// 改坐标成「yaw × 带符号 speed」后，规则网格上的插值必须落在预期剪辑上。
+    /// 整圈 yaw × 非负 speed 的规则网格上，插值必须落在预期剪辑上。
+    ///
+    /// 这里同时钉住本轮改动的核心不变量：速度不再用符号表示前后，
+    /// 所以参数空间里没有「负速度层」，任意速度上都不会混进 Idle。
     #[test]
-    fn yaw_speed_grid_interpolates() {
+    fn full_circle_yaw_grid_interpolates() {
         use crate::anim::core::blendspace::Sample2D;
         let mut doc = BlendSpaceDoc {
-            ranges: Some([[-90.0, 90.0], [-1.0, 1.0]]),
+            ranges: Some([[-180.0, 180.0], [0.0, 1.0]]),
             ..BlendSpaceDoc::default()
         };
-        let walk = [
-            (-90.0, "LeftStrafeWalking", false),
-            (0.0, "Walking", false),
-            (90.0, "RightStrafeWalking", false),
-        ];
-        let run = [
-            (-90.0, "LeftStrafe", false),
-            (0.0, "Running", false),
-            (90.0, "RightStrafe", false),
-        ];
-        for yaw in [-90.0, 0.0, 90.0] {
+        let mut push = |at: [f32; 2], clip: &str, reverse: bool| {
             doc.samples.push(Sample2D {
-                at: [yaw, 0.0],
-                clip: "Idle".to_string(),
-                reverse: false,
-            });
-        }
-        // 负速度层＝把同一档剪辑的播放方向翻转（倒退，不是转身）
-        for (yaw, clip, reverse) in walk {
-            doc.samples.push(Sample2D {
-                at: [yaw, 0.5],
+                at,
                 clip: clip.to_string(),
                 reverse,
             });
-            doc.samples.push(Sample2D {
-                at: [yaw, -0.5],
-                clip: clip.to_string(),
-                reverse: !reverse,
-            });
+        };
+        // 每一列都放 Idle，静止时整行都是站姿
+        for yaw in [-180.0, -150.0, -90.0, -60.0, 0.0, 60.0, 90.0, 150.0, 180.0] {
+            push([yaw, 0.0], "Idle", false);
         }
-        for (yaw, clip, reverse) in run {
-            doc.samples.push(Sample2D {
-                at: [yaw, 1.0],
-                clip: clip.to_string(),
-                reverse,
-            });
-            doc.samples.push(Sample2D {
-                at: [yaw, -1.0],
-                clip: clip.to_string(),
-                reverse: !reverse,
-            });
+        for (yaw, clip) in [
+            (-150.0, "LeftStrafeWalking"),
+            (-90.0, "LeftStrafeWalking"),
+            (-60.0, "Walking"),
+            (0.0, "Walking"),
+            (60.0, "Walking"),
+            (90.0, "RightStrafeWalking"),
+            (150.0, "RightStrafeWalking"),
+        ] {
+            push([yaw, 0.5], clip, false);
+        }
+        for (yaw, clip) in [
+            (-150.0, "LeftStrafe"),
+            (-90.0, "LeftStrafe"),
+            (-60.0, "Running"),
+            (0.0, "Running"),
+            (60.0, "Running"),
+            (90.0, "RightStrafe"),
+            (150.0, "RightStrafe"),
+        ] {
+            push([yaw, 1.0], clip, false);
+        }
+        // ±180 = 正后方：同一档剪辑倒放（人朝前、脚往后迈）
+        for (yaw, clip) in [(-180.0, "Walking"), (180.0, "Walking")] {
+            push([yaw, 0.5], clip, true);
+        }
+        for (yaw, clip) in [(-180.0, "Running"), (180.0, "Running")] {
+            push([yaw, 1.0], clip, true);
         }
 
         let top = |point: [f32; 2]| {
@@ -703,44 +1007,69 @@ mod tests {
         };
 
         // 采样点本身必须独占
-        let (key, weight) = top([0.0, 1.0]);
-        assert_eq!(key, "Running");
-        assert!((weight - 1.0).abs() < 1e-3);
-        let (key, weight) = top([0.0, 0.5]);
-        assert_eq!(key, "Walking");
-        assert!((weight - 1.0).abs() < 1e-3);
-        // 正前方向后走 = 倒放走路，不能变成转身
-        let (key, _) = top([0.0, -0.5]);
-        assert_eq!(key, "Walking#rev");
-        let (key, _) = top([0.0, -1.0]);
-        assert_eq!(key, "Running#rev");
-        // 朝左却倒退 = 实际向右移动，仍然是侧的剪辑被倒放
-        let (key, _) = top([-90.0, -1.0]);
-        assert_eq!(key, "LeftStrafe#rev");
-        // 静止时无论朝向都是 Idle
-        for yaw in [-80.0, -45.0, 0.0, 60.0] {
-            let (key, _) = top([yaw, 0.0]);
-            assert_eq!(key, "Idle", "yaw={yaw} 静止时不该是 {key}");
+        assert_eq!(top([0.0, 1.0]).0, "Running");
+        assert_eq!(top([0.0, 0.5]).0, "Walking");
+        assert_eq!(top([90.0, 0.5]).0, "RightStrafeWalking");
+        // 正后方向后走 = 倒放走路
+        assert_eq!(top([180.0, 0.5]).0, "Walking#rev");
+        assert_eq!(top([180.0, 1.0]).0, "Running#rev");
+        // 0°~60° 钉死正走：这时候应该是独占，不该掺侧移
+        for yaw in [0.0, 30.0, 60.0] {
+            let (key, weight) = top([yaw, 0.5]);
+            assert_eq!(key, "Walking", "yaw={yaw}");
+            assert!((weight - 1.0).abs() < 1e-3, "yaw={yaw} 权重 {weight}");
         }
-        // 侧向半速落在左/右横移
-        let (key, _) = top([-90.0, 0.5]);
-        assert_eq!(key, "LeftStrafeWalking");
-        let (key, _) = top([90.0, 0.5]);
-        assert_eq!(key, "RightStrafeWalking");
-        // 斜向没有素材点，必须由相邻两列合成
-        let (key, weight) = top([-45.0, 0.5]);
+        // 60°~90° 是唯一一段「正走 ↔ 横移」的交叉淡入
+        let (key, weight) = top([75.0, 0.5]);
         assert!(
-            key == "Walking" || key == "LeftStrafeWalking",
-            "斜向应为两列混合，实际 {key}"
+            key == "Walking" || key == "RightStrafeWalking",
+            "75° 应为交叉态，实际 {key}"
         );
-        assert!((weight - 0.5).abs() < 1e-3, "斜向应各半，实际 {weight}");
+        assert!((weight - 0.5).abs() < 1e-3, "75° 应各半，实际 {weight}");
+
+        // 90°~150° 没有素材，钉死在同一档侧移：重复采样同一剪辑 → 权重独占，
+        // 这时候腿才不会「两套步法打架」
+        for yaw in [100.0, 120.0, 150.0] {
+            let (key, weight) = top([yaw, 0.5]);
+            assert_eq!(key, "RightStrafeWalking", "yaw={yaw}");
+            assert!((weight - 1.0).abs() < 1e-3, "yaw={yaw} 权重 {weight}");
+        }
+        for yaw in [-100.0, -120.0, -150.0] {
+            let (key, weight) = top([yaw, 0.5]);
+            assert_eq!(key, "LeftStrafeWalking", "yaw={yaw}");
+            assert!((weight - 1.0).abs() < 1e-3, "yaw={yaw} 权重 {weight}");
+        }
+        // 只有最后 30°（150~180）才是侧移 ↔ 反放走路的重叠过渡
+        let (key, weight) = top([165.0, 0.5]);
+        assert!(
+            key == "RightStrafeWalking" || key == "Walking#rev",
+            "165° 应为两档过渡，实际 {key}"
+        );
+        assert!((weight - 0.5).abs() < 1e-3, "165° 应各半，实际 {weight}");
         // 走↔跑之间是两档同向剪辑的线性混合
         let (key, weight) = top([0.0, 0.75]);
-        assert!(
-            key == "Walking" || key == "Running",
-            "中间档应为走跑混合，实际 {key}"
-        );
+        assert!(key == "Walking" || key == "Running", "实际 {key}");
         assert!((weight - 0.5).abs() < 1e-3, "走跑应各半，实际 {weight}");
+        // 走档 / 跑档上，任何朝向都不该出现 Idle（出现就说明腿会经过站姿）。
+        // 只有 0~0.5 之间的模拟量才会按比例掺进 Idle，那是「慢走档」的稀释，
+        // 游戏里送的是整点 0.5 / 1.0，不会走这条路。
+        for yaw in [-180.0, -120.0, -45.0, 0.0, 45.0, 120.0, 180.0] {
+            for speed in [0.5, 1.0] {
+                let keys: Vec<String> = doc
+                    .weights([yaw, speed])
+                    .into_iter()
+                    .map(|(key, weight)| if weight > 1e-3 { key } else { String::new() })
+                    .collect();
+                assert!(
+                    !keys.iter().any(|key| key == "Idle"),
+                    "yaw={yaw} speed={speed} 混进了 Idle：{keys:?}"
+                );
+            }
+        }
+        // 静止时无论朝向都是 Idle
+        for yaw in [-180.0, -150.0, -80.0, -45.0, 0.0, 60.0, 90.0, 150.0, 180.0] {
+            assert_eq!(top([yaw, 0.0]).0, "Idle", "yaw={yaw}");
+        }
     }
 
     /// 等效地速与等效周期是同一个模型的两面：混合输出的地速必须严格等于

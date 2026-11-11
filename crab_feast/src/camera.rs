@@ -41,21 +41,29 @@ pub struct CameraRig {
 impl Default for CameraRig {
     fn default() -> Self {
         Self {
-            distance: 5.0,
+            distance: 10.0,
             focus_height: 1.3,
         }
     }
 }
 
 /// 目标相机距离（用于缓动过渡）
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct ZoomTarget {
     pub target_distance: f32,
 }
 
+impl Default for ZoomTarget {
+    fn default() -> Self {
+        Self {
+            target_distance: 10.0, // 默认距离
+        }
+    }
+}
+
 /// 滚轮可调的相机距离区间（米），以及每格滚轮的增量
 const DISTANCE_RANGE: (f32, f32) = (2.0, 12.0);
-const ZOOM_PER_NOTCH: f32 = 0.4;
+const ZOOM_PER_NOTCH: f32 = 0.4 / 3.0;
 
 /// 第三人称可用的俯仰区间（弧度）：再低就钻地，再高就只剩头顶。
 pub const CAMERA_PITCH_RANGE: (f32, f32) = (-0.12, 1.0);
@@ -174,7 +182,9 @@ fn orbit_camera(
 
     let horizontal = rig.distance * facing.pitch.cos();
     let height = rig.distance * facing.pitch.sin();
-    let offset = Quat::from_rotation_y(facing.yaw) * Vec3::new(0.0, height, -horizontal);
+    // 相机在水平面的偏移：向后（-Z）投影，再绕 Y 轴旋转 yaw 角度
+    let offset_3d = Vec3::new(0.0, height, -horizontal);
+    let offset = Quat::from_rotation_y(facing.yaw) * offset_3d;
     let target = avatar.translation + Vec3::Y * rig.focus_height;
 
     if let Some(mut transform) = camera_transforms.iter_mut().next() {

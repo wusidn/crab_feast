@@ -11,18 +11,14 @@ mod inspector;
 
 use std::collections::HashMap;
 
-use bevy::{
-    input::mouse::MouseScrollUnit,
-    picking::pointer::PointerButton,
-    prelude::*,
-    ui::{OverflowAxis, UiGlobalTransform},
-    ui_widgets::SliderValue,
-};
+use bevy::app::Propagate;
+use bevy::{picking::pointer::PointerButton, prelude::*, ui_widgets::SliderValue};
 
 use crate::{
     GameState,
     anim::core::BlendSpaceDoc,
-    anim::{AnimFocus, AnimSelection, AnimationSet, MixerCache, MixerEdit},
+    anim::{AnimCatalog, AnimFocus, AnimSelection, AnimationSet, MixerCache, MixerEdit},
+    ui::font::{FontFamily, font_scope},
     ui::menu::{
         DRAWER_WIDTH, MenuConfig, MenuEvent, MenuPageBody, MenuPageDef, MenuState, widgets,
     },
@@ -99,18 +95,11 @@ pub struct SpaceEditor {
     pub gesture_travel: f32,
     /// 正在拖动的当前值标记：拖动起点坐标（参数空间）
     pub marker_drag: Option<[f32; 2]>,
-    /// 当前展开的下拉框
-    pub open_dropdown: Option<BlendDropdown>,
 }
 
-/// 混合空间页面里的下拉框种类（同一时间只展开一个）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlendDropdown {
-    /// 混合系统切换
-    Mixer,
-    /// 选中采样点的动画剪辑
-    Clip,
-}
+/// 混合空间页面里的两个下拉框标识（展开状态由 `widgets::OpenDropdown` 统一持有）
+pub const MIXER_DROPDOWN: &str = "blend-space/mixer";
+pub const CLIP_DROPDOWN: &str = "blend-space/clip";
 
 #[derive(Clone)]
 pub struct SampleDrag {
@@ -133,59 +122,47 @@ impl Default for SpaceEditor {
             status: String::new(),
             drag: None,
             gesture_travel: 0.0,
-            open_dropdown: None,
             marker_drag: None,
         }
     }
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct EditorRoot;
-/// 下拉框触发器（种类只用于调试识别，交互由观察者处理）
-#[derive(Component)]
-pub struct BlendDropdownTrigger;
-/// 下拉框浮层
-#[derive(Component)]
-pub struct BlendDropdownPopup(pub BlendDropdown);
-/// 浮层锚点：记住触发器，用来算可展开空间
-#[derive(Component)]
-pub struct DropdownAnchor {
-    pub trigger: Entity,
-}
 /// 菜单「混合空间」页面里的内容根节点
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 struct SpacePageRoot;
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct GridLayer;
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct SampleLayer;
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct SampleDot {
     pub index: usize,
 }
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct ParamMarker;
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct InspectorBody;
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct StatusText;
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct RootMotionLabel;
 /// 需要每帧刷新数值文本的滑杆标签
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct WeightText;
 
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct EnabledLabel;
 
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct ParamValue {
     /// 0/1 = 两个轴，2 = 播放速度
     pub slot: usize,
 }
 
 /// 检查器里的参数滑杆（根节点），slot 语义同 [`ParamValue`]
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct ParamSlider {
     pub slot: usize,
 }
@@ -212,28 +189,6 @@ pub fn px_to_param(delta: Vec2, ranges: [[f32; 2]; 2]) -> [f32; 2] {
     ]
 }
 
-pub fn label(
-    commands: &mut Commands,
-    parent: Entity,
-    font: &Handle<Font>,
-    text: impl Into<String>,
-    size: f32,
-    color: Color,
-) -> Entity {
-    commands
-        .spawn((
-            Text::new(text),
-            TextFont {
-                font: FontSource::from(font.clone()),
-                font_size: FontSize::Px(size),
-                ..default()
-            },
-            TextColor(color),
-            ChildOf(parent),
-        ))
-        .id()
-}
-
 pub struct BlendSpaceEditorPlugin;
 
 impl Plugin for BlendSpaceEditorPlugin {
@@ -247,6 +202,7 @@ impl Plugin for BlendSpaceEditorPlugin {
                     toggle_editor,
                     open_grid_on_page,
                     build_editor_ui,
+                    attach_editor_font_scope,
                     sync_dock_inset,
                     fill_menu_page,
                 )
@@ -268,7 +224,7 @@ impl Plugin for BlendSpaceEditorPlugin {
                     sync_weight_text,
                     sync_enabled_label,
                     switch_mixer_keys,
-                    sync_dropdown,
+                    apply_dropdown_pick,
                     load_editor_state,
                     publish_edit,
                     widgets::update_slider_styling,
@@ -329,7 +285,6 @@ fn open_grid_on_page(
 
 fn build_editor_ui(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
     editor: Res<SpaceEditor>,
     mut force: ResMut<ForceRebuild>,
     roots: Query<Entity, With<EditorRoot>>,
@@ -353,53 +308,57 @@ fn build_editor_ui(
         return;
     }
 
-    let font: Handle<Font> = asset_server.load("fonts/PingFang-SC-Regular.ttf");
     // 新面板里的采样点层是空的，强制下一帧重画
     force.0 = true;
-    // 停靠在屏幕下方：只有 2D 网格本体，其他控件都在菜单页面里
-    let root = commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                bottom: Val::Px(0.0),
-                width: Val::Percent(100.0),
-                height: Val::Px(PANEL_HEIGHT),
-                flex_direction: FlexDirection::Row,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::FlexStart,
-                padding: UiRect {
-                    top: Val::Px(GRID_TOP),
-                    right: Val::Px(0.0),
-                    ..default()
-                },
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            GlobalZIndex(60),
-            EditorRoot,
-        ))
-        .id();
-
-    let area = build_grid_area(&mut commands, root);
-    grid::build_grid(&mut commands, area, &font, &editor);
+    commands.spawn_scene(editor_scene(&editor));
 }
 
-/// 网格区：横向长方形居中
-fn build_grid_area(commands: &mut Commands, parent: Entity) -> Entity {
-    commands
-        .spawn((
+/// 给网格面板定字体作用域：编辑器是独立悬浮层，不在菜单页面里，字体族要自己挂一次。
+///
+/// 轴名、剪辑名都是文档里的参数名（可能是中文），必须走项目自带的字体，不能用引擎默认字体。
+fn attach_editor_font_scope(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    roots: Query<Entity, (With<EditorRoot>, Without<Propagate<FontFamily>>)>,
+) {
+    let Some(root) = roots.iter().next() else {
+        return;
+    };
+    let font: Handle<Font> = asset_server.load("fonts/PingFang-SC-Regular.ttf");
+    commands.entity(root).insert(font_scope(&font));
+}
+
+/// 网格编辑器：停靠在屏幕下方的面板 → 网格区 → 网格（外框 / 网格线 / 采样点 / 参数标记）
+fn editor_scene(editor: &SpaceEditor) -> impl Scene + use<> {
+    bsn! {
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Px(PANEL_HEIGHT),
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::FlexStart,
+            padding: UiRect::top(Val::Px(GRID_TOP)),
+            overflow: Overflow::clip(),
+        }
+        GlobalZIndex(60)
+        EditorRoot
+        Children [
+            // 网格区：横向长方形居中
             Node {
                 flex_grow: 1.0,
                 min_width: Val::Px(0.0),
                 flex_direction: FlexDirection::Row,
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::FlexStart,
-                ..default()
-            },
-            ChildOf(parent),
-        ))
-        .id()
+            }
+            Children [
+                @{grid::grid_scene(editor)}
+            ]
+        ]
+    }
 }
 
 /// 抽屉展开多少，网格就在剩下的左侧空白区域居中
@@ -416,7 +375,6 @@ fn sync_dock_inset(menu: Res<MenuState>, mut roots: Query<&mut Node, With<Editor
 /// 往菜单的「混合空间」页面里填内容：混合系统、参数、采样点管理、工具
 fn fill_menu_page(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
     editor: Res<SpaceEditor>,
     cache: Res<MixerCache>,
     bodies: Query<(Entity, &MenuPageBody)>,
@@ -444,388 +402,174 @@ fn fill_menu_page(
     else {
         return;
     };
-    let font: Handle<Font> = asset_server.load("fonts/PingFang-SC-Regular.ttf");
-    let root = commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                flex_grow: 1.0,
-                min_height: Val::Px(0.0),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(8.0),
-                ..default()
-            },
-            SpacePageRoot,
-            ChildOf(body),
-        ))
-        .id();
-    // 点页面空白处收起下拉框（触发器和选项都 propagate(false)，不会误触发）
-    commands
-        .entity(root)
-        .observe(|click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
-            if click.button == PointerButton::Primary && editor.open_dropdown.is_some() {
-                editor.open_dropdown = None;
-            }
-        });
-    build_page_content(&mut commands, root, &font, &editor, &cache);
+    commands.spawn_scene(page_scene(body, &editor, &cache));
 }
 
-fn build_page_content(
-    commands: &mut Commands,
-    root: Entity,
-    font: &Handle<Font>,
-    editor: &SpaceEditor,
-    cache: &MixerCache,
-) {
-    // 混合系统切换（下拉框）
-    label(commands, root, font, "混合系统", 12.0, MUTED_TEXT);
+/// 整页结构：混合系统 → 参数 → 采样点 → 工具行 → 操作提示
+fn page_scene(body: Entity, editor: &SpaceEditor, cache: &MixerCache) -> impl Scene + use<> {
     let titles = cache
         .mixers
         .iter()
         .map(|mixer| mixer.title.clone())
         .collect::<Vec<_>>();
     let selected = editor.mixer.min(titles.len().saturating_sub(1));
-    let parts = spawn_dropdown(
-        commands,
-        root,
-        font,
-        BlendDropdown::Mixer,
-        &titles,
-        selected,
-    );
-    for (index, item) in parts.items.into_iter().enumerate() {
-        let key = cache
-            .mixers
-            .get(index)
-            .map(|mixer| mixer.key.clone())
-            .unwrap_or_default();
-        commands.entity(item).observe(
-            move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
-                if click.button != PointerButton::Primary {
-                    return;
-                }
-                click.propagate(false);
-                editor.open_dropdown = None;
-                if editor.loaded_key.as_deref() != Some(key.as_str()) {
-                    editor.mixer = index;
-                    editor.loaded_key = None;
-                    editor.status = format!("切换到混合系统：{}", key);
-                    editor.revision = editor.revision.wrapping_add(1);
-                }
-            },
-        );
-    }
+    let status = editor.status.clone();
 
-    let status = label(
-        commands,
-        root,
-        font,
-        editor.status.clone(),
-        11.0,
-        MUTED_TEXT,
-    );
-    commands.entity(status).insert(StatusText);
-
-    // 参数
-    label(commands, root, font, "参数", 12.0, MUTED_TEXT);
-    let params = commands
-        .spawn((
+    bsn! {
+        Node {
+            width: Val::Percent(100.0),
+            flex_grow: 1.0,
+            min_height: Val::Px(0.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+        }
+        SpacePageRoot
+        ChildOf(body)
+        // 点页面空白处收起下拉框（触发器和选项都 propagate(false)，不会误触发）
+        on(|click: On<PointerClick>, mut open: ResMut<widgets::OpenDropdown>| {
+            if click.button == PointerButton::Primary {
+                open.0 = None;
+            }
+        })
+        Children [
+            @{widgets::text("混合系统", 12.0, MUTED_TEXT)}
+            --
+            @{widgets::dropdown(MIXER_DROPDOWN, &titles, selected)}
+            --
+            Text::new(status)
+            TextFont { font_size: FontSize::Px(11.0) }
+            TextColor(MUTED_TEXT)
+            StatusText
+            --
+            @{widgets::text("参数", 12.0, MUTED_TEXT)}
+            --
+            @{inspector::params_scene(editor, cache)}
+            --
+            @{widgets::text("采样点", 12.0, MUTED_TEXT)}
+            --
+            // 采样点列表由 inspector 反复重建，这里只留一个空容器
             Node {
                 width: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
-                ..default()
-            },
-            ChildOf(root),
-        ))
-        .id();
-    inspector::build_params(commands, params, font, editor, cache);
+            }
+            InspectorBody
+            --
+            @{tools_row()}
+            --
+            @{widgets::text(
+                "拖采样点会吸附到网格刻度点，按住 Shift 自由放置 · 白色标记是当前参数值 · \
+                 F3 显示 / 隐藏下方网格",
+                10.0,
+                MUTED_TEXT,
+            )}
+        ]
+    }
+}
 
-    // 采样点：列表 + 当前位置添加 + 当前权重
-    label(commands, root, font, "采样点", 12.0, MUTED_TEXT);
-    commands.spawn((
+/// 工具行：保存、载入、根运动开关、隐藏网格
+fn tools_row() -> impl Scene + use<> {
+    bsn! {
         Node {
             width: Val::Percent(100.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(4.0),
-            ..default()
-        },
-        InspectorBody,
-        ChildOf(root),
-    ));
-
-    // 工具行
-    let tools = commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                flex_wrap: FlexWrap::Wrap,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(6.0),
-                row_gap: Val::Px(6.0),
-                ..default()
-            },
-            ChildOf(root),
-        ))
-        .id();
-
-    toolbar_button(commands, tools, font, "保存", |editor| {
-        inspector::save_space(editor);
-    });
-    toolbar_button(commands, tools, font, "载入", |editor| {
-        inspector::load_space(editor);
-    });
-
-    let root_button = commands
-        .spawn((
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(6.0),
+            row_gap: Val::Px(6.0),
+        }
+        Children [
+            @{widgets::button("保存")}
+            on(|mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+                if click.button != PointerButton::Primary {
+                    return;
+                }
+                click.propagate(false);
+                inspector::save_space(&mut editor);
+                editor.revision = editor.revision.wrapping_add(1);
+            })
+            --
+            @{widgets::button("载入")}
+            on(|mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+                if click.button != PointerButton::Primary {
+                    return;
+                }
+                click.propagate(false);
+                inspector::load_space(&mut editor);
+                editor.revision = editor.revision.wrapping_add(1);
+            })
+            --
             Node {
                 padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
                 border: UiRect::all(Val::Px(1.0)),
                 border_radius: BorderRadius::all(Val::Px(5.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.14, 0.16, 0.22)),
-            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.14)),
-            ChildOf(tools),
-        ))
-        .id();
-    let root_text = label(commands, root_button, font, "根运动：关", 11.0, TEXT_COLOR);
-    commands.entity(root_text).insert(RootMotionLabel);
-    commands.entity(root_button).observe(
-        move |click: On<PointerClick>, mut selection: ResMut<AnimSelection>| {
-            if click.button != PointerButton::Primary {
-                return;
             }
-            selection.root_motion = !selection.root_motion;
-        },
-    );
-
-    toolbar_button(commands, tools, font, "隐藏网格", |editor| {
-        editor.open = false;
-    });
-
-    label(
-        commands,
-        root,
-        font,
-        "拖采样点会吸附到网格刻度点，按住 Shift 自由放置 · 白色标记是当前参数值 · F3 显示 / 隐藏下方网格",
-        10.0,
-        MUTED_TEXT,
-    );
-}
-
-fn toolbar_button(
-    commands: &mut Commands,
-    parent: Entity,
-    font: &Handle<Font>,
-    text: &str,
-    action: impl Fn(&mut SpaceEditor) + Send + Sync + 'static,
-) {
-    let button = widgets::button(commands, parent, Some(font), text.to_string());
-    commands.entity(button).observe(
-        move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
-            if click.button != PointerButton::Primary {
-                return;
-            }
-            click.propagate(false);
-            action(&mut editor);
-            editor.revision = editor.revision.wrapping_add(1);
-        },
-    );
-}
-
-/// 生成下拉框：通用外观交给 menu::widgets，这里挂上展开/收起所需的标记
-fn spawn_dropdown(
-    commands: &mut Commands,
-    parent: Entity,
-    font: &Handle<Font>,
-    kind: BlendDropdown,
-    labels: &[String],
-    selected: usize,
-) -> widgets::DropdownParts {
-    let parts = widgets::dropdown(commands, parent, Some(font), labels, selected);
-    // 浮层改成自己可滚：内容长的时候在浮层里滚，而不是被外层面板吞掉滚轮
-    commands.entity(parts.popup).insert((
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Percent(100.0),
-            left: Val::Px(0.0),
-            right: Val::Px(0.0),
-            margin: UiRect::top(Val::Px(4.0)),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(2.0),
-            padding: UiRect::all(Val::Px(4.0)),
-            border: UiRect::all(Val::Px(1.0)),
-            border_radius: BorderRadius::all(Val::Px(8.0)),
-            max_height: Val::Px(280.0),
-            overflow: Overflow::scroll_y(),
-            display: Display::None,
-            ..default()
-        },
-        ScrollPosition::DEFAULT,
-        DropdownAnchor {
-            trigger: parts.trigger,
-        },
-    ));
-
-    // 浮层自己的滚轮：拦在浮层上，避免继续冒泡去滚面板
-    let popup = parts.popup;
-    commands.entity(popup).observe(
-        move |mut scroll: On<PointerScroll>,
-              mut positions: Query<&mut ScrollPosition>,
-              nodes: Query<&ComputedNode>| {
-            scroll.propagate(false);
-            let pixels = match scroll.unit {
-                MouseScrollUnit::Line => scroll.y * 40.0,
-                MouseScrollUnit::Pixel => scroll.y,
-            }
-            .clamp(-320.0, 320.0);
-            let (Ok(mut position), Ok(computed)) = (positions.get_mut(popup), nodes.get(popup))
-            else {
-                return;
-            };
-            let max = (computed.content_size().y - computed.size().y).max(0.0)
-                * computed.inverse_scale_factor();
-            position.0.y = (position.0.y - pixels).clamp(0.0, max);
-        },
-    );
-
-    commands
-        .entity(parts.trigger)
-        .insert(BlendDropdownTrigger)
-        .observe(
-            move |mut click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+            BackgroundColor(Color::srgb(0.14, 0.16, 0.22))
+            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.14))
+            on(|click: On<PointerClick>, mut selection: ResMut<AnimSelection>| {
                 if click.button != PointerButton::Primary {
                     return;
                 }
-                // 阻断冒泡，否则页面根节点的“点空白收起”会立刻把它关掉
-                click.propagate(false);
-                editor.open_dropdown = if editor.open_dropdown == Some(kind) {
-                    None
-                } else {
-                    Some(kind)
-                };
-            },
-        );
-    commands
-        .entity(parts.popup)
-        .insert(BlendDropdownPopup(kind));
-    parts
+                selection.root_motion = !selection.root_motion;
+            })
+            Children [
+                Text::new("根运动：关")
+                TextFont { font_size: FontSize::Px(11.0) }
+                TextColor(TEXT_COLOR)
+                RootMotionLabel
+            ]
+            --
+            @{widgets::button("隐藏网格")}
+            on(|click: On<PointerClick>, mut editor: ResMut<SpaceEditor>| {
+                if click.button != PointerButton::Primary {
+                    return;
+                }
+                editor.open = false;
+            })
+        ]
+    }
 }
 
-/// 按 `open_dropdown` 显隐浮层
-// 两组查询的形状写成别名 Bevy 会推不出 SystemParam，只能就地写全。
-#[expect(clippy::type_complexity)]
-fn sync_dropdown(
-    editor: Res<SpaceEditor>,
-    mut popups: Query<(
-        &BlendDropdownPopup,
-        &DropdownAnchor,
-        &mut Node,
-        &mut ScrollPosition,
-    )>,
-    mut ui: ParamSet<(
-        Query<(&ComputedNode, &UiGlobalTransform)>,
-        Query<(&Node, Option<&ChildOf>), Without<BlendDropdownPopup>>,
-    )>,
+/// 下拉框选中结果：混合系统切换 / 采样点剪辑替换
+fn apply_dropdown_pick(
+    mut picked: MessageReader<widgets::DropdownPicked>,
+    cache: Res<MixerCache>,
+    catalog: Res<AnimCatalog>,
+    selection: Res<AnimSelection>,
+    mut editor: ResMut<SpaceEditor>,
 ) {
-    // 收起状态只保证浮层隐藏，不做几何测量（每帧走父链 + 取 rect 是白花）
-    let Some(open_kind) = editor.open_dropdown else {
-        for (_popup, _anchor, mut node, mut scroll) in &mut popups {
-            if node.display != Display::None {
-                node.display = Display::None;
-                scroll.0 = Vec2::ZERO;
-            }
-        }
-        return;
-    };
-
-    for (popup, anchor, mut node, mut scroll) in &mut popups {
-        if popup.0 != open_kind {
-            if node.display != Display::None {
-                node.display = Display::None;
-            }
-            continue;
-        }
-        if node.display != Display::Flex {
-            scroll.0 = Vec2::ZERO;
-            node.display = Display::Flex;
-        }
-        // 触发器的上下边界（UI 逻辑像素，原点左上）
-        let trigger_rect = {
-            let nodes = ui.p0();
-            nodes.get(anchor.trigger).ok().map(|(computed, transform)| {
-                let height = computed.size().y * computed.inverse_scale_factor();
-                let center = transform.translation.y;
-                (center - height * 0.5, center + height * 0.5)
-            })
-        };
-        let Some((trigger_top, trigger_bottom)) = trigger_rect else {
-            continue;
-        };
-
-        // 沿父链找第一个会裁剪后代的祖先（面板 body 的滚动区 / clip 容器）
-        let host = {
-            let nodes = ui.p1();
-            let mut current = anchor.trigger;
-            let mut found = None;
-            while let Ok((_style, child_of)) = nodes.get(current) {
-                let Some(parent) = child_of.map(|child_of| child_of.parent()) else {
-                    break;
+    for pick in picked.read() {
+        match pick.id {
+            MIXER_DROPDOWN => {
+                let Some(mixer) = cache.mixers.get(pick.index) else {
+                    continue;
                 };
-                current = parent;
-                if let Ok((parent_style, _)) = nodes.get(parent)
-                    && parent_style.overflow.y != OverflowAxis::Visible
-                {
-                    found = Some(parent);
-                    break;
+                let key = mixer.key.clone();
+                if editor.loaded_key.as_deref() != Some(key.as_str()) {
+                    editor.mixer = pick.index;
+                    editor.loaded_key = None;
+                    editor.status = format!("切换到混合系统：{key}");
+                    editor.revision = editor.revision.wrapping_add(1);
                 }
             }
-            found
-        };
-        let host_rect = {
-            let nodes = ui.p0();
-            host.and_then(|host| {
-                nodes.get(host).ok().map(|(computed, transform)| {
-                    let height = computed.size().y * computed.inverse_scale_factor();
-                    let center = transform.translation.y;
-                    (center - height * 0.5, center + height * 0.5)
-                })
-            })
-        };
-        let Some((host_top, host_bottom)) = host_rect else {
-            continue;
-        };
-
-        let space_up = (trigger_top - host_top - 6.0).max(0.0);
-        let space_down = (host_bottom - trigger_bottom - 6.0).max(0.0);
-        let upward = space_up > space_down;
-        let available = if upward { space_up } else { space_down };
-        // 高度按 8px 取整，避免每帧微调布局
-        let max_height = Val::Px(((available.min(300.0)) / 8.0).floor().max(2.0) * 8.0);
-
-        let want_top = if upward {
-            Val::Auto
-        } else {
-            Val::Percent(100.0)
-        };
-        let want_bottom = if upward {
-            Val::Percent(100.0)
-        } else {
-            Val::Auto
-        };
-        if node.top != want_top || node.bottom != want_bottom {
-            node.top = want_top;
-            node.bottom = want_bottom;
-            node.margin = if upward {
-                UiRect::bottom(Val::Px(4.0))
-            } else {
-                UiRect::top(Val::Px(4.0))
-            };
-        }
-        if node.max_height != max_height {
-            node.max_height = max_height;
+            CLIP_DROPDOWN => {
+                let Some(index) = editor.selected else {
+                    continue;
+                };
+                let clips = catalog
+                    .character(selection.character)
+                    .map(|def| def.clips.clone())
+                    .unwrap_or_default();
+                let Some(clip) = clips.get(pick.index).cloned() else {
+                    continue;
+                };
+                if let Some(sample) = editor.doc.samples.get_mut(index) {
+                    sample.clip = clip.clone();
+                }
+                editor.revision = editor.revision.wrapping_add(1);
+                editor.status = format!("采样点 #{index} → {clip}");
+            }
+            _ => {}
         }
     }
 }

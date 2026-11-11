@@ -11,6 +11,7 @@ use bevy::{
 };
 
 use super::widgets;
+use crate::ui::font::font_scope;
 
 /// 页面标识。`None` 表示根页面。
 pub type PageId = &'static str;
@@ -93,7 +94,7 @@ impl Default for MenuConfig {
     fn default() -> Self {
         Self {
             root_title: "功能菜单",
-            font_path: None,
+            font_path: Some("fonts/PingFang-SC-Regular.ttf"),
             toggle_keys: vec![KeyCode::F2, KeyCode::Backquote],
             pages: Vec::new(),
         }
@@ -450,8 +451,18 @@ fn spawn_page(
         })
         .id();
 
+    // 页眉是字体作用域：子文本从这里继承字体族，字号各自写
+    if let Some(font_handle) = font {
+        commands.entity(header).insert(font_scope(font_handle));
+    }
+
     // 返回按钮：根页面时等同于关闭抽屉
-    let back = widgets::icon_button(commands, header, font, "‹".to_string(), 18.0);
+    let back = commands
+        .spawn_scene(bsn! {
+            @{widgets::icon_button("‹", 18.0)}
+            ChildOf(header)
+        })
+        .id();
 
     commands.entity(back).observe(
         |mut click: On<PointerClick>,
@@ -467,14 +478,10 @@ fn spawn_page(
         },
     );
 
-    widgets::text(
-        commands,
-        header,
-        font,
-        title.to_string(),
-        16.0,
-        widgets::TEXT_COLOR,
-    );
+    commands.spawn_scene(bsn! {
+        @{widgets::text(title, 16.0, widgets::TEXT_COLOR)}
+        ChildOf(header)
+    });
 
     // 内容区：自动放子页面入口，应用可以继续往里挂控件；内容超出时纵向滚动
     let body = commands
@@ -492,6 +499,11 @@ fn spawn_page(
             ChildOf(page_entity)
         })
         .id();
+
+    // 内容区同样是字体作用域：应用往 [`MenuPageBody`] 里挂的控件全部继承这个字体族
+    if let Some(font_handle) = font {
+        commands.entity(body).insert(font_scope(font_handle));
+    }
     commands.entity(body).insert(ScrollPosition::DEFAULT);
 
     // 滚轮事件冒泡到内容区时，改 ScrollPosition；越界由布局系统自动夹紧
@@ -517,17 +529,12 @@ fn spawn_page(
     );
 
     for child in config.pages.iter().filter(|def| def.parent == page) {
-        spawn_menu_item(commands, body, child, font);
+        spawn_menu_item(commands, body, child);
     }
 }
 
 /// 页面里的一行入口
-fn spawn_menu_item(
-    commands: &mut Commands,
-    body: Entity,
-    page: &MenuPageDef,
-    font: Option<&Handle<Font>>,
-) {
+fn spawn_menu_item(commands: &mut Commands, body: Entity, page: &MenuPageDef) {
     let target = page.id;
     let item_title = page.title;
     let item_description = page.description;
@@ -561,42 +568,23 @@ fn spawn_menu_item(
         )
         .id();
 
-    let texts = commands
-        .spawn_scene(bsn! {
-            Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(3.0),
-            }
-            ChildOf(row)
-        })
-        .id();
+    commands.spawn_scene(bsn! {
+        Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(3.0),
+        }
+        ChildOf(row)
+        Children [
+            @{widgets::text(item_title, 14.0, widgets::TEXT_COLOR)}
+            --
+            @{widgets::text(item_description, 11.0, widgets::LABEL_COLOR)}
+        ]
+    });
 
-    widgets::text(
-        commands,
-        texts,
-        font,
-        item_title.to_string(),
-        14.0,
-        widgets::TEXT_COLOR,
-    );
-
-    widgets::text(
-        commands,
-        texts,
-        font,
-        item_description.to_string(),
-        11.0,
-        widgets::LABEL_COLOR,
-    );
-
-    widgets::text(
-        commands,
-        row,
-        font,
-        "›".to_string(),
-        16.0,
-        widgets::LABEL_COLOR,
-    );
+    commands.spawn_scene(bsn! {
+        @{widgets::text("›", 16.0, widgets::LABEL_COLOR)}
+        ChildOf(row)
+    });
 }
 
 fn cleanup_menu(mut commands: Commands, roots: Query<Entity, With<MenuRoot>>) {
