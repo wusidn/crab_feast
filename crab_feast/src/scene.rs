@@ -65,6 +65,14 @@ impl ScenePlugin {
             }
             Transform::from_xyz(4.0, 8.0, 4.0)
             --
+            // 全局光照：从右上方照下来，比 Bevy 默认的日光（10_000 lux）暗一级
+            DirectionalLight {
+                color: Color::WHITE,
+                illuminance: 300.0,
+                shadow_maps_enabled: true,
+            }
+            Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_4))
+            --
             @ground(ground_size, ground_height, checker_material)
         });
 

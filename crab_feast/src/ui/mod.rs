@@ -1,6 +1,7 @@
 use bevy::app::{App, Plugin};
 
 mod blendspace;
+mod debug;
 mod font;
 mod input_layer;
 mod loading;
@@ -18,6 +19,7 @@ impl Plugin for UiPlugin {
             .add_plugins(menu::GameMenuPlugin)
             .add_plugins(preview::AnimationPreviewPlugin)
             .add_plugins(movement::MovementSettingsPlugin)
-            .add_plugins(blendspace::BlendSpaceEditorPlugin);
+            .add_plugins(blendspace::BlendSpaceEditorPlugin)
+            .add_plugins(debug::DebugSettingsPlugin);
     }
 }

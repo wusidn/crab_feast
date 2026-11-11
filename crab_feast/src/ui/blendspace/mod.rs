@@ -266,19 +266,29 @@ fn register_menu_page(mut config: ResMut<MenuConfig>) {
     ));
 }
 
-/// 进入混合空间页面时点亮底部的 2D 网格
+/// 进入混合空间页面时点亮底部的 2D 网格；离开页面或收起菜单时关掉它，避免遮挡游戏画面。
 fn open_grid_on_page(
     mut commands: Commands,
     mut events: MessageReader<MenuEvent>,
     mut editor: ResMut<SpaceEditor>,
 ) {
     for event in events.read() {
-        let MenuEvent::PageChanged { to: Some(page), .. } = event else {
-            continue;
-        };
-        if *page == BLEND_SPACE_PAGE && !editor.open {
-            editor.open = true;
-            commands.insert_resource(ForceRebuild(true));
+        match event {
+            // 进页面看 `to`：只在切到混合空间页时开，其他任何去向都关
+            MenuEvent::PageChanged { to, .. } => {
+                let on_page = *to == Some(BLEND_SPACE_PAGE);
+                if on_page && !editor.open {
+                    editor.open = true;
+                    commands.insert_resource(ForceRebuild(true));
+                } else if !on_page && editor.open {
+                    editor.open = false;
+                }
+            }
+            // 菜单收起（含在根页面按返回）：关掉网格
+            MenuEvent::Closed => {
+                editor.open = false;
+            }
+            _ => {}
         }
     }
 }
