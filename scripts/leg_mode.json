@@ -1,0 +1,134 @@
+{
+  "Amy": {
+    "mode": "skip",
+    "rebase": {
+      "delta_cm": 8.94,
+      "ratio": 0.129
+    },
+    "skip": {
+      "delta_cm": 6.06,
+      "ratio": 0.087
+    }
+  },
+  "Big Vegas": {
+    "mode": "rebase",
+    "rebase": {
+      "delta_cm": 5.82,
+      "ratio": 0.06
+    },
+    "skip": {
+      "delta_cm": 6.86,
+      "ratio": 0.071
+    }
+  },
+  "Castle Guard 02": {
+    "mode": "rebase",
+    "rebase": {
+      "delta_cm": 7.19,
+      "ratio": 0.072
+    },
+    "skip": {
+      "delta_cm": 8.11,
+      "ratio": 0.081
+    }
+  },
+  "Megan": {
+    "mode": "skip",
+    "rebase": {
+      "delta_cm": 21.47,
+      "ratio": 0.224
+    },
+    "skip": {
+      "delta_cm": 8.52,
+      "ratio": 0.089
+    }
+  },
+  "Ortiz": {
+    "mode": "skip",
+    "rebase": {
+      "delta_cm": 11.54,
+      "ratio": 0.149
+    },
+    "skip": {
+      "delta_cm": 6.66,
+      "ratio": 0.086
+    }
+  },
+  "Paladin WProp J Nordstrom": {
+    "mode": "rebase",
+    "rebase": {
+      "delta_cm": 7.93,
+      "ratio": 0.083
+    },
+    "skip": {
+      "delta_cm": 8.34,
+      "ratio": 0.087
+    }
+  },
+  "Pete": {
+    "mode": "skip",
+    "rebase": {
+      "delta_cm": 19.43,
+      "ratio": 0.209
+    },
+    "skip": {
+      "delta_cm": 8.36,
+      "ratio": 0.09
+    }
+  },
+  "Pumpkinhulk L Shaw": {
+    "mode": "rebase",
+    "rebase": {
+      "delta_cm": 6.42,
+      "ratio": 0.063
+    },
+    "skip": {
+      "delta_cm": 7.97,
+      "ratio": 0.079
+    }
+  },
+  "Steve": {
+    "mode": "skip",
+    "rebase": {
+      "delta_cm": 20.44,
+      "ratio": 0.211
+    },
+    "skip": {
+      "delta_cm": 8.59,
+      "ratio": 0.089
+    }
+  },
+  "Swat": {
+    "mode": "rebase",
+    "rebase": {
+      "delta_cm": 8.44,
+      "ratio": 0.088
+    },
+    "skip": {
+      "delta_cm": 8.58,
+      "ratio": 0.089
+    }
+  },
+  "X Bot": {
+    "mode": "rebase",
+    "rebase": {
+      "delta_cm": 9.22,
+      "ratio": 0.088
+    },
+    "skip": {
+      "delta_cm": 9.42,
+      "ratio": 0.09
+    }
+  },
+  "Y Bot": {
+    "mode": "rebase",
+    "rebase": {
+      "delta_cm": 8.77,
+      "ratio": 0.091
+    },
+    "skip": {
+      "delta_cm": 8.77,
+      "ratio": 0.091
+    }
+  }
+}

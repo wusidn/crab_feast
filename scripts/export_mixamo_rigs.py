@@ -116,8 +116,10 @@ def parse_args() -> argparse.Namespace:
                         "可用后面的细项覆盖")
     p.add_argument("--tex-quality", type=int, default=None, metavar="N",
                    help="贴图 JPEG 质量 1-100（默认 75；0 表示不做贴图压缩）")
-    p.add_argument("--tex-format", choices=("auto", "jpeg"), default=None,
-                   help="贴图格式：auto=保留原格式，jpeg=统一转 JPEG（默认 auto）")
+    p.add_argument("--tex-format", choices=("auto", "png", "jpeg"), default=None,
+                   help="贴图格式：png=统一转 PNG（默认，bevy_gltf 0.20.1 没开 jpeg feature，"
+                        "GLB 里出现 image/jpeg 会直接加载失败），auto=保留原格式，"
+                        "jpeg=统一转 JPEG（只有引擎侧另行开了 jpeg 才用）")
     p.add_argument("--tex-max-size", type=int, default=None, metavar="PX",
                    help="贴图最长边上限，超过则等比缩小（0/不填=不缩放）")
     p.add_argument("--tex-alpha", choices=("keep", "jpeg"), default=None,
@@ -229,14 +231,14 @@ def resolve_compress_args(args) -> None:
         if args.tex_max_size is None:
             args.tex_max_size = 2048
         if args.tex_format is None:
-            args.tex_format = "jpeg"
+            args.tex_format = "png"
 
     if args.tex_quality is None:
         args.tex_quality = 0
     if args.tex_max_size is None:
         args.tex_max_size = 0
     if args.tex_format is None:
-        args.tex_format = "auto"
+        args.tex_format = "png"
     if args.tex_alpha is None:
         args.tex_alpha = "keep"
     if args.tex_normal is None:
@@ -330,7 +332,10 @@ def optimize_textures(args) -> dict:
     """按参数重写贴图文件（转格式 / 降分辨率），并让材质指向新文件。"""
     stats = {"total": 0, "resized": 0, "converted": 0,
              "kb_before": 0.0, "kb_after": 0.0, "alpha_kept": 0}
-    if args.tex_quality <= 0 and args.tex_max_size <= 0:
+    # 即使没开压缩参数，只要贴图格式不是 PNG 也要走一遍：GLB 里带 image/jpeg 时
+    # bevy_gltf 会直接报 "invalid image mime type: image/jpeg"（该 feature 没开）。
+    if (args.tex_quality <= 0 and args.tex_max_size <= 0
+            and args.tex_format != "png"):
         return stats
 
     import tempfile
@@ -351,15 +356,15 @@ def optimize_textures(args) -> dict:
         keep_alpha = args.tex_alpha == "keep" and image_uses_alpha(img)
         is_normal = image_is_normal_map(img)
 
-        # 默认「保留」= 只缩分辨率、不动格式，避免把本来就小的 JPEG 转成 PNG 反而变大
-        if (keep_alpha or (is_normal and args.tex_normal == "keep")):
-            target = src_fmt
-            if keep_alpha:
-                stats["alpha_kept"] += 1
-        elif args.tex_format == "jpeg" or is_normal:
+        # 默认统一 PNG：Bevy 侧的 glTF 加载器只认它能解码的 mime，
+        # 源里有 JPEG（Mixamo 的 _diffuse/_normal）就必须在这里转掉。
+        if keep_alpha:
+            target = "PNG"
+            stats["alpha_kept"] += 1
+        elif args.tex_format == "jpeg" or (is_normal and args.tex_normal == "jpeg"):
             target = "JPEG"
         else:
-            target = src_fmt
+            target = "PNG"
 
         resized = False
         new_w, new_h = width, height

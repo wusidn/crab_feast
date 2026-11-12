@@ -36,7 +36,7 @@ Python 侧参数（需放在 -- 之后，或直接跟在上面这些选项后面
   --list           只列出待处理文件
 
 压缩相关：
-  --compress       预设：贴图转 JPEG(quality=80) + 贴图最长边 2048
+  --compress       预设：贴图最长边压到 2048（格式仍为 PNG，bevy_gltf 不认 JPEG）
   --tex-quality N  贴图 JPEG 质量 1-100（0=不压贴图）
   --tex-format M   auto|jpeg（auto=保留原格式）
   --tex-max-size N 贴图最长边上限（超过则等比缩小）
