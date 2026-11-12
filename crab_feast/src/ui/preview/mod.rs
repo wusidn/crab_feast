@@ -116,9 +116,36 @@ fn fill_menu_page(
 ///
 /// 不开这个口子，默认启用的移动混合会每帧覆写整具骨架，选哪条剪辑都看不出来；
 /// 混合空间本身仍在求值（见 `anim::driver::drive_pose`），所以权重与地速不会断档。
-fn own_skeleton_for_preview(menu: Res<MenuState>, mut focus: ResMut<AnimFocus>) {
-    let on_page = menu.open && menu.current() == Some(ANIMATION_PREVIEW_PAGE);
-    focus.set_preview(on_page);
+///
+/// 预览页就是「真的把游戏里的角色换成试看的那个」：下拉框写的是全局
+/// [`AnimSelection`]，模型、剪辑表、骨架、FootIk 尺寸全部跟着这一份选择走。
+/// 离页不还原 —— 还原会让模型和动画分成两个来源（模型是自己的、剪辑还是试看那个的），
+/// 那种错位比「留在试看角色上」难看得多。
+fn own_skeleton_for_preview(
+    menu: Res<MenuState>,
+    catalog: Res<AnimCatalog>,
+    mut focus: ResMut<AnimFocus>,
+    selection: Res<AnimSelection>,
+    mut on_page: Local<bool>,
+) {
+    let now_on_page = menu.open && menu.current() == Some(ANIMATION_PREVIEW_PAGE);
+    focus.set_preview(now_on_page);
+    if now_on_page == *on_page {
+        return;
+    }
+    *on_page = now_on_page;
+    if now_on_page {
+        return;
+    }
+    // 离页只记一笔「现在游戏里是谁」，方便看日志对账
+    let name = catalog
+        .character(selection.character)
+        .map(|def| def.name.as_str())
+        .unwrap_or("?");
+    info!(
+        "离开动画预览页：角色留在 {name}（#{}）、剪辑 #{}（模型与动画同一来源）",
+        selection.character, selection.clip
+    );
 }
 
 fn reset_dropdown_on_menu_event(

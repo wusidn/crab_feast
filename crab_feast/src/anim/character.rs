@@ -140,6 +140,12 @@ pub struct AnimRuntime {
     offset: Vec3,
     /// 当前角色对应的动画节点
     nodes: Vec<AnimationNodeIndex>,
+    /// `clips`（名字 → 句柄）当前属于哪个角色。
+    ///
+    /// 单看 `spawned_character` 不够：模型和剪辑是两次写进来的，一旦某次请求被
+    /// `up_to_date` 提前挡掉，就会出现「模型是 A、剪辑表还是 B」并且永远不再刷新
+    /// 的死状态 —— 表现正是「换回自己的角色，动作却还是上一个角色的」
+    clips_for: Option<usize>,
     /// 预加载中的角色
     pending_character: Option<usize>,
     pending_rig: Option<Handle<WorldAsset>>,
@@ -323,10 +329,11 @@ pub(crate) fn sync_clip_set(
     if clips.rig.as_deref() == Some(key.as_str()) {
         return;
     }
-    clips.rebuild(key);
+    clips.rebuild(key.clone());
     for (clip, handle) in &runtime.clips {
         clips.insert(clip.clone(), handle.clone());
     }
+    info!("剪辑集合重建：{name}，{} 条", runtime.clips.len());
 
     let Some(def) = character else { return };
 
@@ -403,8 +410,9 @@ fn request_character(
         .iter()
         .position(|candidate| candidate.name == def.name)
         .unwrap_or(0);
-    let up_to_date =
-        runtime.spawned_character == Some(index) && runtime.pending_character.is_none();
+    let up_to_date = runtime.spawned_character == Some(index)
+        && runtime.pending_character.is_none()
+        && runtime.clips_for == Some(index);
     let already_requested = runtime.pending_character == Some(index);
     if up_to_date || already_requested {
         return;
@@ -438,13 +446,18 @@ fn request_character(
             asset_server.load(format!("{}/{}.glb#Animation0", def.animations, clip)),
         );
     }
+    runtime.clips_for = Some(index);
+    info!("剪辑表刷新：{}（#{index}），{} 条", def.name, runtime.clips.len());
 }
 
 /// 资源加载完成后换模型：旧角色会一直播放到换上的这一帧
 fn apply_character_when_loaded(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    catalog: Res<AnimCatalog>,
     mut runtime: ResMut<AnimRuntime>,
+    mut clips: ResMut<ClipSet>,
+    mut driver: ResMut<PoseDriver>,
     avatars: Query<Entity, With<Avatar>>,
 ) {
     let Some(index) = runtime.pending_character else {
@@ -471,7 +484,7 @@ fn apply_character_when_loaded(
     let Some(rig) = runtime.pending_rig.take() else {
         return;
     };
-    let clips = std::mem::take(&mut runtime.pending_clips);
+    let clips_for_graph = std::mem::take(&mut runtime.pending_clips);
     runtime.pending_character = None;
 
     if let Some(old) = runtime.model.take() {
@@ -487,10 +500,23 @@ fn apply_character_when_loaded(
         ))
         .id();
 
+    // 换角色是全局状态切换点：动画侧缓存一律硬失效，别指望「指纹刚好不同」或
+    // change detection 的时序把旧数据换掉。漏掉任何一处，退出预览 / 切回原角色后
+    // 就会出现「模型是 A、动作还是 B」的错位
+    clips.rebuild("");
+    driver.skeleton = None;
+    driver.phases.clear();
+
+    let name = catalog
+        .character(index)
+        .map(|def| def.name.as_str())
+        .unwrap_or("?");
+    info!("换角色：{name}（#{index}）→ 新模型实体 {model:?}");
+
     runtime.model = Some(model);
     runtime.player = None;
     runtime.spawned_character = Some(index);
-    runtime.pending_clips_for_graph = clips;
+    runtime.pending_clips_for_graph = clips_for_graph;
     runtime.playing_animation = None;
     runtime.nodes.clear();
     runtime.awaiting_scene = true;
@@ -500,6 +526,7 @@ fn apply_character_when_loaded(
 /// 场景异步载入完成后，为角色重建动画图并播放当前剪辑
 fn finish_model_setup(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     selection: Res<AnimSelection>,
     mut runtime: ResMut<AnimRuntime>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
@@ -519,12 +546,21 @@ fn finish_model_setup(
     };
 
     let clips = std::mem::take(&mut runtime.pending_clips_for_graph);
+    // 剪辑路径打在日志里：换角色出问题时，「模型是 A、动作是 B」一眼就能看出来
+    let sample = clips
+        .first()
+        .and_then(|clip| asset_server.get_path(clip.id()))
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| "-".to_string());
     let (graph, nodes) = AnimationGraph::from_clips(clips);
     if nodes.is_empty() {
-        warn!("动画剪辑为空，无法为角色建立动画图");
+        // 空图绝不能就此收工：模型会永远停在绑定姿态。把角色请求打回重来一遍
+        warn!("动画剪辑为空，重新请求角色（{sample}）");
         runtime.awaiting_scene = false;
+        runtime.spawned_character = None;
         return;
     }
+    info!("动画图就绪：{} 个节点，样例剪辑 {sample}", nodes.len());
     let graph_handle = graphs.add(graph);
 
     let Ok(mut player) = players.get_mut(player_entity) else {
@@ -748,10 +784,12 @@ fn apply_root_motion(
 
     if let Ok(mut model_transform) = transforms.get_mut(model) {
         model_transform.translation = MODEL_BASE + offset;
-        // 同步 Avatar 的旋转到模型根节点，确保动画系统驱动的朝向与物理层一致
-        if let Ok(avatar_global) = globals.get(avatars.single().ok().unwrap_or(model)) {
-            model_transform.rotation = avatar_global.rotation();
-        }
+        // 模型是 Avatar 的子节点，朝向由 Avatar 的 `Transform` 承担（见 `input.rs`
+        // 的转向系统），这里的**局部**旋转必须是单位：写一次 Avatar 的 world 旋转
+        // 就变成转两倍。之前这条只在混合空间没驱动时（预览）才跑，预览里留下的
+        // 这份「双倍偏航」在退出后不会自动清掉 —— 表现就是人往一个方向走、模型
+        // 和动作朝另一个方向
+        model_transform.rotation = Quat::IDENTITY;
     }
 }
 

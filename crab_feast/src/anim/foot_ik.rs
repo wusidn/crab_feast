@@ -38,13 +38,20 @@ pub struct FootIkPlugin;
 
 /// 全局参数。逐帧读取，所以改这里的值当帧生效；联机时每个角色可以再各自
 /// 用 [`FootIk::enabled`] 做二级开关。
+///
+/// **单位约定**：标着「米」的项（`max_correction`、`toe_pivot_rise`、`heel_off_lead`、
+/// `ground_probe_rise/depth`）写的是「在参考骨架（Amy，腿长 0.571 m）上的米数」，
+/// 运行时按这台角色实测的 `scale_leg` / `scale_foot` 换算成它自己的米数 ——
+/// 同一套参数在 0.57 m 的腿和 0.89 m 的腿上比例一致。角度（度）、时间（秒）、
+/// 权重（0..1）不动，因为它们本来就跟骨骼尺寸无关
 #[derive(Resource, Clone, Debug, PartialEq)]
 pub struct FootIkSettings {
     /// 总开关。关掉时所有角色的 `blend` 都会平滑降到 0，求解整段跳过
     pub enabled: bool,
     /// 目标权重 0→1 的过渡时长（秒）。0 表示硬切（不推荐：会看到膝盖瞬移）
     pub blend_secs: f32,
-    /// 锚点最多允许偏离脚踝多少米，超过就让锚点跟着脚走
+    /// 锚点最多允许偏离脚踝多少米（参考骨架口径，见结构体注释的换算约定），
+    /// 超过就让锚点跟着脚走
     pub max_correction: f32,
     /// 支撑权重高于它才算踩实
     pub plant_enter: f32,
@@ -57,7 +64,9 @@ pub struct FootIkSettings {
     /// 刚踩实时锁脚强度从 0 升到 1 的过渡时长（秒）。同样是 smoothstep 形状；
     /// 0 = 一踩实就钉死（脚的速度被一帧掐断，会「顿」）。默认 0.10
     pub engage_secs: f32,
-    /// 支撑期里动画把脚跟抬起多少米之后，承重点从踝滑到前掌（绕前掌转）。
+    /// 支撑期里动画把脚跟抬起多少米（参考骨架的**脚长**口径）之后，
+    /// 承重点从踝滑到前掌（绕前掌转）。这是脚掌绕前掌转出来的抬升，
+    /// 跟脚有多长成正比
     /// 0 = 从踩实第一帧就钉前掌（脚跟会过早抬起），默认 0.03。
     /// 现在它只是**兜底**触发：重心可能永远不越过脚（倒退、侧移、站立），
     /// 正常走跑时的起跟由 `heel_off_lead` 接管
@@ -105,10 +114,10 @@ pub struct FootIkSettings {
     /// 每只脚向下打一条射线量地面。关掉就退回「从脚踝/前掌推断」——
     /// 推断在台阶、斜坡、以及落地那一帧脚还在空中时会偏
     pub ground_probe: bool,
-    /// 射线起点在脚踝上方多少米。抬高了才能越过薄地板 / 台阶边缘，
+    /// 射线起点在脚踝上方多少米（参考骨架口径，按腿长换算）。抬高了才能越过薄地板 / 台阶边缘，
     /// 也从自己的脚掌上方起射，不会一出来就打在脚上
     pub ground_probe_rise: f32,
-    /// 射线最长向下多少米。太小的话站在台阶上方量不到下一层
+    /// 射线最长向下多少米（参考骨架口径，按腿长换算）。太小的话站在台阶上方量不到下一层
     pub ground_probe_depth: f32,
     /// 落地后「把脚掌从空中的限速值过渡到动画值」的时长（秒）。
     ///
@@ -156,15 +165,21 @@ impl Default for FootIkSettings {
 }
 
 impl FootIkSettings {
-    fn lock_config(&self) -> FootLockConfig {
+    /// 把「以米给」的阈值按骨架尺寸换算成这台角色自己的米数。
+    ///
+    /// 三个米数用到的长度不一样：`max_correction`（踝被拉走多远）和
+    /// `heel_off_lead`（重心沿脚掌越过锚点多远）是**身体位移**，跟腿长成正比；
+    /// `toe_pivot_rise`（踝被抬起多少才开始绕前掌转）是**脚掌绕前掌转出来的
+    /// 抬升**，跟脚长成正比。所以这里是两个系数，不是一个缩放
+    fn lock_config(&self, scale_leg: f32, scale_foot: f32) -> FootLockConfig {
         FootLockConfig {
-            max_correction: self.max_correction.max(0.0),
+            max_correction: self.max_correction.max(0.0) * scale_leg,
             plant_enter: self.plant_enter.clamp(0.0, 1.0),
             plant_exit: self.plant_exit.clamp(0.0, self.plant_enter),
             release_secs: self.release_secs.max(0.0),
             engage_secs: self.engage_secs.max(0.0),
-            toe_pivot_rise: self.toe_pivot_rise.max(0.0),
-            heel_off_lead: self.heel_off_lead.clamp(-0.2, 0.2),
+            toe_pivot_rise: self.toe_pivot_rise.max(0.0) * scale_foot,
+            heel_off_lead: self.heel_off_lead.clamp(-0.2, 0.2) * scale_leg,
             heel_off_secs: self.heel_off_secs.max(1e-3),
             heel_off_min_secs: self.heel_off_min_secs.max(0.0),
         }
@@ -255,6 +270,30 @@ impl Default for FootIk {
 }
 
 impl FootIk {
+    /// 骨架换了（或彻底关掉）：把锚点、姿态缓存、抬跟进度全部清空。
+    ///
+    /// 缓存里的世界坐标只对当初那具骨架有意义；把它们带进新骨架，脚会被拽到
+    /// 上一具骨架的位置上，观感就是「体态被掰变形」
+    fn forget_skeleton(&mut self) {
+        self.rig = None;
+        self.blend = 0.0;
+        self.locks = [FootLock::default(); 2];
+        self.poles = [None; 2];
+        self.foot_rots = [None; 2];
+        self.toe_clamps = [None; 2];
+        self.ground = [None; 2];
+        self.landing = [0.0; 2];
+        self.landing_from = [None; 2];
+        self.air_secs = [1.0; 2];
+        self.anchors = [None; 2];
+        self.correction = [0.0; 2];
+        self.heel = [0.0; 2];
+        self.pitch = [0.0; 2];
+        self.ankle = [0.0; 2];
+        self.toe_bend = [0.0; 2];
+        self.lift_out = [0.0; 2];
+    }
+
     /// 骨架缓存是否就绪（模型还在异步加载时为 false）
     pub fn is_ready(&self) -> bool {
         self.rig.is_some()
@@ -328,6 +367,19 @@ impl FootIk {
 
 }
 
+/// 参考骨架（默认角色 Amy）的腿长：`髋→膝 + 膝→踝`，静止姿态实测 0.571 m。
+///
+/// 所有以**米**给的参数（`max_correction`、`heel_off_lead`、地面射线的抬升/深度）
+/// 都按 `scale_leg = 腿长 / 它` 换算。参数值本身仍然是「在参考骨架上看着顺眼」
+/// 的那个米数，换到 0.89 m 的 X Bot 或 0.64 m 的 Big Vegas 上比例不变，
+/// 不会一个起跟走得太早、一个被拽得太远
+const REFERENCE_LEG_LENGTH: f32 = 0.571;
+
+/// 参考骨架的「踝→前掌」长度（0.128 m）。抬跟那一侧的**高度**阈值
+/// （`toe_pivot_rise`：动画把脚踝抬起多少米才开始绕前掌转）按它换算 ——
+/// 那是脚掌绕前掌转出来的位移，跟脚有多长成正比，跟腿长无关
+const REFERENCE_FOOT_LENGTH: f32 = 0.128;
+
 /// 模型实体下的骨架缓存。实体 id 与模型同生共死，不需要额外失效判断。
 struct FootRig {
     /// 从场景最顶层到 hips（含）的链：用局部变换自己乘出世界矩阵，
@@ -335,6 +387,10 @@ struct FootRig {
     spine: Vec<Entity>,
     /// 两条腿 `[左, 右]`，顺序与 [`FootIk::contacts`] 一致
     legs: [Leg; 2],
+    /// 腿长换算系数（见 [`REFERENCE_LEG_LENGTH`]），夹在 0.4~2.5 兜底
+    scale_leg: f32,
+    /// 脚长换算系数（见 [`REFERENCE_FOOT_LENGTH`]），同样夹住
+    scale_foot: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -387,6 +443,16 @@ fn attach_rigs(
     }
 
     for (model, mut ik) in &mut iks {
+        // 骨架换了就重量一遍：缓存里的骨骼实体、静止俯角和骨骼尺寸都只属于
+        // 当初那具骨架，绑错了会把整条腿的阈值（`scale_leg/scale_foot`）一起带偏。
+        // 代价是每帧几次 `Query::get`，比每次重扫层级便宜得多
+        if ik
+            .rig
+            .as_ref()
+            .is_some_and(|rig| rig_is_stale(rig, model, &parents, &transforms))
+        {
+            ik.forget_skeleton();
+        }
         if ik.rig.is_some() {
             continue;
         }
@@ -400,6 +466,42 @@ fn attach_rigs(
             ik.rig = Some(rig);
         }
     }
+}
+
+/// 缓存的骨架是否已经不再属于这具骨架：腿骨实体失效，或者 hips 已经不在
+/// `model` 底下（模型被就地换皮 / 场景重载时，实体可能还活着但骨架已经换了一具）。
+fn rig_is_stale(
+    rig: &FootRig,
+    model: Entity,
+    parents: &Query<&ChildOf>,
+    transforms: &Query<&Transform>,
+) -> bool {
+    for leg in &rig.legs {
+        if transforms.get(leg.upper).is_err()
+            || transforms.get(leg.lower).is_err()
+            || transforms.get(leg.foot).is_err()
+        {
+            return true;
+        }
+    }
+    let Some(&hips) = rig.spine.last() else {
+        return true;
+    };
+    if transforms.get(hips).is_err() {
+        return true;
+    }
+    // hips 往上一路走到 model：走不到说明它已经挂到别的模型底下了
+    let mut cursor = hips;
+    for _ in 0..64 {
+        if cursor == model {
+            return false;
+        }
+        match parents.get(cursor) {
+            Ok(child_of) => cursor = child_of.parent(),
+            Err(_) => return true,
+        }
+    }
+    true
 }
 
 /// 在当前动画栈里把两脚支撑权重灌给正在被驱动的那个角色。
@@ -461,11 +563,12 @@ fn sample_ground(
                     * foot.compute_affine())
                 .translation
                 .into();
-                let origin = ankle + Vec3::Y * settings.ground_probe_rise;
+                // 抬升/深度都是「米」，按腿长换算：小个子角色不用打那么远的射线
+                let origin = ankle + Vec3::Y * settings.ground_probe_rise * rig.scale_leg;
                 let Some(hit) = spatial.cast_ray(
                     origin,
                     Dir3::NEG_Y,
-                    settings.ground_probe_depth,
+                    settings.ground_probe_depth * rig.scale_leg,
                     true,
                     &filter,
                 ) else {
@@ -509,7 +612,6 @@ fn solve_foot_ik(
     mut transforms: Query<&mut Transform>,
 ) {
     let dt = time.delta_secs();
-    let config = settings.lock_config();
 
     'character: for mut ik in &mut iks {
         // 目标权重：全局开 + 本角色开。关掉时平滑淡出而不是直接跳没
@@ -549,6 +651,8 @@ fn solve_foot_ik(
         let Some(rig) = rig.as_ref() else {
             continue;
         };
+        // 逐角色换算：米制阈值 × 这台角色的骨骼尺寸
+        let config = settings.lock_config(rig.scale_leg, rig.scale_foot);
 
         // 彻底关掉：清锚点，重新打开时从下一次支撑重新贴地，
         // 不会拿几帧前的旧位置把人拽回去
@@ -1371,6 +1475,12 @@ fn build_rig(
         toe_drop: 0.0,
         foot_tilt: 0.0,
     }; 2];
+    // 骨骼尺寸：腿长（髋→膝 + 膝→踝）与脚长（踝→前掌）。加起来取平均，
+    // 单侧骨骼缺失时另一侧照样能定出比例
+    let mut leg_sum = 0.0f32;
+    let mut leg_count = 0u32;
+    let mut foot_sum = 0.0f32;
+    let mut foot_count = 0u32;
     for (index, side) in ["Left", "Right"].into_iter().enumerate() {
         let upper = find_bone(model, children, names, &format!("{side}UpLeg"))?;
         let lower = find_bone(model, children, names, &format!("{side}Leg"))?;
@@ -1395,6 +1505,28 @@ fn build_rig(
             })
             .filter(|tilt| tilt.is_finite() && (-5.0..85.0).contains(tilt))
             .unwrap_or(0.0);
+        // 骨骼长度：关节位置是骨架常量，静止姿态量一次就够（分段相加，
+        // 这样绑定姿态本身是屈膝也不会量短）
+        if let (Some(hip), Some(knee), Some(ankle)) = (
+            world_position(model, upper, parents, transforms),
+            world_position(model, lower, parents, transforms),
+            world_position(model, foot, parents, transforms),
+        ) {
+            let length = (knee - hip).length() + (ankle - knee).length();
+            if length.is_finite() && length > 1e-3 {
+                leg_sum += length;
+                leg_count += 1;
+            }
+        }
+        if let Some(ball) = toe.and_then(|toe| world_position(model, toe, parents, transforms))
+            && let Some(ankle) = world_position(model, foot, parents, transforms)
+        {
+            let length = (ball - ankle).length();
+            if length.is_finite() && length > 1e-3 {
+                foot_sum += length;
+                foot_count += 1;
+            }
+        }
         legs[index] = Leg {
             upper,
             lower,
@@ -1405,7 +1537,28 @@ fn build_rig(
         };
     }
 
-    Some(FootRig { spine, legs })
+    let scale_leg = ratio(leg_sum, leg_count, REFERENCE_LEG_LENGTH);
+    let scale_foot = ratio(foot_sum, foot_count, REFERENCE_FOOT_LENGTH);
+    info!(
+        "骨骼尺寸：腿长 {:.3} m（×{scale_leg:.2}）、踝→前掌 {:.3} m（×{scale_foot:.2}）",
+        leg_sum / leg_count.max(1) as f32,
+        foot_sum / foot_count.max(1) as f32
+    );
+
+    Some(FootRig {
+        spine,
+        legs,
+        scale_leg,
+        scale_foot,
+    })
+}
+
+/// 量到的尺寸 / 参考尺寸，夹在 0.4~2.5；没量到（骨架缺骨骼）就退回 1（按参考骨架算）
+fn ratio(sum: f32, count: u32, reference: f32) -> f32 {
+    if count == 0 || !sum.is_finite() || reference <= 1e-6 {
+        return 1.0;
+    }
+    (sum / count as f32 / reference).clamp(0.4, 2.5)
 }
 
 /// 从 `model` 往下累乘局部变换，得到某个骨骼的世界位置（只在挂载骨架时用一次）
@@ -1449,6 +1602,33 @@ mod tests {
             lower_rot: Quat::IDENTITY,
             foot_rot: Quat::IDENTITY,
         }
+    }
+
+    /// 米制阈值必须跟着骨骼尺寸换算：同一个 `FootIkSettings` 交给 1.8 倍腿长的
+    /// 角色时，「踝被拉多远、重心越过脚多远、脚掌抬多高才滑到前掌」都要按比例放大，
+    /// 否则大个子会被拽得更远、小个子起跟更晚
+    #[test]
+    fn meter_thresholds_follow_the_skeleton_scale() {
+        let settings = FootIkSettings {
+            max_correction: 0.20,
+            heel_off_lead: -0.10,
+            toe_pivot_rise: 0.04,
+            ..FootIkSettings::default()
+        };
+        let reference = settings.lock_config(1.0, 1.0);
+        let big = settings.lock_config(1.8, 1.3);
+        // 身体位移那一组按腿长
+        assert!((big.max_correction - 0.36).abs() < 1e-5);
+        assert!((big.heel_off_lead - (-0.18)).abs() < 1e-5);
+        // 脚掌抬升那一项按脚长
+        assert!((big.toe_pivot_rise - 0.052).abs() < 1e-5);
+        // 参考骨架上原样
+        assert!((reference.max_correction - 0.20).abs() < 1e-5);
+        assert!((reference.heel_off_lead - (-0.10)).abs() < 1e-5);
+        assert!((reference.toe_pivot_rise - 0.04).abs() < 1e-5);
+        // 与尺寸无关的那几项不许被动
+        assert!((big.plant_enter - reference.plant_enter).abs() < 1e-6);
+        assert!((big.release_secs - reference.release_secs).abs() < 1e-6);
     }
 
     /// 把解出来的局部旋转重新乘回世界，确认脚落到目标上、骨长不变
@@ -1597,6 +1777,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -1807,6 +1989,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -1943,6 +2127,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2118,6 +2304,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2321,6 +2509,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2865,6 +3055,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2993,6 +3185,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -3132,6 +3326,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -3285,6 +3481,8 @@ mod tests {
         ik.rig = Some(FootRig {
             spine: vec![root, model, armature, hips],
             legs: [left, right],
+            scale_leg: 1.0,
+            scale_foot: 1.0,
         });
         world.entity_mut(model).insert(ik);
 
@@ -3396,7 +3594,27 @@ mod tests {
                             "踝到前掌的竖直距离应量到 0.08，实际 {}",
                             leg.toe_drop
                         );
+                        // 前掌骨静止俯角：8cm 下、14cm 前 → 29.7°
+                        let tilt = (0.08f32).atan2(0.14).to_degrees();
+                        assert!(
+                            (leg.foot_tilt - tilt).abs() < 0.1,
+                            "前掌骨静止俯角应量到 {tilt:.1}°，实际 {:.1}°",
+                            leg.foot_tilt
+                        );
                     }
+                    // 骨骼尺寸：腿 0.35+0.35，脚 √(0.08²+0.14²)
+                    let expected = 0.7 / REFERENCE_LEG_LENGTH;
+                    assert!(
+                        (rig.scale_leg - expected).abs() < 0.01,
+                        "腿长换算应 {expected:.3}，实际 {:.3}",
+                        rig.scale_leg
+                    );
+                    let expected = 0.161_245 / REFERENCE_FOOT_LENGTH;
+                    assert!(
+                        (rig.scale_foot - expected).abs() < 0.01,
+                        "脚长换算应 {expected:.3}，实际 {:.3}",
+                        rig.scale_foot
+                    );
                 },
             )
             .expect("跑不起来");

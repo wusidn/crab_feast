@@ -231,6 +231,9 @@ pub(crate) fn drive_pose(
         // 绝对定位而不是累加：root_delta 已经是相对静息位置的位移
         transform.translation =
             skeleton.base_translation + Vec3::new(last_root_delta.x, 0.0, last_root_delta.z);
+        // 模型根节点的局部旋转恒为单位：偏航由父节点 Avatar 承担。混合空间接管
+        // 姿态时也要在这里清一次，免得预览/单条剪辑路径留下的偏航继续挂着
+        transform.rotation = Quat::IDENTITY;
     }
 }
 
