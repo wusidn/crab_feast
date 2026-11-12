@@ -6,5 +6,5 @@
 pub mod foot_lock;
 pub mod two_bone;
 
-pub use foot_lock::{FootContact, FootLock, FootLockConfig};
+pub use foot_lock::{FootContact, FootLock, FootLockConfig, ROLL_SPAN};
 pub use two_bone::{aim_world_rotation, solve_two_bone, TwoBoneSolution};

@@ -319,8 +319,13 @@ fn update_foot_ik_status(
             let [contact_left, contact_right] = ik.contacts;
             let [planted_left, planted_right] = ik.planted();
             let [roll_left, roll_right] = ik.roll();
+            let [heel_left, heel_right] = ik.heel_off();
+            let [ankle_left, ankle_right] = ik.ankle_deg();
+            // 前掌骨折角：抬跟时脚趾要留在地上，这个数应该跟着抬跟一起长
+            let [toe_left, toe_right] = ik.toe_bend_deg();
             let [strength_left, strength_right] = ik.strength();
-            // 承重点：踩实后期承重点滑到前掌（「掌」），前期钉踝（「踝」）
+            // 承重点：踩实后期承重点滑到前掌（「掌」），前期钉踝（「踝」）。
+            // 踝角 = 脚掌与小腿的夹角，90 = 站立、蹬地时该到 130~160
             let pivot = |planted: bool, roll: f32| {
                 if !planted {
                     "-"
@@ -341,7 +346,7 @@ fn update_foot_ik_status(
                 None => "-".to_string(),
             };
             format!(
-                "权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
+                "权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 抬跟 {:.0}%/{:.0}% · 踝角 {:.0}°/{:.0}° · 趾 {:.0}°/{:.0}° · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
                 ik.blend(),
                 contact_left,
                 contact_right,
@@ -349,6 +354,12 @@ fn update_foot_ik_status(
                 strength_right,
                 pivot(planted_left, roll_left),
                 pivot(planted_right, roll_right),
+                heel_left * 100.0,
+                heel_right * 100.0,
+                ankle_left,
+                ankle_right,
+                toe_left,
+                toe_right,
                 left,
                 right,
                 ground(0),

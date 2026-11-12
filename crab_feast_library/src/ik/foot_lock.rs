@@ -27,6 +27,36 @@ const MIN_OFFSET: f32 = 1e-5;
 /// 强度小到这个值就认为锁脚已经退干净：清零后不再每帧多解一次 IK
 const MIN_STRENGTH: f32 = 1e-4;
 
+/// 「抬跟」进度里，承重点从踝滑到前掌所占的比例。
+///
+/// 剩下的 `1 - ROLL_SPAN` 留给脚掌俯仰本身（由调用方按同样的进度插值）：
+/// 承重点还没接到前掌上就先把脚掌掰起来，前掌会被压进地里再被「不穿地」夹回来，
+/// 看起来就是脚掌先翘一下、再放平。先迁承重点、后补俯仰，两者各自单调、无回头。
+///
+/// 0.3 而不是 0.4：承重点迁移只是**为了能掰脚掌**的必要前置，它本身不被看见。
+/// 占掉四成的话，抬跟触发之后还要等 0.1s（走路 6 帧）才看得见脚跟起来，
+/// 观感上又是一次「晚」；压到三成后俯仰拿到七成时间，那段更像蹬出去。
+/// 再往下压就得给迁移单独限速了 —— 它是一段 2~4cm 的踝位移，一两帧走完会滑
+pub const ROLL_SPAN: f32 = 0.3;
+
+/// 抬跟至少要摊多久（秒）。再短就是一帧到位，脚跟等于「弹」起来的
+const MIN_HEEL_RAMP: f32 = 0.10;
+
+/// 抬跟要在支撑期结束前的哪个位置走满：按上一段支撑期估出来的长度 × 它。
+///
+/// 0.75 的意思是「离地前 25% 就该已经蹬到位」——最后那段停住不动的、完全伸展的
+/// 脚掌就是「蹬住了」的观感；如果一直爬到离地那一帧才到位，动作和离地同时结束，
+/// 看起来就是被身体带着走。走路时剩余 15% ≈ 90ms、跑步 ≈ 35ms，都够看出一个
+/// 站住的拍子。0.85 时只剩 15%，观感上蹬地还是压在离地那一瞬
+const HEEL_RAMP_OF_STANCE: f32 = 0.75;
+
+/// 支撑期长度估计的平滑系数：新测到的一段和旧估计按 1:x 混合。
+/// 0.35 让换速度（走 → 跑）在两步之内跟上，又不会让单次异常步幅把节奏带偏
+const STANCE_EMA: f32 = 0.35;
+
+/// 太短的「支撑」不算数（中途抖了一下又重新踩实）：短于它不参与估计
+const MIN_STANCE_SAMPLE: f32 = 0.08;
+
 /// 锁脚参数。由全局设置构造，逐帧传给 [`FootLock::update`]，所以改参数立刻生效。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FootLockConfig {
@@ -45,6 +75,21 @@ pub struct FootLockConfig {
     /// 支撑期内，动画把脚跟抬起多少米之后改成「钉前掌」。
     /// 0 = 从踩实第一帧就钉前掌（脚跟会过早抬起）
     pub toe_pivot_rise: f32,
+    /// 重心（骨盆）沿脚掌朝向越过锚点多远（米）才开始抬脚跟。
+    ///
+    /// 真实步态里脚跟在**重心压过着地脚之后**才抬；动画自己的抬跟时刻常偏晚，
+    /// 光等动画抬踝，锁脚就会把脚按平到接近离地那一瞬。0 = 重心正好压到脚踝上，
+    /// 负值 = 提前抬（-0.05 ≈ 重心压到脚掌中段，也就是解剖上的 heel-off 时刻）。
+    pub heel_off_lead: f32,
+    /// 抬跟推进到「完全抬跟」的**最长**时长（秒）。前 [`ROLL_SPAN`] 段迁承重点，
+    /// 后段交给脚掌俯仰补齐目标角。
+    ///
+    /// 实际用的是「上一段支撑期估出的剩余时间 × 0.85」，只有它比这个值更短时才压缩：
+    /// 跑步支撑期只有 0.25s，固定 0.30s 的斜坡根本爬不满，俯角到离地也没到位
+    pub heel_off_secs: f32,
+    /// 触发前至少要踩实多久（秒）：刚落地的几帧重心可能已经在踝上方（短步幅、
+    /// 刹停），这时不该立刻抬跟
+    pub heel_off_min_secs: f32,
 }
 
 impl Default for FootLockConfig {
@@ -61,6 +106,13 @@ impl Default for FootLockConfig {
             engage_secs: 0.10,
             // 3cm：正常抬脚跟到 3cm 时前掌是承重点，再往上前掌就该接管了
             toe_pivot_rise: 0.03,
+            // -8cm：重心还在踝后方 8cm（脚掌的一半处）就起跟。解剖上真正的
+            // heel-off 就发生在重心过踝之前；-5cm 实测还晚，-8cm 更接近真实步态
+            heel_off_lead: -0.08,
+            // 300ms：走路剩余支撑约 0.3s，正好摊满；跑步由自适应缩短（见字段文档）
+            heel_off_secs: 0.30,
+            // 80ms ≈ 5 帧：盖住落地时的重心抖动，又不至于把正常的起跟推后
+            heel_off_min_secs: 0.08,
         }
     }
 }
@@ -74,6 +126,9 @@ impl FootLockConfig {
         self.release_secs = self.release_secs.max(0.0);
         self.engage_secs = self.engage_secs.max(0.0);
         self.toe_pivot_rise = self.toe_pivot_rise.max(0.0);
+        self.heel_off_lead = self.heel_off_lead.clamp(-0.2, 0.2);
+        self.heel_off_secs = self.heel_off_secs.max(1e-3);
+        self.heel_off_min_secs = self.heel_off_min_secs.max(0.0);
         self
     }
 }
@@ -95,6 +150,12 @@ pub struct FootContact {
     /// 推断在「落地那帧脚还在空中」「脚掌跖屈/背屈」时都会偏，
     /// 而真实地面在爬楼梯、斜坡这种复杂地形上是唯一可信的来源
     pub floor: Option<f32>,
+    /// 重心（骨盆）的世界位置，用来判断「重心越过着地脚」这个抬跟时机。
+    ///
+    /// 只取水平分量，沿踩实那一刻的脚掌朝向投影：投影为正且超过
+    /// [`FootLockConfig::heel_off_lead`] 就认为重心已经压过着地脚，开始抬脚跟。
+    /// `None`（没有身体信息）时退回「看动画抬踝」的旧触发。
+    pub body: Option<Vec3>,
 }
 
 impl FootContact {
@@ -104,6 +165,7 @@ impl FootContact {
             toe: None,
             toe_drop: 0.0,
             floor: None,
+            body: None,
         }
     }
 }
@@ -126,6 +188,20 @@ pub struct FootLock {
     progress: f32,
     /// 承重点沿脚掌滑动的比例：0 = 钉脚踝（脚是平的），1 = 钉前掌（绕前掌转）
     roll: f32,
+    /// 抬跟进度 0..1：重心越过着地脚（或动画自己抬踝）后单调推进。
+    /// 承重点滑动只吃它的前 [`ROLL_SPAN`]，脚掌俯仰吃剩下的部分
+    heel: f32,
+    /// 踩实那一刻脚掌的水平朝向（单位向量，踝 → 前掌）。重心越过判定沿它投影
+    heel_dir: Vec3,
+    /// 本段支撑期已经踩了多久（秒），给抬跟触发一个最小支撑时长，
+    /// 也是「还剩多少时间」的基准
+    stance_secs: f32,
+    /// 上一段支撑期有多长（秒，指数平滑）。抬跟的斜坡按它估的剩余时间压缩，
+    /// 所以走→跑的换挡两步之内就能跟上；0 = 还没测过，退回配置里的上限
+    stance_est: f32,
+    /// 本段抬跟摊多长（秒），触发那一帧按 `stance_est` 定下来就不再变：
+    /// 逐帧重算会让同一段支撑里的进度忽快忽慢（像被拽了一下）
+    ramp_secs: f32,
     /// 踩实那一帧的踝高：动画把踝抬高说明该抬脚跟了
     ankle_base: f32,
     /// 踩实那一帧「前掌 − 踝」的向量（脚掌朝向）。没有前掌骨时为零
@@ -149,11 +225,26 @@ impl FootLock {
         self.strength = 0.0;
         self.progress = 0.0;
         self.roll = 0.0;
+        self.heel = 0.0;
+        self.heel_dir = Vec3::ZERO;
+        self.stance_secs = 0.0;
+        self.stance_est = 0.0;
+        self.ramp_secs = 0.0;
         self.ankle_base = 0.0;
         self.toe_vec = Vec3::ZERO;
         self.toe_floor = None;
         self.toe_floor_probed = false;
         self.presence = 0.0;
+    }
+
+    /// 本段抬跟要摊多长（秒）：触发那一帧按「上一段支撑长度 − 已经踩的时间」
+    /// 的 85% 定，夹在 [`MIN_HEEL_RAMP`] 与配置上限之间。
+    ///
+    /// 这一条是「蹬地时机」的骨头：固定的 0.30s 斜坡放在跑步的 0.25s 支撑期里，
+    /// 重心越过脚之后只剩 0.10s，俯角根本爬不到目标，脚就是平的、被身体带着走。
+    /// 按实测的支撑长度往前推，走路摊得慢、跑步摊得快，俯角总在离地前到位
+    pub fn heel_ramp_secs(&self) -> f32 {
+        self.ramp_secs
     }
 
     /// 还没还回去的修正量（世界空间，米）。调试面板可以拿它当过冲读数
@@ -192,6 +283,11 @@ impl FootLock {
         self.roll
     }
 
+    /// 抬跟进度（0..1，支撑期内只增不减）。调用方拿它的后半段去补脚掌俯仰
+    pub fn heel_off(&self) -> f32 {
+        self.heel
+    }
+
     /// 踩实时的地面高度（世界 y）。没有踩实或没有前掌骨时是 `None`。
     /// 调用方拿它当「地面高度」，把前掌朝向夹在它之上，脚掌就不会扎进地里；
     /// 反过来，它偏高的话脚掌就永远压不下去（落地后翘着）。
@@ -216,8 +312,9 @@ impl FootLock {
     /// - `enabled`：本帧是否允许锁脚；
     /// - `dt`：帧间隔（秒），用于强度过渡与残差过渡，与帧率无关。
     ///
-    /// 承重点是沿脚掌滑动的：踩实初期钉**脚踝**（脚是平的）；动画把脚跟抬到
-    /// `toe_pivot_rise` 之后，承重点逐渐滑到**前掌**，脚变成绕前掌转 ——
+    /// 承重点是沿脚掌滑动的：踩实初期钉**脚踝**（脚是平的）；重心越过着地脚
+    /// （或动画自己把脚跟抬到 `toe_pivot_rise`）之后，承重点在 `heel_off_secs`
+    /// 的前 [`ROLL_SPAN`] 段里逐渐滑到**前掌**，脚变成绕前掌转 ——
     /// 于是脚跟先离地、前掌最后离地，和真实蹬地顺序一致。
     ///
     /// 锚点 = 踩实时踝的世界位置，加上 `roll × 踩实时的脚向量`：锚点在世界里不动，
@@ -258,10 +355,15 @@ impl FootLock {
                 if support >= config.plant_enter {
                     self.planted = true;
                     self.roll = 0.0;
+                    self.heel = 0.0;
+                    self.stance_secs = 0.0;
+                    self.ramp_secs = 0.0;
                     // 踩实的第一帧就把当前脚踝记成锚点：这一帧的残差为 0，不会跳
                     self.anchor = Some(ankle);
                     self.ankle_base = ankle.y;
                     self.toe_vec = toe.map(|toe| toe - ankle).unwrap_or(Vec3::ZERO);
+                    self.heel_dir =
+                        Vec3::new(self.toe_vec.x, 0.0, self.toe_vec.z).normalize_or_zero();
                     // 地面高度用「踝高 − 踝到前掌的竖直距离」算，不用当帧前掌位置：
                     // 落地那帧脚跟先着地时前掌还在空中，拿它当地面会让脚掌一直翘着
                     // 两种近似各错一边，取更低的那个：
@@ -283,19 +385,59 @@ impl FootLock {
             } else if support <= config.plant_exit {
                 self.planted = false;
                 self.anchor = None;
+                // 这一段支撑量出了准确长度：抬跟的斜坡按它估下一段的剩余时间。
+                // 太短的段（中途抖了一下）不算，免得估计被一次误判带跑
+                if self.stance_secs >= MIN_STANCE_SAMPLE {
+                    self.stance_est = if self.stance_est <= f32::EPSILON {
+                        self.stance_secs
+                    } else {
+                        self.stance_est * (1.0 - STANCE_EMA) + self.stance_secs * STANCE_EMA
+                    };
+                }
             }
         } else {
             self.planted = false;
             self.anchor = None;
         }
 
-        // 动画把脚跟抬起来 → 承重点向脚掌滑。只增不减：支撑期内不倒回去。
+        // 本段支撑已经踩了多久：抬跟触发前要求至少踩实 `heel_off_min_secs`
+        if self.planted {
+            self.stance_secs += dt.max(0.0);
+        } else {
+            self.stance_secs = 0.0;
+        }
+
+        // 抬跟进度：两个触发源取更早的那个，全程只增不减（倒回去脚踝会当帧下坠）
+        // 1) 重心（骨盆）沿脚掌朝向越过锚点：真实步态里脚跟在**重心压过着地脚之后**
+        //    才抬。等动画自己抬踝往往已经接近离地那一瞬，锁脚就把脚按平到那时候；
+        // 2) 动画自己把踝抬高了 `toe_pivot_rise`：站立、倒退、侧移时重心可能永远
+        //    不越过脚掌朝向（投影一直为负），这时只能信动画。
         // 用 smoothstep 而不是线性：线性在阈值处有一个曲率折角，抬脚会「咯噔」一下
         if self.planted && toe.is_some() {
             let start = config.toe_pivot_rise.max(1e-3);
             let rise = (ankle.y - self.ankle_base).max(0.0);
-            let roll = smoothstep(((rise - start) / start).clamp(0.0, 1.0));
-            self.roll = self.roll.max(roll);
+            let from_rise = smoothstep(((rise - start) / start).clamp(0.0, 1.0));
+
+            let mut from_body = self.heel;
+            if self.stance_secs >= config.heel_off_min_secs
+                && let Some(body) = contact.body.filter(|body| body.is_finite())
+                && let Some(anchor) = self.anchor
+                && self.heel_dir.length_squared() > 0.5
+            {
+                let advance =
+                    Vec3::new(body.x - anchor.x, 0.0, body.z - anchor.z).dot(self.heel_dir);
+                if advance >= config.heel_off_lead {
+                    if self.ramp_secs <= f32::EPSILON {
+                        self.ramp_secs = self.heel_ramp(config);
+                    }
+                    from_body = (self.heel + dt.max(0.0) / self.ramp_secs).min(1.0);
+                }
+            }
+
+            self.heel = self.heel.max(from_body).max(from_rise);
+            // 承重点只吃前 ROLL_SPAN 段；剩下那段留给脚掌俯仰（调用方按同一个
+            // 进度插值），先接过承重点再掰脚掌，前掌才不会被压进地里
+            self.roll = smoothstep((self.heel / ROLL_SPAN).clamp(0.0, 1.0));
         }
 
         // 还钉着时的修正量：锚点 + roll × 脚向量差 − 当前踝位置。
@@ -358,6 +500,19 @@ impl FootLock {
             0.0
         };
         (ankle + applied, weight)
+    }
+
+    /// 本次抬跟的摊开时长：按「估计的支撑长度 − 已经踩的时间」留
+    /// [`HEEL_RAMP_OF_STANCE`] 给这一段，夹在 [`MIN_HEEL_RAMP`] 与
+    /// [`FootLockConfig::heel_off_secs`] 之间（配置值只当上限）
+    fn heel_ramp(&self, config: &FootLockConfig) -> f32 {
+        let cap = config.heel_off_secs.max(1e-3);
+        if self.stance_est <= f32::EPSILON {
+            // 还没走过一段完整的支撑（刚生成、或者一直没离地）：用配置的上限
+            return cap;
+        }
+        let left = (self.stance_est - self.stance_secs).max(0.0);
+        (left * HEEL_RAMP_OF_STANCE).clamp(MIN_HEEL_RAMP.min(cap), cap)
     }
 }
 
@@ -450,13 +605,31 @@ mod tests {
     #[test]
     fn hysteresis_keeps_planted_between_enter_and_exit() {
         let mut lock = FootLock::default();
-        lock.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &config());
+        lock.update(
+            FootContact::ankle_only(Vec3::ZERO),
+            1.0,
+            true,
+            DT,
+            &config(),
+        );
         // 0.4 低于 enter、高于 exit：仍然算踩实
-        let _ = lock.update(FootContact::ankle_only(Vec3::ZERO), 0.4, true, DT, &config());
+        let _ = lock.update(
+            FootContact::ankle_only(Vec3::ZERO),
+            0.4,
+            true,
+            DT,
+            &config(),
+        );
         assert!(lock.is_planted(), "0.4 仍在迟滞区间内，不该松脚");
         assert!(lock.anchor().is_some());
         // 掉到 exit 以下才松开
-        lock.update(FootContact::ankle_only(Vec3::ZERO), 0.1, true, DT, &config());
+        lock.update(
+            FootContact::ankle_only(Vec3::ZERO),
+            0.1,
+            true,
+            DT,
+            &config(),
+        );
         assert!(!lock.is_planted());
         assert!(lock.anchor().is_none());
     }
@@ -677,6 +850,7 @@ mod tests {
             toe: Some(toe),
             toe_drop: 0.0,
             floor: None,
+            body: None,
         };
 
         let (target, _) = lock.update(contact(ankle0, toe0), 1.0, true, DT, &cfg);
@@ -691,8 +865,9 @@ mod tests {
         let mut toe = toe0;
         let mut last_target = target;
         let mut rolled = 0.0f32;
-        for frame in 1..=10 {
-            ankle += Vec3::new(0.012, 0.010, 0.0);
+        for frame in 1..=14 {
+            // 动画抬踝 0.3cm/帧（18cm/s，接近真实蹬地）；前掌水平方向被带着走 1.2cm
+            ankle += Vec3::new(0.012, 0.003, 0.0);
             toe += Vec3::new(0.012, 0.0, 0.0);
             let (target, _) = lock.update(contact(ankle, toe), 1.0, true, DT, &cfg);
             assert!(
@@ -720,6 +895,145 @@ mod tests {
         );
     }
 
+    /// 起跟时机跟**重心**走：重心还在着地脚后方时，脚跟一律不许抬；
+    /// 越过脚踝之后按 `heel_off_secs` 单调推进到 1。
+    ///
+    /// 这条是与「等动画自己抬踝」的分界线：动画的抬跟时刻常常偏晚，锁脚会把脚掌
+    /// 按平到接近离地那一瞬，看起来就是「没踩实就抬脚」。
+    #[test]
+    fn heel_off_waits_for_the_body_to_cross_the_planted_foot() {
+        let cfg = FootLockConfig {
+            engage_secs: 0.0,
+            heel_off_secs: 0.30,
+            heel_off_min_secs: 0.0,
+            ..config()
+        };
+        let mut lock = FootLock::default();
+        // 脚掌朝前：踝在原点上方 10cm，前掌在前方 16cm、低 4cm
+        let ankle = Vec3::new(0.0, 0.10, 0.0);
+        let toe = Vec3::new(0.0, 0.06, 0.16);
+        let contact = |body_z: f32| FootContact {
+            ankle,
+            toe: Some(toe),
+            toe_drop: 0.0,
+            floor: None,
+            body: Some(Vec3::new(0.0, 0.90, body_z)),
+        };
+
+        // 踩实：重心还在脚掌后方 10cm
+        lock.update(contact(-0.10), 1.0, true, DT, &cfg);
+        assert_eq!(lock.heel_off(), 0.0);
+        assert_eq!(lock.roll(), 0.0, "重心没过脚，承重点该留在踝上");
+
+        // 0.15s 之内重心一直没越过脚踝：脚跟不许抬
+        for frame in 0..9 {
+            lock.update(contact(-0.10), 1.0, true, DT, &cfg);
+            assert_eq!(lock.heel_off(), 0.0, "第 {frame} 帧：脚跟不该在重心之前抬");
+        }
+
+        // 重心压过着地脚：这一帧就该起跟
+        lock.update(contact(0.01), 1.0, true, DT, &cfg);
+        assert!(lock.heel_off() > 0.0, "重心过了脚踝应当立刻起跟");
+        assert!(lock.roll() > 0.0, "起跟同时开始把承重点迁向前掌");
+
+        // 再 0.30s：抬跟走满，承重点完全在前掌
+        for _ in 0..18 {
+            lock.update(contact(0.01), 1.0, true, DT, &cfg);
+        }
+        assert!((lock.heel_off() - 1.0).abs() < 1e-3, "抬跟应当走满");
+        assert!((lock.roll() - 1.0).abs() < 1e-3, "承重点应当完全在前掌");
+    }
+
+    /// 抬跟的斜坡必须装得进**真实剩余**的支撑期。
+    ///
+    /// 固定的 0.30s 斜坡放在跑步的 0.25s 支撑里，重心越过脚之后只剩 0.10s：
+    /// 俯角爬到一半脚就离地了，看着就是脚掌平的、被身体带着走。这里先量一段
+    /// 短支撑，再让下一段同样短的支撑触发，检查斜坡被压缩到剩余时间里。
+    #[test]
+    fn heel_ramp_compresses_into_a_short_stance() {
+        let cfg = FootLockConfig {
+            engage_secs: 0.0,
+            heel_off_min_secs: 0.0,
+            heel_off_secs: 0.30,
+            ..config()
+        };
+        let mut lock = FootLock::default();
+        let ankle = Vec3::new(0.0, 0.10, 0.0);
+        let toe = Vec3::new(0.0, 0.06, 0.16);
+        let contact = |body_z: f32| FootContact {
+            ankle,
+            toe: Some(toe),
+            toe_drop: 0.0,
+            floor: None,
+            body: Some(Vec3::new(0.0, 0.90, body_z)),
+        };
+
+        // 第一段：0.25s 的支撑（跑步一类的短支撑）。重心一直在脚后，不起跟，
+        // 只为了量出这段有多长
+        for _ in 0..15 {
+            lock.update(contact(-0.10), 1.0, true, DT, &cfg);
+        }
+        for _ in 0..20 {
+            lock.update(contact(-0.10), 0.0, true, DT, &cfg);
+        }
+        assert!(!lock.is_planted(), "抬脚之后不该还算踩实");
+
+        // 第二段：同样的短支撑。先踩 5 帧，再让重心压到脚掌中段触发
+        for _ in 0..5 {
+            lock.update(contact(-0.10), 1.0, true, DT, &cfg);
+        }
+        assert_eq!(lock.heel_off(), 0.0, "重心还没到脚掌中段，不该起跟");
+        lock.update(contact(-0.02), 1.0, true, DT, &cfg);
+        assert!(lock.heel_off() > 0.0, "重心压过脚掌中段应当起跟");
+
+        // 估计支撑 0.25s、已踩 0.1s → 剩 0.15s，斜坡 0.85 × 0.15 ≈ 0.13s
+        let ramp = lock.heel_ramp_secs();
+        assert!(
+            (0.11..=0.17).contains(&ramp),
+            "0.25s 的支撑里斜坡该压到 0.13s 上下，实际 {ramp}"
+        );
+        assert!(ramp < cfg.heel_off_secs, "斜坡必须短于配置的上限");
+
+        // 走满这段斜坡时脚还在地上：俯角在离地**之前**就到目标
+        let frames = (ramp / DT).ceil() as usize;
+        for _ in 0..frames {
+            lock.update(contact(-0.02), 1.0, true, DT, &cfg);
+        }
+        assert!(
+            (lock.heel_off() - 1.0).abs() < 1e-3,
+            "斜坡走完时抬跟该满，实际 {}",
+            lock.heel_off()
+        );
+        assert!(lock.is_planted(), "此时还没离地：俯角是在支撑期里做完的");
+    }
+
+    /// 还没量过任何一段支撑时（刚生成），斜坡退回配置的上限，不会一帧到位
+    #[test]
+    fn heel_ramp_falls_back_to_the_configured_cap_before_any_measurement() {
+        let cfg = FootLockConfig {
+            engage_secs: 0.0,
+            heel_off_min_secs: 0.0,
+            ..config()
+        };
+        let mut lock = FootLock::default();
+        let ankle = Vec3::new(0.0, 0.10, 0.0);
+        let toe = Vec3::new(0.0, 0.06, 0.16);
+        lock.update(
+            FootContact {
+                ankle,
+                toe: Some(toe),
+                toe_drop: 0.0,
+                floor: None,
+                body: Some(Vec3::new(0.0, 0.90, 0.05)),
+            },
+            1.0,
+            true,
+            DT,
+            &cfg,
+        );
+        assert!((lock.heel_ramp_secs() - cfg.heel_off_secs).abs() < 1e-5);
+    }
+
     /// 地面高度必须由「踝高 − 踝到前掌的竖直距离」算出来。
     ///
     /// 落地那帧如果脚跟先着地、脚掌还背屈着，前掌位置比地面高好几厘米；拿它当地面，
@@ -740,6 +1054,7 @@ mod tests {
             toe: Some(toe),
             toe_drop: 0.08,
             floor: None,
+            body: None,
         };
         lock.update(contact, 1.0, true, DT, &cfg);
         let floor = lock.toe_floor().expect("踩实时应有前掌地面高度");
@@ -766,6 +1081,7 @@ mod tests {
             toe: Some(toe),
             toe_drop: 0.08,
             floor: None,
+            body: None,
         };
         lock.update(contact, 1.0, true, DT, &cfg);
         let floor = lock.toe_floor().expect("踩实时应有地面高度");
@@ -792,6 +1108,7 @@ mod tests {
             toe: Some(toe),
             toe_drop: 0.08,
             floor: Some(0.02),
+            body: None,
         };
         lock.update(contact, 1.0, true, DT, &cfg);
         let floor = lock.toe_floor().expect("踩实时应有地面高度");
@@ -815,6 +1132,7 @@ mod tests {
             toe: Some(toe),
             toe_drop: 0.0,
             floor: None,
+            body: None,
         };
 
         for _ in 0..30 {
@@ -904,11 +1222,17 @@ mod tests {
             release_secs: -1.0,
             engage_secs: -1.0,
             toe_pivot_rise: -1.0,
+            heel_off_lead: 10.0,
+            heel_off_secs: -1.0,
+            heel_off_min_secs: -1.0,
         }
         .sanitized();
         assert_eq!(cfg.max_correction, 0.0);
         assert!(cfg.plant_exit <= cfg.plant_enter);
         assert_eq!(cfg.release_secs, 0.0);
         assert_eq!(cfg.engage_secs, 0.0);
+        assert!(cfg.heel_off_lead <= 0.2, "提前量要夹在合理范围");
+        assert!(cfg.heel_off_secs > 0.0, "秒数不能是 0，否则起跟在当帧走完");
+        assert_eq!(cfg.heel_off_min_secs, 0.0);
     }
 }

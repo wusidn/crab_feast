@@ -26,7 +26,7 @@ use bevy::math::{Affine3A, Dir3};
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use crab_feast_library::ik::{
-    aim_world_rotation, solve_two_bone, FootContact, FootLock, FootLockConfig,
+    aim_world_rotation, solve_two_bone, FootContact, FootLock, FootLockConfig, ROLL_SPAN,
 };
 
 use crate::GameState;
@@ -58,8 +58,38 @@ pub struct FootIkSettings {
     /// 0 = 一踩实就钉死（脚的速度被一帧掐断，会「顿」）。默认 0.10
     pub engage_secs: f32,
     /// 支撑期里动画把脚跟抬起多少米之后，承重点从踝滑到前掌（绕前掌转）。
-    /// 0 = 从踩实第一帧就钉前掌（脚跟会过早抬起），默认 0.03
+    /// 0 = 从踩实第一帧就钉前掌（脚跟会过早抬起），默认 0.03。
+    /// 现在它只是**兜底**触发：重心可能永远不越过脚（倒退、侧移、站立），
+    /// 正常走跑时的起跟由 `heel_off_lead` 接管
     pub toe_pivot_rise: f32,
+    /// 重心（骨盆）沿脚掌朝向越过锚点多远（米）才开始抬脚跟。默认 0 = 重心
+    /// 正好压到踩实那一刻的脚踝上；负值提前，正值推后
+    pub heel_off_lead: f32,
+    /// 抬跟触发后推进到「完全抬跟」的时长（秒）。前 40% 迁承重点，后段补脚掌俯仰
+    pub heel_off_secs: f32,
+    /// 起跟前至少要踩实多久（秒）：落地那几帧重心可能已经在脚上方
+    pub heel_off_min_secs: f32,
+    /// 支撑末期要蹬到的**踝角**（度）：脚掌与小腿的夹角。
+    ///
+    /// 角度约定：90° = 站立（脚掌平、小腿竖直），跖屈蹬地时正常人能到
+    /// 130~160°。之所以不能只看「脚掌相对地面的俯角」：支撑末期小腿常常是前倾的
+    /// （膝在踝前方），同样的地面俯角会打折扣 —— 小腿前倾 30° 时，脚掌俯 55° 只有
+    /// 115° 的踝角，看着就是「折叠严重」。这里按当帧小腿的前倾量折算回地面俯角，
+    /// 只补不足：动画自己蹬得更大就原样保留。<= 90 = 不干预
+    pub heel_off_ankle: f32,
+    /// 支撑期踝角的**解剖下限**（度）。低于它就不是「踝在弯」，是脚踝被压过头了。
+    ///
+    /// 脚掌平贴地面时，小腿每前倾一度，踝角就掉一度（φ = 90 + P − L）。真实步态
+    /// 不会让踝角这么掉下去 —— 重心过了脚踝，脚跟就该离地、靠脚掌俯下去抵消小腿
+    /// 的前倾；我们的锁脚却一直把踝钉在地上、脚掌保持动画的平放姿态，于是看起来
+    /// 就是「小腿压着脚掌往前折」。
+    ///
+    /// 这条给踝角一个地板：**整个支撑期**只要 φ 低于它，就绕前掌把脚掌俯下去
+    /// （脚跟跟着抬高），差多少补多少。它不挂靠「重心越过锚点」那个抬跟时机 ——
+    /// 折角是整段支撑里一点点长出来的，等那个时机再补已经折到 60°，来不及。
+    /// 副作用是它会比抬跟斜坡更早起跟（这正是「重心过脚踝就该离地」的样子）。
+    /// 默认 90
+    pub heel_off_ankle_min: f32,
     /// 膝盖朝向（极点）跟随动画的时间常数（秒）。混合空间里两条剪辑的膝盖朝向
     /// 差一点，逐帧跟着动画走会让膝盖左右抖，看起来就是支撑腿「顿」。
     /// 0 = 完全跟随动画（不推荐），默认 0.05
@@ -100,6 +130,16 @@ impl Default for FootIkSettings {
             release_secs: 0.26,
             engage_secs: 0.10,
             toe_pivot_rise: 0.03,
+            // 0：重心压到踩实时的脚踝上就起跟，不等动画自己抬
+            heel_off_lead: 0.0,
+            // 300ms：走路的支撑期后半段大约这么长，起跟 → 蹬地摊满整段
+            heel_off_secs: 0.30,
+            // 80ms ≈ 5 帧：盖住落地时的重心抖动
+            heel_off_min_secs: 0.08,
+            // 140°：真实蹬地时踝角能到 130~160°（跖屈 40~70°），取中间偏保守；
+            // 动画剪辑通常只做到 110~120°，看着就是「折叠」
+            heel_off_ankle: 140.0,
+            heel_off_ankle_min: 90.0,
             // 50ms：盖住混合空间里两条剪辑的膝盖朝向差异，又不至于跟不上转身
             pole_secs: 0.05,
             // 60ms（约 4 帧）：掐掉抬脚时的单帧朝向跳变，又不至于让脚掌跟不上摆动
@@ -124,6 +164,9 @@ impl FootIkSettings {
             release_secs: self.release_secs.max(0.0),
             engage_secs: self.engage_secs.max(0.0),
             toe_pivot_rise: self.toe_pivot_rise.max(0.0),
+            heel_off_lead: self.heel_off_lead.clamp(-0.2, 0.2),
+            heel_off_secs: self.heel_off_secs.max(1e-3),
+            heel_off_min_secs: self.heel_off_min_secs.max(0.0),
         }
     }
 }
@@ -173,6 +216,16 @@ pub struct FootIk {
     /// 最近一帧的锚点与修正量，调试面板 / 测试读取
     anchors: [Option<Vec3>; 2],
     correction: [f32; 2],
+    /// 两只脚最近一帧的抬跟进度（0..1）、脚掌俯角（度，相对地面）
+    /// 与抬完之后的**踝角**（度，脚掌与小腿的夹角）
+    heel: [f32; 2],
+    pitch: [f32; 2],
+    ankle: [f32; 2],
+    /// 前掌骨（球窝/跖趾关节）这一帧反向折了多少度（抬跟时脚趾留在地上靠它）
+    toe_bend: [f32; 2],
+    /// 抬跟的淡出进度（1 = 还在支撑期，0 = 离地后已经收干净），按
+    /// [`LIFT_RELEASE_SECS`] 推进。和锁脚的强度分开，脚离地时不会拖着放平
+    lift_out: [f32; 2],
 }
 
 impl Default for FootIk {
@@ -192,6 +245,11 @@ impl Default for FootIk {
             air_secs: [1.0; 2],
             anchors: [None; 2],
             correction: [0.0; 2],
+            heel: [0.0; 2],
+            pitch: [0.0; 2],
+            ankle: [0.0; 2],
+            toe_bend: [0.0; 2],
+            lift_out: [0.0; 2],
         }
     }
 }
@@ -221,6 +279,36 @@ impl FootIk {
     /// 两只脚当前承重点沿脚掌滑到哪了（0 = 脚踝，1 = 前掌）
     pub fn roll(&self) -> [f32; 2] {
         [self.locks[0].roll(), self.locks[1].roll()]
+    }
+
+    /// 两只脚最近一帧的抬跟进度（0..1）
+    #[allow(dead_code)] // 调试面板 / 测试读数用
+    pub fn heel_off(&self) -> [f32; 2] {
+        self.heel
+    }
+
+    /// 两只脚最近一帧的脚掌俯角（度，相对地面，脚跟抬起为正）
+    #[allow(dead_code)] // 调试面板 / 测试读数用
+    pub fn pitch(&self) -> [f32; 2] {
+        self.pitch
+    }
+
+    /// 两只脚最近一帧的**踝角**（度，脚掌与小腿的夹角）。90 = 站立，
+    /// 蹬地时应当爬向 130~160。
+    ///
+    /// 用的是**这一帧实际解出来的膝**（和抬跟/地板同一个口径），所以面板上的数
+    /// 就是画面上那个角。早先版本用动画的膝，读数比画面高 5~10° —— 面板够 90、
+    /// 腿上还折着
+    #[allow(dead_code)] // 调试面板 / 测试读数用
+    pub fn ankle_deg(&self) -> [f32; 2] {
+        self.ankle
+    }
+
+    /// 前掌骨（球窝/跖趾关节）反向折角（度）。抬跟时脚趾留在地上、脚掌绕它
+    /// 转过去，折的就是这个角；超过 `TOE_BEND_MAX` 之后脚趾才跟着脚掌走
+    #[allow(dead_code)] // 调试面板 / 测试读数用
+    pub fn toe_bend_deg(&self) -> [f32; 2] {
+        self.toe_bend
     }
 
     /// 两只脚这一帧施加的锁脚强度（0..1），调试面板看「加压/放开」的过程
@@ -258,6 +346,9 @@ struct Leg {
     toe: Option<Entity>,
     /// 踝到前掌的竖直距离（0 = 没量到）。锁脚拿它把踝高换算成真正的地面高度
     toe_drop: f32,
+    /// 静止姿态下「踝→前掌骨」相对地面的俯角（度）。纯骨骼摆放的常量：
+    /// 脚掌平放时 `foot_pitch_deg` 读出来的就是它（这个项目的 rig 是 26~62° 不等）
+    foot_tilt: f32,
 }
 
 impl Plugin for FootIkPlugin {
@@ -300,7 +391,12 @@ fn attach_rigs(
             continue;
         }
         if let Some(rig) = build_rig(model, &children, &names, &parents, &transforms) {
-            info!("脚部 IK 骨架就绪：{model:?}，{} 节脊椎链", rig.spine.len());
+            info!(
+                "脚部 IK 骨架就绪：{model:?}，{} 节脊椎链，前掌骨静止俯角 {:.1}°/{:.1}°",
+                rig.spine.len(),
+                rig.legs[0].foot_tilt,
+                rig.legs[1].foot_tilt
+            );
             ik.rig = Some(rig);
         }
     }
@@ -440,6 +536,11 @@ fn solve_foot_ik(
             landing,
             landing_from,
             air_secs,
+            heel,
+            pitch,
+            ankle,
+            toe_bend,
+            lift_out,
             ..
         } = &mut *ik;
         let ground = *ground;
@@ -462,6 +563,10 @@ fn solve_foot_ik(
             *landing = [0.0; 2];
             *landing_from = [None; 2];
             *air_secs = [1.0; 2];
+            *heel = [0.0; 2];
+            *pitch = [0.0; 2];
+            *ankle = [0.0; 2];
+            *lift_out = [0.0; 2];
             continue;
         }
 
@@ -495,16 +600,25 @@ fn solve_foot_ik(
             let lower_world = upper_world * lower.compute_affine();
             let foot_world = lower_world * foot.compute_affine();
             // 前掌：脚骨的世界矩阵 × 前掌骨局部变换
-            let toe = leg
+            let toe_local = leg
                 .toe
-                .and_then(|entity| transforms.get(entity).ok().map(|transform| *transform))
-                .map(|transform| (foot_world * transform.compute_affine()).translation.into());
+                .and_then(|entity| transforms.get(entity).ok().map(|transform| *transform));
+            let toe = toe_local.map(|transform| (foot_world * transform.compute_affine()).translation.into());
+            let toe_rot = toe_local.map(|transform| {
+                (spine_rot
+                    * upper.rotation
+                    * lower.rotation
+                    * foot.rotation
+                    * transform.rotation)
+                    .normalize()
+            });
 
             poses[index] = Some(LegPose {
                 root: upper_world.translation.into(),
                 joint: lower_world.translation.into(),
                 end: foot_world.translation.into(),
                 toe,
+                toe_rot,
                 parent_rot: spine_rot,
                 upper_rot: spine_rot * upper.rotation,
                 lower_rot: spine_rot * upper.rotation * lower.rotation,
@@ -519,6 +633,9 @@ fn solve_foot_ik(
             };
 
             let support = contacts[index];
+            // 重心（骨盆）= 脊椎链最末一节的世界位置。抬跟时机拿它沿脚掌朝向投影，
+            // 判「重心有没有压过着地脚」；用本帧自己乘出来的矩阵，不落后一帧
+            let body = Some(Vec3::from(spine_world.translation));
             // 目标位置里已经带着「解除锁定后还没还完的残差」，
             // 所以抬脚是平滑追上动画，不会从锚点瞬移回去
             let (lock_target, lock_weight) = locks[index].update(
@@ -527,6 +644,7 @@ fn solve_foot_ik(
                     toe: pose.toe,
                     toe_drop: rig.legs.get(index).map(|leg| leg.toe_drop).unwrap_or(0.0),
                     floor: ground[index].map(|hit| hit.height),
+                    body,
                 },
                 support,
                 on,
@@ -536,8 +654,141 @@ fn solve_foot_ik(
             anchors[index] = locks[index].anchor();
             // 锁脚权重再乘全局淡入：任何开关/切换都在这里平滑掉
             let weight = (lock_weight * blend).clamp(0.0, 1.0);
-            let target = pose.end.lerp(lock_target, weight);
+            let mut target = pose.end.lerp(lock_target, weight);
             correction[index] = (target - pose.end).length();
+
+            // 膝盖朝向（极点）：动画的膝盖方向低通一下再交给求解器。
+            // 混合空间换剪辑 / 权重抖动时，动画极点会逐帧晃，膝盖跟着晃就是「顿」；
+            // 平滑后膝盖只朝一个方向慢慢转，转身时 50ms 的滞后肉眼看不出来。
+            // 抬跟段要拿它探解，所以在这里算一次、后面共用（每帧同一条腿只平滑一次）
+            let animated_pole = (pose.joint - pose.root).normalize_or_zero();
+            let smoothed_pole = smooth_pole(poles[index], animated_pole, dt, settings.pole_secs);
+            if smoothed_pole.is_some() {
+                poles[index] = smoothed_pole;
+            }
+            // 极点退化（腿完全伸直）：交给求解器自己兜底
+            let pole = smoothed_pole.unwrap_or(pose.joint - pose.root);
+
+            // ---- 抬跟：绕前掌把脚掌俯仰补到目标角 ----
+            // 锁脚只保证「前掌在原地」，脚跟抬多高完全取决于脚掌俯仰多少；动画
+            // 自己的蹬地幅度常常不到 45°，看起来像是还没踩实就抬脚。这里把脚掌
+            // 继续俯下去，踝随之抬高，前掌仍钉在原地。只补不足：动画自己俯得更大
+            // 就原样保留。
+            //
+            // 位置和旋转必须一起抬（绕同一个前掌轴转同一个角），否则脚掌转了、
+            // 踝却没抬，前掌就被压进地里，再被「不穿地」的夹紧掰回来 —— 观感就是
+            // 脚掌先翘一下又放平。离地后由 `lift_out` 在 0.1s 内收干净。
+            //
+            // 口径是**踝角** φ = 90 + P − L（P = 脚掌相对地面的俯角，L = 小腿前倾）。
+            // 关键：L 必须拿**解出来的膝**算。锁脚把踝钉在原地之后，动画的膝位置
+            // 就不是真实几何了 —— 拿动画膝算，读数能有 90，画面上小腿已经压到 70，
+            // 面板和画面成了两个口径。所以下面每一轮都先探一次解
+            let heel_progress = locks[index].heel_off();
+            // 离地后 0.1s 内收回，而不是跟锁脚强度一起慢放 0.26s（见
+            // LIFT_RELEASE_SECS 的说明）。踩实期间恒为 1，支撑里抖动也不会掉
+            let lift_out_now = if locks[index].is_planted() {
+                1.0
+            } else {
+                (lift_out[index] - dt / LIFT_RELEASE_SECS).max(0.0)
+            };
+            lift_out[index] = lift_out_now;
+            let lift =
+                smoothstep(((heel_progress - ROLL_SPAN) / (1.0 - ROLL_SPAN)).clamp(0.0, 1.0))
+                    * smoothstep(lift_out_now);
+            // 动画自己给的地面俯角（不含我们加的）
+            // 骨骼自己的「踝→前掌」向量在静止姿态就是俯的：脚掌平放时它已经
+            // 是 26~62°（每根 rig 的摆放不同）。下面 `pitch` / 踝角 / 目标全用
+            // **脚掌面**口径（平放 = 0），所以每帧先减掉这个常量
+            let foot_tilt = rig.legs.get(index).map(|leg| leg.foot_tilt).unwrap_or(0.0);
+            let pitch_anim = match pose.toe {
+                Some(toe) => foot_pitch_deg(toe, pose.end) - foot_tilt,
+                None => 0.0,
+            };
+            let mut pitch_deg = pitch_anim;
+            // 抬跟的旋转每次都从**动画原样**的脚掌出发（`heel_off_lift` 的位移也是
+            // 相对动画踝算的）。迭代里如果在已经转过的 `pose.foot_rot` 上再乘，
+            // 各轮的旋转会叠起来，俯角就远超目标
+            let foot_rot0 = pose.foot_rot;
+            let base_target = target;
+            let mut lift_offset = Vec3::ZERO;
+            // 抬跟这一帧实际让脚掌绕前掌转了 (轴, 角多少度)：前掌骨要按它兜回来
+            let mut lift_axis = Vec3::Y;
+            let mut lift_angle = 0.0f32;
+            if weight > 0.0
+                && let Some(toe) = pose.toe
+            {
+                let floor = settings.heel_off_ankle_min;
+                // 本帧最多补到多少度：按**上一帧**实际落到的俯角限速、跨帧累积。
+                // 不能按单次调用限速 —— 抬跟每帧从头重算（无状态），单次限 4° 的话
+                // 三圈也只有 12°，看上去就是卡住了
+                let cap = pitch[index] + ANKLE_FLOOR_RATE * dt;
+                // 目标踝角：抬跟斜坡把动画自己的踝角往 `heel_off_ankle` 推（只推不拉），
+                // 地板 `heel_off_ankle_min` 是整段支撑期都得守住的底
+                let mut phi_goal: Option<f32> = None;
+                // 上一次探解时的 (俯角, 小腿前倾)，用来量 dL/dP
+                let mut last = (pitch_anim, 0.0f32);
+                let mut slope = 0.0f32;
+                for _ in 0..4 {
+                    let Some((knee, ankle_now)) = probe_leg(pose, target, pole) else {
+                        break;
+                    };
+                    let lean = shank_lean_deg(knee, ankle_now, toe);
+                    let phi = 90.0 + pitch_deg - lean;
+                    let goal = *phi_goal.get_or_insert_with(|| {
+                        let animated = 90.0 + pitch_anim - lean;
+                        (animated + (settings.heel_off_ankle - animated).max(0.0) * lift)
+                            .max(floor)
+                    });
+                    let need = goal - phi;
+                    // 进入容差就停；冲过头超过 1° 也要往回修（斜率在低俯角处偏大，
+                    // 一步跨过头是常事，不修就永远停在 98°）
+                    if (-1.0..=0.15).contains(&need) {
+                        break;
+                    }
+                    // 踝一抬起来小腿就更斜（实测 dL/dP ≈ 0.7），把差值直接加到俯角上
+                    // 收敛比接近 0.67，每轮只爬一半 —— 用测到的斜率换算成一步到位
+                    if (pitch_deg - last.0).abs() > 1e-2 {
+                        slope = ((lean - last.1) / (pitch_deg - last.0)).clamp(-0.5, 0.8);
+                    }
+                    // 俯角上限是「骨向量不许接近竖直」：面口径要减掉静止俯角
+                    let pitch_max = (HEEL_OFF_PITCH_MAX - foot_tilt).max(pitch_anim);
+                    let want = (pitch_deg + need / (1.0 - slope).max(0.2) * 0.9)
+                        .max(pitch_anim)
+                        .min(cap.max(pitch_anim))
+                        .min(pitch_max);
+                    // 上一轮若冲过头（斜率在低俯角处偏大），这一轮允许往回修
+                    if (want - pitch_deg).abs() <= 1e-3 {
+                        break;
+                    }
+                    let Some((lift_rot, lift_delta, lifted_pitch)) =
+                        heel_off_lift(toe, pose.end, want, foot_tilt, 1.0)
+                    else {
+                        break;
+                    };
+                    let (axis, angle) = lift_rot.to_axis_angle();
+                    lift_axis = axis;
+                    lift_angle = angle.to_degrees();
+                    pose.foot_rot = (lift_rot * foot_rot0).normalize();
+                    // `heel_off_lift` 的位移是**相对动画踝**算的，所以这里重置而不是累加
+                    lift_offset = lift_delta;
+                    target = base_target + lift_delta * weight;
+                    last = (pitch_deg, lean);
+                    pitch_deg = lifted_pitch;
+                }
+            }
+            pitch[index] = pitch_deg;
+            // 抬完之后实际落在多少度的踝角（调试面板拿它对着 90~160 的区间看）。
+            // 同样按解出来的膝算 —— 这是**画面上的那个角**，不是动画膝的近似
+            let ankle_read = match pose.toe {
+                Some(toe) => probe_leg(pose, target, pole).map_or(0.0, |(knee, ankle_now)| {
+                    (90.0 + pitch_deg - shank_lean_deg(knee, ankle_now, toe))
+                        .clamp(0.0, 180.0)
+                }),
+                None => 0.0,
+            };
+            ankle[index] = ankle_read;
+            toe_bend[index] = 0.0;
+            heel[index] = heel_progress;
 
             // 脚掌朝向（踝角低通 + 前掌不穿地的有记忆偏移）。注意这一段必须在
             // 「weight 为 0 就跳过」**之前**：抬脚后锁脚权重就是 0，摆动期整段
@@ -568,8 +819,14 @@ fn solve_foot_ik(
             // 还在从 0 爬到 1，需求（wanted = 地面 − 踝高）跟着一点点变 ——
             // 那 3~4° 的「落下去又反弹」就是这么来的。
             // 也不能钉成锚点：支撑后期承重点滑向前掌，踝会跟着抬高，
-            // 钉在锚点算等于一直认为踝很低，前掌会被抬起 3cm（浮空）
-            let clamp_ankle = if planted_now { lock_target } else { target };
+            // 钉在锚点算等于一直认为踝很低，前掌会被抬起 3cm（浮空）。
+            // 抬跟把踝又绕前掌抬了一截（`lift_offset`），这里要一起算进去，
+            // 否则夹紧会以为前掌还沉在地下，把脚掌往回掰
+            let clamp_ankle = if planted_now {
+                lock_target + lift_offset
+            } else {
+                target
+            };
             let (foot_rot, rot_state, clamp_state) = resolve_foot_orientation(
                 foot_rots[index],
                 toe_clamps[index],
@@ -592,14 +849,29 @@ fn solve_foot_ik(
             toe_clamps[index] = clamp_state;
             pose.foot_rot = foot_rot;
 
+            // 前掌骨（球窝/跖趾关节）：脚掌绕前掌转过去 `lift_angle`，前掌骨要是
+            // 跟着走，脚趾就钻进地里（画面上一整块平板脚跟着翘）。这里把它按
+            // **世界朝向**反向兜回来同样一个角（最多 `TOE_BEND_MAX`），脚趾就留在
+            // 地上、在球窝处折起来。用的是定稿后的 `pose.foot_rot`，所以低通和
+            // 不穿地夹紧带来的偏差也一起算进去
+            if lift_angle > 0.5
+                && let Some(toe_rot0) = pose.toe_rot
+                && let Some(leg) = rig.legs.get(index)
+                && let Some(toe) = leg.toe
+            {
+                // 折满 `TOE_BEND_MAX` 之后才跟着脚掌走：世界朝向 = 动画 + 剩下的角
+                let residual = (lift_angle - TOE_BEND_MAX).max(0.0).to_radians();
+                let toe_world = Quat::from_axis_angle(lift_axis, residual) * toe_rot0;
+                if let Ok(mut transform) = transforms.get_mut(toe) {
+                    let local = (pose.foot_rot.inverse() * toe_world).normalize();
+                    toe_bend[index] = local.angle_between(Quat::IDENTITY).to_degrees();
+                    transform.rotation = local;
+                }
+            }
+
             if weight <= 0.0 {
                 // 权重为 0：位置全交给动画，但脚掌朝向要写回去（低通/淡出还在跑）。
-                // 极点也照样跟着动画走，否则落地那帧膝方向还停在摆动开始时的旧值
-                let animated_pole = (pose.joint - pose.root).normalize_or_zero();
-                if let Some(pole) = smooth_pole(poles[index], animated_pole, dt, settings.pole_secs)
-                {
-                    poles[index] = Some(pole);
-                }
+                // 极点已经在上面跟着动画走过了
                 if let Some(leg) = rig.legs.get(index) {
                     if let Ok(mut transform) = transforms.get_mut(leg.foot) {
                         transform.rotation =
@@ -608,19 +880,6 @@ fn solve_foot_ik(
                 }
                 continue;
             }
-
-            // 膝盖朝向（极点）：动画的膝盖方向低通一下再交给求解器。
-            // 混合空间换剪辑 / 权重抖动时，动画极点会逐帧晃，膝盖跟着晃就是「顿」；
-            // 平滑后膝盖只朝一个方向慢慢转，转身时 50ms 的滞后肉眼看不出来
-            let animated_pole = (pose.joint - pose.root).normalize_or_zero();
-            let pole = match smooth_pole(poles[index], animated_pole, dt, settings.pole_secs) {
-                Some(pole) => {
-                    poles[index] = Some(pole);
-                    pole
-                }
-                // 极点退化（腿完全伸直）：交给求解器自己兜底
-                None => pose.joint - pose.root,
-            };
 
             let Some(solved) = solve_leg(pose, target, pole) else {
                 continue;
@@ -641,6 +900,15 @@ fn solve_foot_ik(
     }
 }
 
+/// 只解不写：按当前姿态把腿解一次，返回 `(解出来的膝盖, 实际到达的踝)`。
+///
+/// 抬跟与踝角读数都要它：锁脚把踝钉在原位之后，动画的膝位置不再是真实几何，
+/// 拿动画膝去量小腿前倾会系统性偏小（面板看着够 90，画面上小腿已经压到 70）
+fn probe_leg(pose: LegPose, target: Vec3, pole: Vec3) -> Option<(Vec3, Vec3)> {
+    solve_two_bone(pose.root, pose.joint, pose.end, target, pole)
+        .map(|solved| (solved.joint, solved.end))
+}
+
 /// 一条腿求解前的姿态快照（全部是世界空间 / 世界旋转）。
 #[derive(Clone, Copy)]
 struct LegPose {
@@ -649,6 +917,9 @@ struct LegPose {
     end: Vec3,
     /// 前掌关节（`*ToeBase`）的世界位置；骨架里没有就是 `None`
     toe: Option<Vec3>,
+    /// 前掌骨的**世界旋转**（动画给的那个）。抬跟要把脚掌转过去，前掌骨要么
+    /// 跟着扎进地里，要么在球窝处折起来 —— 这里留一份原样当参照
+    toe_rot: Option<Quat>,
     /// 上段骨骼父节点的世界旋转（hips）
     parent_rot: Quat,
     upper_rot: Quat,
@@ -733,6 +1004,36 @@ fn smooth_pole(previous: Option<Vec3>, animated: Vec3, dt: f32, secs: f32) -> Op
 /// 前掌夹紧的最大角度（弧度，约 15°）。前掌按 16cm 算，15° 能把前掌抬 4cm，
 /// 足够盖住动画的正常过冲；再大就不是「修瑕疵」而是「脚掌被掰变形」了
 const TOE_CLAMP_MAX: f32 = 0.26;
+
+/// 抬跟一次最多补多少度（安全阀）。目标角本身才是上限，这个只防动画姿态异常时
+/// 把脚掰成钩子；正常「动画俯 20°、目标 55°」只会补 35°
+/// 前掌骨（球窝/跖趾关节）能反向折多少度。抬跟时脚掌绕前掌转过去，脚趾留在
+/// 地上不动，靠的就是这个关节；超过它就跟着脚掌走（人踮到极限时也是这样）
+const TOE_BEND_MAX: f32 = 60.0;
+
+/// 单次调用（一帧内）能补的俯角上限。它只是安全网：真正的限速是
+/// `ANKLE_FLOOR_RATE`（跨帧），口径是「脚掌面」，脚本来就背屈的 rig 需要的
+/// 补角可以超过 60°
+const HEEL_OFF_LIFT_MAX: f32 = 90.0;
+
+/// 「踝角地板」的软起区间（度）：差得少时补得缓一点（只是数值上的平滑，
+/// 「踝角地板」每帧最多补多少度（按每秒给）。它低于脚掌旋转限速
+/// （`foot_max_rate` 默认 360°/s），脚掌的实际旋转才跟得上踝的位移，前掌不会被带跑
+const ANKLE_FLOOR_RATE: f32 = 240.0;
+
+/// 抬跟在脚离地后收回的时长（秒）。
+///
+/// **不能**跟着锁脚的 `release_secs`（0.26s）走：那是给「位置残差」还债用的，
+/// 形状是两端速度为 0 的慢放。用它收俯角，脚离地后还会被拽在原地、一边慢慢放平
+/// —— 观感正是「被身体带着走」。0.10s 只盖住三四帧，蹬完那一下还留在脚上，
+/// 然后立刻交回动画去做摆动期的背屈
+const LIFT_RELEASE_SECS: f32 = 0.10;
+
+/// 折算出来的「脚掌相对地面的俯角」上限（度）。
+///
+/// 脚掌转到接近竖直时，绕前掌的转轴（Y × 脚掌水平朝向）会退化，
+/// `heel_off_lift` 也会在 ~78° 处退出。目标最多到这里，免得算出个掰不动的角度
+const HEEL_OFF_PITCH_MAX: f32 = 76.0;
 
 /// 「前掌不穿地」那部分修正收回的时间常数（秒）。脚一离地这十几度就要赶紧收干净，
 /// 所以它**不**跟着 [`FootIkSettings::foot_max_rate`] 走。
@@ -944,6 +1245,75 @@ fn approach(current: f32, target: f32, max_delta: f32) -> f32 {
     }
 }
 
+/// `smoothstep`：0..1 单调、两端导数为 0，起跟收跟都不会有折角
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 脚掌俯角（度）：脚跟抬起为正 —— 前掌在踝之下越多，角度越大
+fn foot_pitch_deg(toe: Vec3, ankle: Vec3) -> f32 {
+    let foot = toe - ankle;
+    let horizontal = Vec2::new(foot.x, foot.z).length();
+    (-foot.y).atan2(horizontal.max(1e-4)).to_degrees()
+}
+
+/// 小腿的前倾角（度）：`knee − ankle` 在「水平 · 脚掌朝向」方向上的分量，
+/// 膝在踝前方为正。锚定在脚掌朝向而不是世界 +Z，转身、斜向站位时口径才对得上
+fn shank_lean_deg(knee: Vec3, ankle: Vec3, toe: Vec3) -> f32 {
+    let shank = knee - ankle;
+    let forward = Vec3::new(toe.x - ankle.x, 0.0, toe.z - ankle.z).normalize_or_zero();
+    if forward.length_squared() < 0.5 || !shank.is_finite() {
+        return 0.0;
+    }
+    // 前倾角 = 小腿在「上」与「前」两个方向上的分量之比
+    shank.dot(forward).atan2(shank.y).to_degrees()
+}
+
+/// 抬跟：绕前掌把脚掌俯仰补到 `pitch_target`，返回 `(世界旋转, 踝的位移, 抬完的俯角)`。
+///
+/// - 轴取水平面内垂直于脚掌朝向的方向，所以只有俯仰变、前掌的水平方位不变；
+/// - **绕前掌转**：踝的位移与旋转是同一件事的两个面（`lifted = toe - rot * (toe - ankle)`），
+///   两边一起用，前掌就钉在原地不动；
+/// - `k` 是本节拍的进度（0..1）：0 不动、1 到目标；动画自己已经俯得比目标更大时
+///   不再往回掰 —— 这里补的是「没蹬够」，不削真实的蹬地。
+/// - `pitch_target_deg` 与返回值都是**脚掌面**口径（脚掌平放 = 0）；`foot_tilt_deg`
+///   是「踝→前掌」这条骨向量在静止姿态下的俯角 —— 骨向量口径 = 面口径 + 它
+fn heel_off_lift(
+    toe: Vec3,
+    ankle: Vec3,
+    pitch_target_deg: f32,
+    foot_tilt_deg: f32,
+    k: f32,
+) -> Option<(Quat, Vec3, f32)> {
+    // 目标可以是负的（脚掌面朝「背屈」那一侧也算合法姿态），只挡非有限值
+    if !pitch_target_deg.is_finite() || k <= 1e-4 {
+        return None;
+    }
+    let foot = toe - ankle;
+    if !foot.is_finite() || foot.length_squared() <= 1e-6 {
+        return None;
+    }
+    // 轴取水平面内垂直于脚掌朝向的方向：脚掌近乎竖直（脚尖朝下）时轴退化，
+    // 那种姿态也谈不上「脚跟再抬」
+    let horizontal_len = Vec2::new(foot.x, foot.z).length();
+    if horizontal_len < foot.length() * 0.2 {
+        return None;
+    }
+    let horizontal = Vec3::new(foot.x, 0.0, foot.z) / horizontal_len;
+    let pitch_now = foot_pitch_deg(toe, ankle) - foot_tilt_deg;
+    // 差多少补多少，但单次最多补 `HEEL_OFF_LIFT_MAX`
+    let extra = (pitch_target_deg - pitch_now).clamp(0.0, HEEL_OFF_LIFT_MAX) * k.clamp(0.0, 1.0);
+    if extra <= 1e-3 {
+        return None;
+    }
+    // 正角 = 脚尖往下（脚跟往上）。轴 = 上 × 脚掌水平朝向
+    let axis = Vec3::Y.cross(horizontal).normalize_or_zero();
+    let rot = Quat::from_axis_angle(axis, extra.to_radians());
+    let lifted = toe - rot * foot;
+    Some((rot, lifted - ankle, pitch_now + extra))
+}
+
 /// 从模型往下找名字以 `suffix` 结尾的骨骼（跳过 Ctrl / Helper / IK 控制骨）
 fn find_bone(
     model: Entity,
@@ -999,6 +1369,7 @@ fn build_rig(
         foot: hips,
         toe: None,
         toe_drop: 0.0,
+        foot_tilt: 0.0,
     }; 2];
     for (index, side) in ["Left", "Right"].into_iter().enumerate() {
         let upper = find_bone(model, children, names, &format!("{side}UpLeg"))?;
@@ -1012,16 +1383,53 @@ fn build_rig(
             .and_then(|entity| transforms.get(entity).ok())
             .map(|transform| (-transform.translation.y).max(0.0))
             .unwrap_or(0.0);
+        // 踝角口径的标定：`foot_pitch_deg` 量的是踝→前掌骨这条向量，脚掌平放时
+        // 它并不是 0 —— 前掌关节在踝下方 6~10cm，这根骨头本身就俯了 26~62°。
+        // 不减掉它，「踝角 = 90 + P − L」就每根 rig 多算一个常数，
+        // 地板写 90 实际只压到 55（Swat 这种脚骨更陡的 rig 只到 34）
+        let foot_tilt = toe
+            .and_then(|toe| {
+                let foot_pos = world_position(model, foot, parents, transforms)?;
+                let toe_pos = world_position(model, toe, parents, transforms)?;
+                Some(foot_pitch_deg(toe_pos, foot_pos))
+            })
+            .filter(|tilt| tilt.is_finite() && (-5.0..85.0).contains(tilt))
+            .unwrap_or(0.0);
         legs[index] = Leg {
             upper,
             lower,
             foot,
             toe,
             toe_drop,
+            foot_tilt,
         };
     }
 
     Some(FootRig { spine, legs })
+}
+
+/// 从 `model` 往下累乘局部变换，得到某个骨骼的世界位置（只在挂载骨架时用一次）
+fn world_position(
+    model: Entity,
+    target: Entity,
+    parents: &Query<&ChildOf>,
+    transforms: &Query<&Transform>,
+) -> Option<Vec3> {
+    let mut chain = vec![target];
+    let mut cursor = target;
+    while cursor != model {
+        cursor = parents.get(cursor).ok()?.parent();
+        chain.push(cursor);
+    }
+    let mut world = Affine3A::IDENTITY;
+    for entity in chain.iter().rev() {
+        let local = transforms
+            .get(*entity)
+            .copied()
+            .unwrap_or(Transform::IDENTITY);
+        world *= local.compute_affine();
+    }
+    Some(world.translation.into())
 }
 
 #[cfg(test)]
@@ -1032,6 +1440,7 @@ mod tests {
     fn straight_pose() -> LegPose {
         LegPose {
             toe: None,
+            toe_rot: None,
             root: Vec3::new(0.0, 1.0, 0.0),
             joint: Vec3::new(0.0, 0.45, 0.2),
             end: Vec3::ZERO,
@@ -1098,15 +1507,375 @@ mod tests {
     /// 世界空间里支撑脚就会横着挪一小段。这里搭一套简化骨架（链长与 Amy 接近），
     /// 每帧模拟动画层重新写回腿部原姿态，再让身体偏航 0.9°/帧走 20 帧，
     /// 最后检查脚踝的世界位置还贴着锚点、骨长没被拉断。
+    /// 踝角的地板：脚掌平放、小腿前倾 17° 时，踝角本来会压到 73°（「折叠」）。
+    /// 这条地板要求脚跟先离地、脚掌俯下去抵消小腿前倾，把踝角守在 90°
+    ///
+    /// 把蹬地目标（`heel_off_ankle`）关掉，让这条约束单独受检：脚掌要俯到 ≈ 17°，
+    /// 踝角要停在 90° 而不是 73°
     #[test]
-    fn ik_pins_the_ankle_while_the_body_turns() {
+    fn the_ankle_angle_never_folds_below_the_floor() {
         let mut app = App::new();
-        app.insert_resource(FootIkSettings::default());
+        app.insert_resource(FootIkSettings {
+            toe_pivot_rise: 100.0,
+            heel_off_lead: 0.0,
+            // 关掉「蹬到 140°」那个目标，只剩地板在管
+            heel_off_ankle: 0.0,
+            heel_off_ankle_min: 90.0,
+            ..FootIkSettings::default()
+        });
         app.insert_resource(Time::<()>::default());
 
         let world = app.world_mut();
         let root = world
             .spawn((Name::new("Avatar"), Transform::default()))
+            .id();
+        let model = world
+            .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
+            .id();
+        let armature = world
+            .spawn((Name::new("Armature"), Transform::default(), ChildOf(model)))
+            .id();
+        let hips = world
+            .spawn((
+                Name::new("mixamorig:Hips"),
+                Transform::from_xyz(0.0, 0.9, 0.0),
+                ChildOf(armature),
+            ))
+            .id();
+
+        // 小腿前倾 0.3rad（17.2°）；脚掌**平放**：脚骨世界朝向要把前掌那 26.6° 的
+        // 下俯抵消掉，所以 flat 要一起减掉，脚掌相对地面才是 0°
+        let bend = Quat::from_rotation_x(0.3);
+        let flat = Quat::from_rotation_x(-0.3 - 0.5191);
+        let make_leg = |world: &mut World, side: &str, x: f32| {
+            let upper = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}UpLeg")),
+                    Transform::from_xyz(x, 0.0, 0.0),
+                    ChildOf(hips),
+                ))
+                .id();
+            let lower = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}Leg")),
+                    Transform::from_xyz(0.0, -0.35, 0.0).with_rotation(bend),
+                    ChildOf(upper),
+                ))
+                .id();
+            let foot = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}Foot")),
+                    Transform::from_xyz(0.0, -0.35, 0.0).with_rotation(flat),
+                    ChildOf(lower),
+                ))
+                .id();
+            let toe = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}ToeBase")),
+                    Transform::from_xyz(0.0, -0.08, 0.14),
+                    ChildOf(foot),
+                ))
+                .id();
+            (
+                Leg {
+                    upper,
+                    lower,
+                    foot,
+                    toe: Some(toe),
+                    toe_drop: 0.0,
+                    foot_tilt: 0.0,
+                },
+                (upper, lower, foot, toe),
+            )
+        };
+        let (left, left_bones) = make_leg(world, "Left", 0.08);
+        let (right, right_bones) = make_leg(world, "Right", -0.08);
+
+        let mut ik = FootIk::default();
+        ik.contacts = [1.0, 1.0];
+        ik.blend = 1.0;
+        ik.rig = Some(FootRig {
+            spine: vec![root, model, armature, hips],
+            legs: [left, right],
+        });
+        world.entity_mut(model).insert(ik);
+
+        let originals = [
+            (left_bones.0, Quat::IDENTITY),
+            (left_bones.1, bend),
+            (left_bones.2, flat),
+            (left_bones.3, Quat::IDENTITY),
+            (right_bones.0, Quat::IDENTITY),
+            (right_bones.1, bend),
+            (right_bones.2, flat),
+        ];
+        let toe_world = |world: &World| {
+            let mut matrix = Affine3A::IDENTITY;
+            for entity in [
+                root, model, armature, hips, left_bones.0, left_bones.1, left_bones.2, left_bones.3,
+            ] {
+                let local = world.get::<Transform>(entity).expect("骨骼");
+                matrix *= local.compute_affine();
+            }
+            Vec3::from(matrix.translation)
+        };
+
+        let toe_rot_world = |world: &World| {
+            let mut rotation = Quat::IDENTITY;
+            for entity in [
+                root, model, armature, hips, left_bones.0, left_bones.1, left_bones.2, left_bones.3,
+            ] {
+                rotation *= world.get::<Transform>(entity).expect("骨骼").rotation;
+            }
+            rotation
+        };
+
+        let mut planted_toe = Vec3::ZERO;
+        let mut toe_rot0 = Quat::IDENTITY;
+        let mut angles = Vec::new();
+        for frame in 0..30u32 {
+            let world = app.world_mut();
+            for (entity, rotation) in originals {
+                world.get_mut::<Transform>(entity).expect("腿骨").rotation = rotation;
+            }
+            if frame < 12 {
+                world.get_mut::<Transform>(root).expect("根").translation.z += 0.012;
+            }
+            if frame == 0 {
+                planted_toe = toe_world(world);
+                toe_rot0 = toe_rot_world(world);
+            }
+            world
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
+            world
+                .run_system_once(solve_foot_ik)
+                .expect("脚部 IK 系统跑不起来");
+            let ik = world.get::<FootIk>(model).expect("FootIk 组件");
+            angles.push((ik.pitch()[0], ik.ankle_deg()[0]));
+        }
+
+        let world = app.world();
+        // 抬跟把脚掌绕前掌转了 30°+，前掌骨必须在球窝处折起来同样的角，
+        // 脚尖的世界朝向才不会跟着扎进地里
+        let toe_rot1 = toe_rot_world(world);
+        assert!(
+            toe_rot0.angle_between(toe_rot1) < 0.035,
+            "前掌骨的世界朝向应基本不变（脚趾留在地上），实际偏了 {:.1}°",
+            toe_rot0.angle_between(toe_rot1).to_degrees()
+        );
+        // 折角要和脚掌面俯角同源：脚掌绕前掌转了多少，前掌骨就得反向折多少
+        let toe_fold = world
+            .get::<Transform>(left_bones.3)
+            .expect("前掌骨")
+            .rotation
+            .angle_between(Quat::IDENTITY)
+            .to_degrees();
+        let sole = angles.last().expect("有帧").0;
+        assert!(
+            (toe_fold - sole).abs() < 3.0,
+            "前掌骨折角应 ≈ 脚掌面俯角（{sole:.1}°），实际 {toe_fold:.1}°"
+        );
+
+        let ik = world.get::<FootIk>(model).expect("FootIk 组件");
+        assert!(
+            ik.heel_off()[0] > 0.0,
+            "这个姿态下重心在踝前方，抬跟应当已经触发"
+        );
+        // 第一帧锁定那一刻踝角确实是折着的：脚掌平放 + 小腿前倾 → 90 − 17 ≈ 73。
+        // 地板一圈只准补 4°，所以头一两帧还看得见这个折角
+        let folded = angles[0].1;
+        assert!(
+            folded < 80.0,
+            "动画本身就把踝角折到 {folded:.1}°（脚掌平放、小腿前倾 17°）"
+        );
+        // 地板生效之后：脚掌俯到 ≈ 19°（小腿前倾随踝抬高从 17° 变成 ~19°），
+        // 踝角守在 90°
+        let (pitch, ankle) = *angles.last().expect("有帧");
+        assert!(
+            pitch > 15.0,
+            "脚掌应当绕前掌俯到小腿前倾的那个角度（≈19°），实际 {pitch:.1}°"
+        );
+        assert!(
+            ankle >= 89.0,
+            "踝角不许折到 90 以下，实际 {ankle:.1}°"
+        );
+        // 抬完之后一路上都不许再掉下去。
+        // 从这里起算而不是第 10 帧：地板按 ANKLE_FLOOR_RATE = 240°/s 限速（和动画
+        // 自身的跖屈叠起来不能超过单帧 10°），从 72.8° 爬到 90° 要 ~0.22s = 13 帧，
+        // 这十几帧里本来就还在爬
+        let lowest = angles[13..]
+            .iter()
+            .map(|(_, angle)| angle)
+            .cloned()
+            .fold(f32::MAX, f32::min);
+        assert!(lowest >= 89.0, "支撑后半段踝角掉到了 {lowest:.1}°");
+
+        // 前掌还是钉在原地：地板也是绕前掌补的
+        let toe = toe_world(world);
+        let drift = (toe - planted_toe).length();
+        assert!(drift < 0.02, "地板把前掌带走了 {drift:.3}m");
+    }
+
+    /// 踝角口径必须按**脚掌面**算，而 `foot_pitch_deg` 量的是「踝→前掌」这条骨
+    /// 向量：脚掌平放时它已经俯了 26~62°（每根 rig 不同）。这条测试把同一套几何
+    /// 的 `foot_tilt` 设成 29.7°，地板仍然要把**脚掌面**的踝角守在 90°，
+    /// 也就是骨向量口径下要走到 29.7° + 小腿前倾
+    #[test]
+    fn the_ankle_floor_measures_the_sole_not_the_bone() {
+        let mut app = App::new();
+        app.insert_resource(FootIkSettings {
+            toe_pivot_rise: 100.0,
+            heel_off_lead: 0.0,
+            heel_off_ankle: 0.0,
+            heel_off_ankle_min: 90.0,
+            max_correction: 0.40,
+            ..FootIkSettings::default()
+        });
+        app.insert_resource(Time::<()>::default());
+
+        let world = app.world_mut();
+        let root = world
+            .spawn((Name::new("Avatar"), Transform::default()))
+            .id();
+        let model = world
+            .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
+            .id();
+        let armature = world
+            .spawn((Name::new("Armature"), Transform::default(), ChildOf(model)))
+            .id();
+        let hips = world
+            .spawn((
+                Name::new("mixamorig:Hips"),
+                Transform::from_xyz(0.0, 0.9, 0.0),
+                ChildOf(armature),
+            ))
+            .id();
+
+        // 前掌关节在踝下方 8cm、前方 14cm → 静止俯角 29.7°（真实 rig 是 26~62°）
+        let tilt = (0.08f32).atan2(0.14).to_degrees();
+        let bend = Quat::from_rotation_x(0.3);
+        // 脚**平放**（脚掌面水平）：只抵消小腿前倾 17°，不再抵消脚骨自己那 29.7°
+        let flat = Quat::from_rotation_x(-0.3);
+        let make_leg = |world: &mut World, side: &str, x: f32| {
+            let upper = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}UpLeg")),
+                    Transform::from_xyz(x, 0.0, 0.0),
+                    ChildOf(hips),
+                ))
+                .id();
+            let lower = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}Leg")),
+                    Transform::from_xyz(0.0, -0.35, 0.0).with_rotation(bend),
+                    ChildOf(upper),
+                ))
+                .id();
+            let foot = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}Foot")),
+                    Transform::from_xyz(0.0, -0.35, 0.0).with_rotation(flat),
+                    ChildOf(lower),
+                ))
+                .id();
+            let toe = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}ToeBase")),
+                    Transform::from_xyz(0.0, -0.08, 0.14),
+                    ChildOf(foot),
+                ))
+                .id();
+            (
+                Leg {
+                    upper,
+                    lower,
+                    foot,
+                    toe: Some(toe),
+                    toe_drop: 0.08,
+                    foot_tilt: tilt,
+                },
+                (upper, lower, foot),
+            )
+        };
+        let (left, left_bones) = make_leg(world, "Left", 0.08);
+        let (right, _) = make_leg(world, "Right", -0.08);
+
+        let mut ik = FootIk::default();
+        ik.contacts = [1.0, 1.0];
+        ik.blend = 1.0;
+        ik.rig = Some(FootRig {
+            spine: vec![root, model, armature, hips],
+            legs: [left, right],
+        });
+        world.entity_mut(model).insert(ik);
+
+        let originals = [
+            (left_bones.0, Quat::IDENTITY),
+            (left_bones.1, bend),
+            (left_bones.2, flat),
+        ];
+        let mut angles = Vec::new();
+        for frame in 0..30u32 {
+            let world = app.world_mut();
+            for (entity, rotation) in originals {
+                world.get_mut::<Transform>(entity).expect("腿骨").rotation = rotation;
+            }
+            if frame < 12 {
+                world.get_mut::<Transform>(root).expect("根").translation.z += 0.012;
+            }
+            world
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
+            world
+                .run_system_once(solve_foot_ik)
+                .expect("脚部 IK 系统跑不起来");
+            let ik = world.get::<FootIk>(model).expect("FootIk 组件");
+            angles.push((ik.pitch()[0], ik.ankle_deg()[0]));
+        }
+
+        let (pitch, ankle) = *angles.last().expect("有帧");
+        // 脚掌平放、小腿前倾 17° → 踝角本来就在 73°，骨向量口径会把那 29.7°
+        // 算进去（读成 102.7°），面口径必须读回 73°
+        let folded = angles[0].1;
+        assert!(
+            (68.0..=76.0).contains(&folded),
+            "第一帧的面口径踝角应 ≈73°（90 − 17），实际 {folded:.1}°"
+        );
+        assert!(
+            angles[0].0.abs() < 2.0,
+            "脚掌面平放时面口径俯角应 ≈0°，实际 {:.1}°",
+            angles[0].0
+        );
+        // 地板生效后：脚掌面俯角要跟着小腿前倾走（踝抬 10cm 后小腿从 17° 斜到
+        // ~39°），踝角守在 90°
+        assert!(
+            (12.0..=45.0).contains(&pitch),
+            "面口径俯角应跟着小腿前倾（≈17° 起、随抬跟变大），实际 {pitch:.1}°"
+        );
+        assert!(
+            ankle >= 89.0,
+            "脚掌面的踝角应守在 90°，实际 {ankle:.1}°"
+        );
+    }
+
+    #[test]
+    fn ik_pins_the_ankle_while_the_body_turns() {
+        let mut app = App::new();
+        // 这条测的是「转身时脚踝被钉在原地」本身：抬跟会把踝绕前掌抬起来、
+        // 水平上也会跟着往后挪一截，那是另一条测试的事。这里把起跟的最小支撑
+        // 时长拉到超过这 20 帧，抬跟不介入
+        app.insert_resource(FootIkSettings {
+            heel_off_min_secs: 1.0,
+            ..FootIkSettings::default()
+        });
+        app.insert_resource(Time::<()>::default());
+
+        let world = app.world_mut();
+        // 起点往后放 15cm：小腿前倾会让脚落在骨盆后方，往回挪一点，
+        // 让「身体往前蹬出去」这段位移在模型里真的发生
+        let root = world
+            .spawn((Name::new("Avatar"), Transform::from_xyz(0.0, 0.0, -0.15)))
             .id();
         let model = world
             .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
@@ -1160,6 +1929,7 @@ mod tests {
                     foot,
                     toe: Some(toe),
                 toe_drop: 0.0,
+                foot_tilt: 0.0,
                 },
                 (upper, lower, foot),
             )
@@ -1253,6 +2023,219 @@ mod tests {
         );
     }
 
+    /// 系统级验证「抬跟的幅度与绕点」：脚掌绕前掌蹬到**踝角** 140°，前掌留在原地，
+    /// 离地后俯角要立刻交回动画。
+    ///
+    /// 口径是踝角（= 90 + 脚掌相对地面的俯角 − 小腿前倾角）：同样把脚掌俯到 55°，
+    /// 小腿前倾 30° 时只有 115°，看着就是折叠。所以目标必须按小腿的倾斜折算回来。
+    #[test]
+    fn heel_off_starts_with_the_body_and_reaches_the_target_pitch() {
+        let mut app = App::new();
+        app.insert_resource(FootIkSettings {
+            // 这条专门测「重心→抬跟→俯角」这条链，兜底的动画抬踝阈值不参与
+            toe_pivot_rise: 100.0,
+            // 几何上按「重心压到踝上」算触发帧：脚踩实时在骨盆前方 10cm，
+            // 每帧 1.2cm → 第 9 帧越过。lead 取 0，预期帧才是算出来的那个
+            heel_off_lead: 0.0,
+            // 骨架腿短、步子大，横向修正远超默认 22cm，这里放开
+            max_correction: 0.40,
+            ..FootIkSettings::default()
+        });
+        app.insert_resource(Time::<()>::default());
+
+        let world = app.world_mut();
+        // 起点往后放 15cm：小腿前倾会让脚落在骨盆后方，往回挪一点，
+        // 让「身体往前蹬出去」这段位移在模型里真的发生
+        let root = world
+            .spawn((Name::new("Avatar"), Transform::from_xyz(0.0, 0.0, -0.15)))
+            .id();
+        let model = world
+            .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
+            .id();
+        let armature = world
+            .spawn((Name::new("Armature"), Transform::default(), ChildOf(model)))
+            .id();
+        let hips = world
+            .spawn((
+                Name::new("mixamorig:Hips"),
+                Transform::from_xyz(0.0, 0.9, 0.0),
+                ChildOf(armature),
+            ))
+            .id();
+
+        // 小腿前倾 0.3rad（膝在踝前方，就是支撑末期真实的样子）。它决定了
+        // 踝角比脚掌的地面俯角小 17°，所以同样的目标踝角要俯得更多
+        let bend = Quat::from_rotation_x(0.3);
+        // 脚掌本身回正：动画给的是一个平放的脚，俯角由踝-前掌的几何决定（约 30°）
+        let flat = Quat::from_rotation_x(-0.3);
+        let make_leg = |world: &mut World, side: &str, x: f32| {
+            let upper = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}UpLeg")),
+                    Transform::from_xyz(x, 0.0, 0.0),
+                    ChildOf(hips),
+                ))
+                .id();
+            let lower = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}Leg")),
+                    Transform::from_xyz(0.0, -0.35, 0.0).with_rotation(bend),
+                    ChildOf(upper),
+                ))
+                .id();
+            let foot = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}Foot")),
+                    Transform::from_xyz(0.0, -0.35, 0.0).with_rotation(flat),
+                    ChildOf(lower),
+                ))
+                .id();
+            let toe = world
+                .spawn((
+                    Name::new(format!("mixamorig:{side}ToeBase")),
+                    Transform::from_xyz(0.0, -0.08, 0.14),
+                    ChildOf(foot),
+                ))
+                .id();
+            (
+                Leg {
+                    upper,
+                    lower,
+                    foot,
+                    toe: Some(toe),
+                    toe_drop: 0.0,
+                    foot_tilt: 0.0,
+                },
+                (upper, lower, foot, toe),
+            )
+        };
+        let (left, left_bones) = make_leg(world, "Left", 0.08);
+        let (right, right_bones) = make_leg(world, "Right", -0.08);
+
+        let mut ik = FootIk::default();
+        ik.contacts = [1.0, 1.0];
+        ik.blend = 1.0;
+        ik.rig = Some(FootRig {
+            spine: vec![root, model, armature, hips],
+            legs: [left, right],
+        });
+        world.entity_mut(model).insert(ik);
+
+        // 动画层每帧写回同一套姿态：脚掌始终平放（俯角 ≈ 30°，远不到 45°）
+        let originals = [
+            (left_bones.0, Quat::IDENTITY),
+            (left_bones.1, bend),
+            (left_bones.2, flat),
+            (right_bones.0, Quat::IDENTITY),
+            (right_bones.1, bend),
+            (right_bones.2, flat),
+        ];
+        let toe_world = |world: &World, bones: (Entity, Entity, Entity, Entity)| {
+            let mut matrix = Affine3A::IDENTITY;
+            for entity in [
+                root, model, armature, hips, bones.0, bones.1, bones.2, bones.3,
+            ] {
+                let local = world.get::<Transform>(entity).expect("骨骼");
+                matrix *= local.compute_affine();
+            }
+            Vec3::from(matrix.translation)
+        };
+
+        let mut planted_toe = Vec3::ZERO;
+        let mut crossed = None;
+        for frame in 0..45u32 {
+            let world = app.world_mut();
+            for (entity, rotation) in originals {
+                world.get_mut::<Transform>(entity).expect("腿骨").rotation = rotation;
+            }
+            // 前 12 帧身体往前走（每帧 1.2cm，共 14cm）：踩实那一刻骨盆已经在
+            // 踝前方一点，走的这一段就是「蹬出去」的距离；之后停住让抬跟走完
+            if frame < 12 {
+                world.get_mut::<Transform>(root).expect("根").translation.z += 0.012;
+            }
+            if frame == 0 {
+                planted_toe = toe_world(world, left_bones);
+            }
+            world
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
+            world
+                .run_system_once(solve_foot_ik)
+                .expect("脚部 IK 系统跑不起来");
+
+            let ik = world.get::<FootIk>(model).expect("FootIk 组件");
+            if crossed.is_none() && ik.heel_off()[0] > 0.0 {
+                crossed = Some(frame);
+            }
+        }
+
+        let world = app.world();
+        let ik = world.get::<FootIk>(model).expect("FootIk 组件");
+        let started = crossed.expect("重心压在脚上之后应当起跟");
+        // 这条测的是**幅度与绕点**（顶到哪个角、前掌动不动）；起跟时机由
+        // `foot_lock::heel_off_waits_for_the_body_to_cross_the_planted_foot` 盯着。
+        // 这里小腿前倾，骨盆一开始就小幅落在踝前方，所以最小支撑时长一过就起跟
+        assert!(
+            (4..=6).contains(&started),
+            "最小支撑时长（0.08s ≈ 5 帧）一过才该起跟，实际第 {started} 帧"
+        );
+
+        let heel = ik.heel_off()[0];
+        assert!(heel > 0.99, "抬跟应当走满，实际 {heel:.2}");
+        // 小腿前倾 17°：目标踝角 140° → 脚掌相对地面要俯 140 − 90 + 17 ≈ 67°
+        let pitch = ik.pitch()[0];
+        assert!(
+            pitch > 60.0,
+            "支撑末期脚掌应当俯到 67° 上下（踝角 140°），实际 {pitch:.1}°"
+        );
+        // 踝角 = 90 + 俯角 − 小腿前倾。这条测试里锁脚把踝钉在原地、身体走出一大截，
+        // 解出来的膝前倾 ~40°，要 140° 就得把脚掌俯到 90°（垂直）——
+        // `heel_off_lift` 在脚掌接近垂直时（水平分量 < 20%）就不再做转轴了，
+        // 所以上限被 `HEEL_OFF_PITCH_MAX = 76` 封在 ~126°。这里断言的是「确实
+        // 蹬到了几何上限」，而不是那个理论值
+        let ankle = ik.ankle_deg()[0];
+        assert!(
+            ankle >= 120.0,
+            "踝角应当蹬到 120° 以上（动画自己只有 ~113°），实际 {ankle:.1}°"
+        );
+
+        // 前掌还是钉在原地：抬跟绕的是它，不是踝
+        let toe = toe_world(world, left_bones);
+        let drift = (toe - planted_toe).length();
+        assert!(
+            drift < 0.02,
+            "抬跟把前掌带走了 {drift:.3}m（应在 {planted_toe:?}）"
+        );
+
+        // ---- 离地之后：俯角要在 0.1s 内交回动画，不能跟着锁脚残差慢慢放平 ----
+        // 锁脚的 `release_secs` 是 0.26s（给位置残差还债用）。俯角要是也按它收回，
+        // 脚离地后还会一边被拽住一边慢慢放下 —— 那正是「被身体带着走」的观感
+        let world = app.world_mut();
+        world.get_mut::<FootIk>(model).expect("FootIk").contacts = [0.0, 0.0];
+        for _ in 0..7 {
+            let world = app.world_mut();
+            for (entity, rotation) in originals {
+                world.get_mut::<Transform>(entity).expect("腿骨").rotation = rotation;
+            }
+            world
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
+            world
+                .run_system_once(solve_foot_ik)
+                .expect("脚部 IK 系统跑不起来");
+        }
+        let world = app.world();
+        let ik = world.get::<FootIk>(model).expect("FootIk 组件");
+        let pitch_after = ik.pitch()[0];
+        // 7 帧 = 0.12s：按 0.26s 的残差节奏这里还该有 ~45°（补的那份只掉一半），
+        // 按 0.1s 的抬跟节奏已经收干净，只剩动画自己的 ~30°
+        assert!(
+            (pitch_after - 30.0).abs() < 6.0,
+            "离地 0.12s 后脚掌该回到动画的俯角（约 30°），实际 {pitch_after:.1}°"
+        );
+        assert!(!ik.planted()[0], "抬脚后不该还算踩实");
+    }
+
     /// 系统级验证「脚掌贴地」：支撑末期动画抬高脚跟时，承重点要滑到前掌，
     /// 让前掌留在原地、脚踝跟着抬 —— 而不是把踝按住、让前掌先离地。
     #[test]
@@ -1266,8 +2249,10 @@ mod tests {
         app.insert_resource(Time::<()>::default());
 
         let world = app.world_mut();
+        // 起点往后放 15cm：小腿前倾会让脚落在骨盆后方，往回挪一点，
+        // 让「身体往前蹬出去」这段位移在模型里真的发生
         let root = world
-            .spawn((Name::new("Avatar"), Transform::default()))
+            .spawn((Name::new("Avatar"), Transform::from_xyz(0.0, 0.0, -0.15)))
             .id();
         let model = world
             .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
@@ -1322,6 +2307,7 @@ mod tests {
                     foot,
                     toe: Some(toe),
                 toe_drop: 0.0,
+                foot_tilt: 0.0,
                 },
                 (upper, lower, foot, toe),
             )
@@ -1348,7 +2334,9 @@ mod tests {
 
         let toe_world = |world: &World, bones: (Entity, Entity, Entity, Entity)| {
             let mut matrix = Affine3A::IDENTITY;
-            for entity in [root, model, armature, hips, bones.0, bones.1, bones.2, bones.3] {
+            for entity in [
+                root, model, armature, hips, bones.0, bones.1, bones.2, bones.3,
+            ] {
                 let local = world.get::<Transform>(entity).expect("骨骼");
                 matrix *= local.compute_affine();
             }
@@ -1396,9 +2384,9 @@ mod tests {
         assert!(roll >= 0.99, "脚跟抬起来后承重点应当完全滑到前掌，实际 {roll:.2}");
 
         let toe = toe_world(world, left_bones);
-        let toe_drift = (toe.y - planted_toe.y).abs().max(
-            Vec3::new(toe.x - planted_toe.x, 0.0, toe.z - planted_toe.z).length(),
-        );
+        let toe_drift = (toe.y - planted_toe.y)
+            .abs()
+            .max(Vec3::new(toe.x - planted_toe.x, 0.0, toe.z - planted_toe.z).length());
         // 1cm：夹紧量在脚掌离地后要淡出（十几个度摊在 60ms 里），那几帧的前掌会
         // 沿弧线收回 ~1cm——这是「平滑撤掉」的代价，比当帧翻回去好
         assert!(
@@ -1423,9 +2411,7 @@ mod tests {
     fn pole_smoothing_damps_frame_to_frame_jitter() {
         let dt = 1.0 / 60.0;
         let base = Vec3::Y;
-        let tilt = |degrees: f32| {
-            Quat::from_rotation_x(degrees.to_radians()) * base
-        };
+        let tilt = |degrees: f32| Quat::from_rotation_x(degrees.to_radians()) * base;
         let mut previous = None;
         let mut max_deviation = 0.0f32;
         for frame in 0..120 {
@@ -1809,8 +2795,10 @@ mod tests {
         app.insert_resource(Time::<()>::default());
 
         let world = app.world_mut();
+        // 起点往后放 15cm：小腿前倾会让脚落在骨盆后方，往回挪一点，
+        // 让「身体往前蹬出去」这段位移在模型里真的发生
         let root = world
-            .spawn((Name::new("Avatar"), Transform::default()))
+            .spawn((Name::new("Avatar"), Transform::from_xyz(0.0, 0.0, -0.15)))
             .id();
         let model = world
             .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
@@ -1863,6 +2851,7 @@ mod tests {
                     foot,
                     toe: Some(toe),
                 toe_drop: 0.0,
+                foot_tilt: 0.0,
                 },
                 (upper, lower, foot, toe),
             )
@@ -1888,7 +2877,9 @@ mod tests {
 
         let toe_world = |world: &World, bones: (Entity, Entity, Entity, Entity)| {
             let mut matrix = Affine3A::IDENTITY;
-            for entity in [root, model, armature, hips, bones.0, bones.1, bones.2, bones.3] {
+            for entity in [
+                root, model, armature, hips, bones.0, bones.1, bones.2, bones.3,
+            ] {
                 let local = world.get::<Transform>(entity).expect("骨骼");
                 matrix *= local.compute_affine();
             }
@@ -1932,8 +2923,10 @@ mod tests {
         app.insert_resource(Time::<()>::default());
 
         let world = app.world_mut();
+        // 起点往后放 15cm：小腿前倾会让脚落在骨盆后方，往回挪一点，
+        // 让「身体往前蹬出去」这段位移在模型里真的发生
         let root = world
-            .spawn((Name::new("Avatar"), Transform::default()))
+            .spawn((Name::new("Avatar"), Transform::from_xyz(0.0, 0.0, -0.15)))
             .id();
         let model = world
             .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
@@ -1986,6 +2979,7 @@ mod tests {
                     foot,
                     toe: Some(toe),
                 toe_drop: 0.0,
+                foot_tilt: 0.0,
                 },
                 (upper, lower, foot, toe),
             )
@@ -2006,7 +3000,15 @@ mod tests {
         let foot_local = |frame: f32| Quat::from_rotation_x(0.12 * frame - 1.0);
         let foot_world_rot = |world: &World| {
             let mut rotation = Quat::IDENTITY;
-            for entity in [root, model, armature, hips, left_bones.0, left_bones.1, left_bones.2] {
+            for entity in [
+                root,
+                model,
+                armature,
+                hips,
+                left_bones.0,
+                left_bones.1,
+                left_bones.2,
+            ] {
                 let local = world.get::<Transform>(entity).expect("骨骼");
                 rotation *= local.rotation;
             }
@@ -2116,6 +3118,7 @@ mod tests {
                     foot,
                     toe: Some(toe),
                 toe_drop: 0.0,
+                foot_tilt: 0.0,
                 },
                 (upper, lower, foot),
             )
@@ -2134,7 +3137,15 @@ mod tests {
 
         let foot_world_rot = |world: &World| {
             let mut rotation = Quat::IDENTITY;
-            for entity in [root, model, armature, hips, left_bones.0, left_bones.1, left_bones.2] {
+            for entity in [
+                root,
+                model,
+                armature,
+                hips,
+                left_bones.0,
+                left_bones.1,
+                left_bones.2,
+            ] {
                 rotation *= world.get::<Transform>(entity).expect("骨骼").rotation;
             }
             rotation
@@ -2144,7 +3155,7 @@ mod tests {
         // 14 抬脚、整条腿往上抬：脚尖离地、直到「怎么抬都够不着地面」，夹紧必须放弃
         let mut previous: Option<Quat> = None;
         let mut worst = (0.0f32, 0u32);
-        for frame in 0..40u32 {
+        for frame in 0..45u32 {
             let world = app.world_mut();
             let pitch = if frame < 6 {
                 0.0
@@ -2204,8 +3215,10 @@ mod tests {
         app.insert_resource(Time::<()>::default());
 
         let world = app.world_mut();
+        // 起点往后放 15cm：小腿前倾会让脚落在骨盆后方，往回挪一点，
+        // 让「身体往前蹬出去」这段位移在模型里真的发生
         let root = world
-            .spawn((Name::new("Avatar"), Transform::default()))
+            .spawn((Name::new("Avatar"), Transform::from_xyz(0.0, 0.0, -0.15)))
             .id();
         let model = world
             .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
@@ -2257,6 +3270,7 @@ mod tests {
                     foot,
                     toe: Some(toe),
                 toe_drop: 0.0,
+                foot_tilt: 0.0,
                 },
                 (upper, lower, foot),
             )
@@ -2276,7 +3290,15 @@ mod tests {
 
         let foot_world_rot = |world: &World| {
             let mut rotation = Quat::IDENTITY;
-            for entity in [root, model, armature, hips, left_bones.0, left_bones.1, left_bones.2] {
+            for entity in [
+                root,
+                model,
+                armature,
+                hips,
+                left_bones.0,
+                left_bones.1,
+                left_bones.2,
+            ] {
                 rotation *= world.get::<Transform>(entity).expect("骨骼").rotation;
             }
             rotation
@@ -2284,7 +3306,7 @@ mod tests {
 
         let mut previous: Option<Quat> = None;
         let mut max_step = 0.0f32;
-        for frame in 0..40u32 {
+        for frame in 0..45u32 {
             let world = app.world_mut();
             // 第 20 帧踝关节突然跖屈 40°（混合空间换剪辑时就是这样跳的）
             let pitch = if frame < 20 { 0.0 } else { 0.7 };
@@ -2317,8 +3339,10 @@ mod tests {
     fn toe_drop_is_measured_from_the_skeleton() {
         let mut app = App::new();
         let world = app.world_mut();
+        // 起点往后放 15cm：小腿前倾会让脚落在骨盆后方，往回挪一点，
+        // 让「身体往前蹬出去」这段位移在模型里真的发生
         let root = world
-            .spawn((Name::new("Avatar"), Transform::default()))
+            .spawn((Name::new("Avatar"), Transform::from_xyz(0.0, 0.0, -0.15)))
             .id();
         let model = world
             .spawn((Name::new("Model"), Transform::default(), ChildOf(root)))
@@ -2383,6 +3407,83 @@ mod tests {
         assert!((approach(0.0, 1.0, 0.25) - 0.25).abs() < 1e-6);
         assert!((approach(0.9, 1.0, 0.25) - 1.0).abs() < 1e-6);
         assert!((approach(1.0, 0.0, 0.25) - 0.75).abs() < 1e-6);
+    }
+
+    /// 抬跟只补「动画没蹬够」的那部分，而且必须绕前掌转：
+    /// 踝抬起来、前掌不动、脚掌俯角落到目标。
+    /// 踝角口径：φ = 90 + P − L。小腿前倾越多，同样的地面俯角对应的踝角越小 —
+    /// 这就是「脚掌俯 55° 却看着折叠」的算术来源
+    #[test]
+    fn ankle_angle_accounts_for_the_shank_lean() {
+        let ankle = Vec3::ZERO;
+        // 前掌在前方 16cm、低 8cm → 地面俯角 26.6°
+        let toe = Vec3::new(0.0, -0.08, 0.16);
+        let pitch = foot_pitch_deg(toe, ankle);
+
+        // 小腿竖直：踝角 = 90 + 26.6
+        let knee = Vec3::new(0.0, 0.35, 0.0);
+        let lean = shank_lean_deg(knee, ankle, toe);
+        assert!(lean.abs() < 0.5, "竖直小腿的前倾角应为 0，实际 {lean:.1}");
+        assert!((90.0 + pitch - lean - 116.6).abs() < 0.5);
+
+        // 膝在踝前方 20.7cm（小腿长 36.4cm）：前倾 34.6°，踝角掉到 82°
+        let knee = Vec3::new(0.0, 0.30, 0.207);
+        let lean = shank_lean_deg(knee, ankle, toe);
+        assert!((lean - 34.6).abs() < 0.5, "前倾角应为 34.6°，实际 {lean:.1}");
+        assert!(
+            (90.0 + pitch - lean - 82.0).abs() < 0.5,
+            "同样的脚掌在小腿前倾时只剩 82° 的踝角"
+        );
+
+        // 要蹬到 140° 的踝角，脚掌得俯 140 − 90 + 34.6 ≈ 85°（这就是「折叠」要补的量）
+        assert!((140.0 - 90.0 + lean - 84.6).abs() < 0.5);
+    }
+
+    #[test]
+    fn heel_off_lift_pivots_on_the_toe_and_reaches_the_target() {
+        // 站姿：踝高 10cm，前掌在前方 16cm、低 4cm（俯角约 14°）
+        let ankle = Vec3::new(0.0, 0.10, 0.0);
+        let toe = Vec3::new(0.0, 0.06, 0.16);
+        let pitch_now = foot_pitch_deg(toe, ankle);
+        assert!((pitch_now - 14.0).abs() < 0.5, "初始俯角 {pitch_now:.1}°");
+
+        // 补到位：俯角到 55°，踝明显抬高，前掌水平方位不变
+        let (rot, delta, lifted) =
+            heel_off_lift(toe, ankle, 55.0, 0.0, 1.0).expect("差 40°，应当补抬");
+        assert!((lifted - 55.0).abs() < 0.2, "抬完的俯角 {lifted:.1}°");
+        let ankle_after = ankle + delta;
+        assert!(
+            ankle_after.y > ankle.y + 0.05,
+            "踝要跟着抬起来，实际抬了 {:.3}m",
+            ankle_after.y - ankle.y
+        );
+        // 旋转和位移是一件事：把脚掌向量转过去，前掌正好还在原地
+        let foot = toe - ankle;
+        let lifted_toe = ankle_after + rot * foot;
+        assert!(
+            (lifted_toe - toe).length() < 1e-5,
+            "前掌被带走了：{lifted_toe:?}（应在 {toe:?}）"
+        );
+
+        // 进度 0.5 → 补一半；0 → 不动
+        let (_, _, half) = heel_off_lift(toe, ankle, 55.0, 0.0, 0.5).expect("半程应当补");
+        assert!(
+            (half - (pitch_now + (55.0 - pitch_now) * 0.5)).abs() < 0.2,
+            "半程俯角 {half:.1}°"
+        );
+        assert!(heel_off_lift(toe, ankle, 55.0, 0.0, 0.0).is_none());
+
+        // 动画自己已经蹬得更狠：不往回掰
+        let steeper = Vec3::new(0.0, -0.10, 0.12); // 前掌比踝低 20cm → 约 59°
+        let pitch_steep = foot_pitch_deg(steeper, ankle);
+        assert!(
+            pitch_steep > 55.0,
+            "构造一个更陡的姿态，实际 {pitch_steep:.1}°"
+        );
+        assert!(
+            heel_off_lift(steeper, ankle, 55.0, 0.0, 1.0).is_none(),
+            "动画已经比目标更陡，不该往回削"
+        );
     }
 
     /// Mixamo 的 GLB 里同一个位置有三套骨：`mixamorig:*` 真骨、`Ctrl_*` 控制骨、
