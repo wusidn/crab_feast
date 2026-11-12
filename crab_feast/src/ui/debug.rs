@@ -32,6 +32,22 @@ pub struct FootIkToggle;
 #[derive(Component, Clone, Default)]
 pub struct FootIkStatus;
 
+/// 调试用的时间速度（慢放看单帧）。只改 `Time<Virtual>` 的 relative speed，
+/// 动画、物理、脚部 IK 的 dt 一起缩，看到的就是同一段动作放慢
+#[derive(Resource, Debug)]
+pub struct DebugTimeScale {
+    pub speed: f32,
+}
+
+impl Default for DebugTimeScale {
+    fn default() -> Self {
+        Self { speed: 1.0 }
+    }
+}
+
+/// 慢放的档位：`[` 退一档、`]` 进一档、`\` 回到 1.0
+const TIME_STEPS: [f32; 9] = [0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 2.0];
+
 /// 资源里存开关状态，控件只负责读它；同步系统把状态写回 gizmo 配置
 #[derive(Resource, Debug, Default)]
 pub struct PhysicsDebugSettings {
@@ -52,6 +68,8 @@ pub struct DebugSettingsPlugin;
 impl Plugin for DebugSettingsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PhysicsDebugSettings>()
+            .init_resource::<DebugTimeScale>()
+            .add_systems(Update, debug_time_speed)
             .add_systems(
                 OnEnter(GameState::Game),
                 register_menu_page.before(MenuSet::Setup),
@@ -71,6 +89,32 @@ impl Plugin for DebugSettingsPlugin {
                     .run_if(in_state(GameState::Game)),
             );
     }
+}
+
+/// 慢放/快放：`[` 退一档、`]` 进一档、`\` 复位到 1.0。
+///
+/// 走 `Time<Virtual>` 而不是只放大脚部 IK 的 dt：这样动画采样、物理和 IK 用的是
+/// 同一个时间比例，慢放看到的仍是同一段动作，不会因为「动画没慢、IK 慢了」错位。
+fn debug_time_speed(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut time: ResMut<Time<Virtual>>,
+    mut scale: ResMut<DebugTimeScale>,
+) {
+    let current = TIME_STEPS
+        .iter()
+        .position(|step| (*step - scale.speed).abs() < 1e-4)
+        .unwrap_or(7);
+    let next = if keys.just_pressed(KeyCode::BracketLeft) {
+        current.saturating_sub(1)
+    } else if keys.just_pressed(KeyCode::BracketRight) {
+        (current + 1).min(TIME_STEPS.len() - 1)
+    } else if keys.just_pressed(KeyCode::Backslash) {
+        7
+    } else {
+        return;
+    };
+    scale.speed = TIME_STEPS[next];
+    time.set_relative_speed(scale.speed);
 }
 
 /// 把「调试」注册成菜单里的一级入口
@@ -261,6 +305,7 @@ fn update_physics_debug_label(
 /// 更新脚部 IK 实时读数：权重、支撑、两只脚这一帧的修正距离
 fn update_foot_ik_status(
     settings: Res<FootIkSettings>,
+    scale: Res<DebugTimeScale>,
     ik: Query<&FootIk>,
     mut labels: Query<&mut Text, With<FootIkStatus>>,
 ) {
@@ -274,6 +319,7 @@ fn update_foot_ik_status(
             let [contact_left, contact_right] = ik.contacts;
             let [planted_left, planted_right] = ik.planted();
             let [roll_left, roll_right] = ik.roll();
+            let [strength_left, strength_right] = ik.strength();
             // 承重点：踩实后期承重点滑到前掌（「掌」），前期钉踝（「踝」）
             let pivot = |planted: bool, roll: f32| {
                 if !planted {
@@ -284,15 +330,30 @@ fn update_foot_ik_status(
                     "踝"
                 }
             };
+            // 射线量到的地面：没打中显示「-」，打中显示高度和坡度
+            // （坡度 = 命中法线偏离竖直的角度，爬楼梯/斜坡时看它有没有跳）
+            let ground = |index: usize| match ik.ground(index) {
+                Some(hit) => format!(
+                    "{:.2}/{:.0}°",
+                    hit.height,
+                    hit.normal.dot(Vec3::Y).clamp(-1.0, 1.0).acos().to_degrees()
+                ),
+                None => "-".to_string(),
+            };
             format!(
-                "权重 {:.2} · 支撑 {:.2}/{:.2} · 承重 {}/{} · 修正 {:.3}/{:.3} m",
+                "权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
                 ik.blend(),
                 contact_left,
                 contact_right,
+                strength_left,
+                strength_right,
                 pivot(planted_left, roll_left),
                 pivot(planted_right, roll_right),
                 left,
-                right
+                right,
+                ground(0),
+                ground(1),
+                scale.speed
             )
         }
     } else {

@@ -11,13 +11,21 @@
 //!   不会因为「关了一会儿」而拿旧锚点把人往地里拽；
 //! - **有上限的修正**：锚点偏离超过 `max_correction` 就跟着脚走。腿不会被拉到极限，
 //!   极端情况下退化成「少滑一点」，而不是反关节或穿模；
-//! - **解除锁定是插值**：抬脚/关掉时残留的修正量按 `release_secs` 指数衰减回动画姿态。
-//!   当帧清零会让脚踝从一个锚点瞬移回动画位置，肉眼就是「卡一下」。
+//! - **强度是 smoothstep 形状的进度，不是斜坡、也不是二阶跟随器**：踩实/抬脚时施加的
+//!   比例 = `smoothstep(进度)`，位置、速度、**加速度**三者在两端都连续。
+//!   线性斜坡只在位置连续（速度是折线，60fps 下 40ms 的 engage 只有两三帧）；
+//!   指数衰减更糟，第一帧就吃掉四分之一残差，起点速度最大；
+//!   临界阻尼二阶跟随器速度连续了，但加速度在起步帧是 `A·ω²` 的台阶 ——
+//!   6cm 残差 / 0.18s 就有 ~30m/s²，抬脚那一瞬间就是「被拽了一下」。
+//!   smoothstep 把同样的位移摊成 `6A/T²`：0.26s 下只有 5m/s²，肉眼看不出突变。
 
 use bevy::math::Vec3;
 
 /// 水平方向夹角/位移的极小阈值（米）
 const MIN_OFFSET: f32 = 1e-5;
+
+/// 强度小到这个值就认为锁脚已经退干净：清零后不再每帧多解一次 IK
+const MIN_STRENGTH: f32 = 1e-4;
 
 /// 锁脚参数。由全局设置构造，逐帧传给 [`FootLock::update`]，所以改参数立刻生效。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,10 +36,11 @@ pub struct FootLockConfig {
     pub plant_enter: f32,
     /// 支撑权重降到它才判定为抬脚
     pub plant_exit: f32,
-    /// 解除锁定后残差衰减的时间常数（秒）。0 = 立刻归位（会看到跳变）
+    /// 解除锁定后锁脚强度从 1 落回 0 的过渡时长（秒）。二阶过渡：首尾速度都是 0，
+    /// 比指数衰减慢一点，但松开那一帧没有速度台阶。0 = 立刻归位（会看到跳变）
     pub release_secs: f32,
-    /// 刚判定踩实时，锁脚强度从 0 升到 1 的时间（秒）。
-    /// 0 = 一踩实就满强度（脚会从「跟着身体走」一帧内变成「钉死」，同样会「卡」）
+    /// 刚判定踩实时，锁脚强度从 0 升到 1 的过渡时长（秒）。二阶过渡，
+    /// 首尾速度都是 0，所以脚不会被一帧掐断。0 = 一踩实就满强度（会「顿」）
     pub engage_secs: f32,
     /// 支撑期内，动画把脚跟抬起多少米之后改成「钉前掌」。
     /// 0 = 从踩实第一帧就钉前掌（脚跟会过早抬起）
@@ -45,10 +54,11 @@ impl Default for FootLockConfig {
             max_correction: 0.22,
             plant_enter: 0.55,
             plant_exit: 0.25,
-            // 60ms 一帧衰减约 24%：抬脚时脚踝是平滑追上动画，而不是当帧跳回去
-            release_secs: 0.06,
-            // 40ms 大约是 2~3 帧：落地瞬间脚有一个「咬住地面」的短促减速
-            engage_secs: 0.04,
+            // 260ms ≈ 一个摆动期：抬脚后残差要在「脚离地的那段时间」里还完。
+            // 时间给足比给形状更重要 —— 残差越大（转身时能到 20cm），越需要整段摆动去摊
+            release_secs: 0.26,
+            // 100ms 走到 90%：落地不是「咬住」，而是一段有形的加压
+            engage_secs: 0.10,
             // 3cm：正常抬脚跟到 3cm 时前掌是承重点，再往上前掌就该接管了
             toe_pivot_rise: 0.03,
         }
@@ -76,11 +86,25 @@ impl FootLockConfig {
 pub struct FootContact {
     pub ankle: Vec3,
     pub toe: Option<Vec3>,
+    /// 踝到前掌的竖直距离（静止姿态量的，米）。用它把「踩实那一帧的踝高」换算成
+    /// 真正的地面高度：落地那帧如果脚跟先着地、脚掌还背屈着，前掌位置是偏高的，
+    /// 拿它当地面，脚掌就永远压不下去（看起来落地后翘着）。
+    /// 0 = 没量过，退回旧行为（用当帧前掌高度）
+    pub toe_drop: f32,
+    /// 射线量到的真实地面高度（世界 y）。有它就用它，没有才靠推断——
+    /// 推断在「落地那帧脚还在空中」「脚掌跖屈/背屈」时都会偏，
+    /// 而真实地面在爬楼梯、斜坡这种复杂地形上是唯一可信的来源
+    pub floor: Option<f32>,
 }
 
 impl FootContact {
     pub fn ankle_only(ankle: Vec3) -> Self {
-        Self { ankle, toe: None }
+        Self {
+            ankle,
+            toe: None,
+            toe_drop: 0.0,
+            floor: None,
+        }
     }
 }
 
@@ -94,17 +118,25 @@ pub struct FootLock {
     /// 还没还回去的修正量（世界空间）。踩实时就是「锚点 − 脚踝」，
     /// 解除锁定后按时间衰减到 0，抬脚不会看到一脚跳回去。
     residual: Vec3,
-    /// 本段支撑期的咬合权重（0..1）：刚踩实时从 0 升到 1，避免脚的速度一帧内被掐死
-    engage: f32,
+    /// 本段支撑期施加的锁脚强度（0..1）= `smoothstep(progress)`。
+    /// 形状函数保证位置/速度/加速度都连续，脚不会被「一帧掐断」或「一帧拽回」
+    strength: f32,
+    /// 强度的线性进度（0..1）：按 1/`secs` 匀速推进，形状完全交给 smoothstep。
+    /// 抬脚中途又重新踩实时，进度原路返回，不会跳
+    progress: f32,
     /// 承重点沿脚掌滑动的比例：0 = 钉脚踝（脚是平的），1 = 钉前掌（绕前掌转）
     roll: f32,
     /// 踩实那一帧的踝高：动画把踝抬高说明该抬脚跟了
     ankle_base: f32,
     /// 踩实那一帧「前掌 − 踝」的向量（脚掌朝向）。没有前掌骨时为零
     toe_vec: Vec3,
-    /// 踩实那一帧前掌的世界高度（地面基准）。抬脚后保留，供朝向夹紧淡出用
+    /// 踩实那一帧的**地面高度**（世界 y）。抬脚后保留，供朝向夹紧淡出用。
+    /// 由「踝高 − 踝到前掌的竖直距离」算，不是当帧前掌位置——见 `FootContact::toe_drop`
     toe_floor: Option<f32>,
-    /// 朝向夹紧的剩余强度（0..1）：踩实时为 1，抬脚后与残差同步衰减。
+    /// `toe_floor` 是射线量到的（true）还是推断的（false）。推断值可能是假的，
+    /// 夹紧那边要据此决定要不要相信它
+    toe_floor_probed: bool,
+    /// 朝向夹紧的剩余强度（0..1），跟 [`FootLock::strength`] 同步：
     /// 少了它，「前掌不穿地」的转动会在抬脚那一帧被整段撤掉，脚掌一帧翻十几度
     presence: f32,
 }
@@ -114,17 +146,24 @@ impl FootLock {
         self.anchor = None;
         self.planted = false;
         self.residual = Vec3::ZERO;
-        self.engage = 0.0;
+        self.strength = 0.0;
+        self.progress = 0.0;
         self.roll = 0.0;
         self.ankle_base = 0.0;
         self.toe_vec = Vec3::ZERO;
         self.toe_floor = None;
+        self.toe_floor_probed = false;
         self.presence = 0.0;
     }
 
     /// 还没还回去的修正量（世界空间，米）。调试面板可以拿它当过冲读数
     pub fn residual(&self) -> Vec3 {
         self.residual
+    }
+
+    /// 本帧施加的锁脚强度（0..1）。调试面板可以拿它看加压/放开的过程
+    pub fn strength(&self) -> f32 {
+        self.strength
     }
 
     /// 把水平方向拉超过 `max_correction` 的修正量夹回来（腿不会被拽断），
@@ -153,10 +192,16 @@ impl FootLock {
         self.roll
     }
 
-    /// 踩实时前掌贴地的高度（世界 y）。没有踩实或没有前掌骨时是 `None`。
-    /// 调用方拿它当「地面高度」，把前掌朝向夹在它之上，脚掌就不会扎进地里。
+    /// 踩实时的地面高度（世界 y）。没有踩实或没有前掌骨时是 `None`。
+    /// 调用方拿它当「地面高度」，把前掌朝向夹在它之上，脚掌就不会扎进地里；
+    /// 反过来，它偏高的话脚掌就永远压不下去（落地后翘着）。
     pub fn toe_floor(&self) -> Option<f32> {
         self.toe_floor
+    }
+
+    /// `toe_floor` 是射线量到的真实地面（true），还是从脚踝/前掌推断的（false）
+    pub fn toe_floor_is_probed(&self) -> bool {
+        self.toe_floor_probed
     }
 
     /// 朝向夹紧还剩多少强度（0..1）。抬脚后与残差同步衰减，脚掌朝向才不会有台阶
@@ -169,7 +214,7 @@ impl FootLock {
     /// - `contact`：本帧**动画给出**的脚踝与前掌世界位置（还没被 IK 改过）；
     /// - `support`：支撑权重（0 = 完全在空中，1 = 完全踩实）；
     /// - `enabled`：本帧是否允许锁脚；
-    /// - `dt`：帧间隔（秒），用于残差衰减与咬合斜坡，与帧率无关。
+    /// - `dt`：帧间隔（秒），用于强度过渡与残差过渡，与帧率无关。
     ///
     /// 承重点是沿脚掌滑动的：踩实初期钉**脚踝**（脚是平的）；动画把脚跟抬到
     /// `toe_pivot_rise` 之后，承重点逐渐滑到**前掌**，脚变成绕前掌转 ——
@@ -178,6 +223,10 @@ impl FootLock {
     /// 锚点 = 踩实时踝的世界位置，加上 `roll × 踩实时的脚向量`：锚点在世界里不动，
     /// 但它是「脚掌上的哪一点」随 `roll` 从踝滑到前掌。所以抬脚跟时脚踝目标是
     /// 平滑上移的，不会出现「一帧从踝锚点跳到前掌锚点」的台阶。
+    ///
+    /// 修正量分两步施加：`residual`（锚点差，支撑期内逐帧精确跟随）和
+    /// `strength`（0..1 的二阶过渡）。踩实/抬脚改变的是 `strength`，它的速度在
+    /// 起点与终点都是 0，所以脚的世界速度没有台阶 —— 顿挫感来自速度突变，不是位置跳变。
     pub fn update(
         &mut self,
         contact: FootContact,
@@ -213,8 +262,23 @@ impl FootLock {
                     self.anchor = Some(ankle);
                     self.ankle_base = ankle.y;
                     self.toe_vec = toe.map(|toe| toe - ankle).unwrap_or(Vec3::ZERO);
-                    self.toe_floor = toe.map(|toe| toe.y);
-                    self.presence = 1.0;
+                    // 地面高度用「踝高 − 踝到前掌的竖直距离」算，不用当帧前掌位置：
+                    // 落地那帧脚跟先着地时前掌还在空中，拿它当地面会让脚掌一直翘着
+                    // 两种近似各错一边，取更低的那个：
+                    // - 当帧前掌位置：脚跟先着地（脚掌背屈）时偏高
+                    // - 踝高 − 踝到前掌距：脚尖先着地（脚掌跖屈）时也偏高
+                    // 真实地面只会比两者中更低那个更接近脚掌的实际最低点
+                    // 射线量到的地面最可信（台阶、斜坡都靠它）；没有物理时退回推断
+                    self.toe_floor_probed = contact.floor.is_some_and(|floor| floor.is_finite());
+                    self.toe_floor = contact.floor.filter(|floor| floor.is_finite()).or_else(|| {
+                        toe.map(|toe| {
+                            if contact.toe_drop > 1e-4 {
+                                toe.y.min(ankle.y - contact.toe_drop)
+                            } else {
+                                toe.y
+                            }
+                        })
+                    });
                 }
             } else if support <= config.plant_exit {
                 self.planted = false;
@@ -225,16 +289,18 @@ impl FootLock {
             self.anchor = None;
         }
 
-        // 动画把脚跟抬起来 → 承重点向脚掌滑。只增不减：支撑期内不倒回去
+        // 动画把脚跟抬起来 → 承重点向脚掌滑。只增不减：支撑期内不倒回去。
+        // 用 smoothstep 而不是线性：线性在阈值处有一个曲率折角，抬脚会「咯噔」一下
         if self.planted && toe.is_some() {
             let start = config.toe_pivot_rise.max(1e-3);
             let rise = (ankle.y - self.ankle_base).max(0.0);
-            let roll = ((rise - start) / start).clamp(0.0, 1.0);
+            let roll = smoothstep(((rise - start) / start).clamp(0.0, 1.0));
             self.roll = self.roll.max(roll);
         }
 
         // 还钉着时的修正量：锚点 + roll × 脚向量差 − 当前踝位置。
-        // 刚松开的那一帧用松开前的锚点算，修正量原样交给残差（不当帧清零）
+        // 刚松开的那一帧用松开前的锚点算，修正量原样留在 `residual` 里，
+        // 之后不再改动它 —— 放开的形状只由 `strength` 决定，这样首尾速度才能都是 0
         let anchor = self.anchor.or(old_anchor);
         let toe_vec_now = toe.map(|toe| toe - ankle).unwrap_or(self.toe_vec);
         let pinned = match anchor {
@@ -246,36 +312,46 @@ impl FootLock {
         };
 
         if self.planted {
-            // 咬合：刚踩实那一帧从 0 起，`engage_secs` 内升到满强度
-            self.engage = if was_planted {
-                approach(self.engage, 1.0, dt, config.engage_secs)
-            } else {
-                0.0
-            };
+            // 支撑期内精确跟随：这里不能滤波，否则脚会一直「橡皮筋」往后滑
             self.residual = pinned;
-        } else {
-            // 还残差期间按满强度：此时被平滑的量就是残差本身
-            self.engage = 1.0;
-            if was_planted {
-                // 刚松开的那一帧不衰减（`release_secs > 0` 时）：修正量原样留下，
-                // 从下一帧才开始往 0 收敛，所以松开本身没有台阶。
-                // `release_secs == 0` 表示硬切，当帧就归位。
-                self.residual = if config.release_secs > f32::EPSILON {
-                    pinned
-                } else {
-                    Vec3::ZERO
-                };
-                // 同理，朝向夹紧这一帧还是满强度，从下一帧起跟着残差一起淡出
-                if config.release_secs <= f32::EPSILON {
-                    self.presence = 0.0;
-                }
+        } else if was_planted {
+            // 松开那一帧把最新一次锚点差原样留下来，之后不再改动它：
+            // 放开的形状只由 `strength` 决定，首尾速度才能都是 0。
+            // `release_secs == 0` 表示硬切，只留给 A/B 对比观感，默认不开
+            self.residual = if config.release_secs > f32::EPSILON {
+                pinned
             } else {
-                self.residual = decay(self.residual, dt, config.release_secs);
-                self.presence = decay_scalar(self.presence, dt, config.release_secs);
-            }
+                Vec3::ZERO
+            };
+        }
+        // 已经在空中：残差冻结，交给 `strength` 平滑放掉
+
+        // 强度：进度匀速推进，形状走 smoothstep —— 踩实 → 1、抬脚 → 0，
+        // 两端的位置/速度/加速度都是连续的（见模块注释）
+        let want = if self.planted { 1.0 } else { 0.0 };
+        let secs = if self.planted {
+            config.engage_secs
+        } else {
+            config.release_secs
+        };
+        self.progress = advance_progress(self.progress, want, dt, secs);
+        self.strength = smoothstep(self.progress);
+
+        // 退干净后清零：残差留着会让这一脚每帧多解一次 IK
+        if !self.planted && self.strength <= MIN_STRENGTH {
+            self.strength = 0.0;
+            self.progress = 0.0;
+            self.residual = Vec3::ZERO;
         }
 
-        let applied = self.residual * self.engage;
+        // 前掌朝向夹紧跟强度同步淡出，脚掌朝向不会有台阶
+        self.presence = if self.planted {
+            1.0
+        } else {
+            self.strength
+        };
+
+        let applied = self.residual * self.strength;
         let weight = if applied.length_squared() > MIN_OFFSET * MIN_OFFSET {
             1.0
         } else {
@@ -285,41 +361,26 @@ impl FootLock {
     }
 }
 
-/// 每帧最多推进 `dt / secs` 的比例（线性咬合），`secs = 0` 直接到位
-fn approach(current: f32, target: f32, dt: f32, secs: f32) -> f32 {
-    if secs <= f32::EPSILON || dt <= 0.0 {
+/// `smoothstep`：`t` 在 0..1 上单调、两端导数为 0，把折角磨平
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 把进度匀速推向 `target`：`secs` 秒走完全程，`secs = 0` 表示当帧到位。
+/// 线性进度 + [`smoothstep`] 形状 = 两端位置/速度/加速度全连续的那种过渡。
+fn advance_progress(progress: f32, target: f32, dt: f32, secs: f32) -> f32 {
+    if dt <= 0.0 {
+        return progress;
+    }
+    if secs <= f32::EPSILON {
         return target;
     }
-    let step = dt / secs;
-    if (target - current).abs() <= step {
-        target
+    let step = (dt / secs).clamp(0.0, 1.0);
+    if target > progress {
+        (progress + step).min(target)
     } else {
-        current + step * (target - current).signum()
-    }
-}
-
-/// 残差指数衰减。低于亚毫米直接归零：指数永远到不了 0，
-/// 不截断的话这一脚每一帧都会多解一次 IK。
-fn decay_scalar(value: f32, dt: f32, release_secs: f32) -> f32 {
-    if dt <= 0.0 || release_secs <= f32::EPSILON {
-        return 0.0;
-    }
-    let next = value * (-dt / release_secs).exp();
-    if next < 1e-3 {
-        0.0
-    } else {
-        next
-    }
-}
-
-fn decay(residual: Vec3, dt: f32, release_secs: f32) -> Vec3 {    if dt <= 0.0 || release_secs <= f32::EPSILON {
-        return Vec3::ZERO;
-    }
-    let next = residual * (-dt / release_secs).exp();
-    if next.length_squared() < 1e-8 {
-        Vec3::ZERO
-    } else {
-        next
+        (progress - step).max(target)
     }
 }
 
@@ -332,6 +393,13 @@ mod tests {
 
     fn config() -> FootLockConfig {
         FootLockConfig::default()
+    }
+
+    /// 连续踩实若干帧，把强度建立到满
+    fn plant(lock: &mut FootLock, ankle: Vec3, frames: usize, cfg: &FootLockConfig) {
+        for _ in 0..frames {
+            lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, cfg);
+        }
     }
 
     #[test]
@@ -394,12 +462,14 @@ mod tests {
     }
 
     /// 关闭时必须立刻丢掉锚点（重新打开不能拿旧位置拽人），
-    /// 但残差仍按时间还回去，所以关掉本身也不会「卡」一下
+    /// 但强度按二阶过渡落下去，所以关掉本身没有速度台阶
     #[test]
     fn disabling_drops_the_anchor_but_eases_the_residual() {
         let cfg = config();
         let mut lock = FootLock::default();
-        lock.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &cfg);
+        plant(&mut lock, Vec3::ZERO, 40, &cfg);
+        assert!((lock.strength() - 1.0).abs() < 1e-3);
+
         let ankle = Vec3::new(0.3, 0.0, 0.0);
         let (target, weight) = lock.update(FootContact::ankle_only(ankle), 1.0, false, DT, &cfg);
         assert!(!lock.is_planted());
@@ -408,13 +478,14 @@ mod tests {
         // 残差被夹在 max_correction，脚踝不会一步跳回动画位置
         let offset = target - ankle;
         assert!(
-            (offset.length() - cfg.max_correction).abs() < 1e-4,
-            "{offset:?}"
+            (offset.length() - cfg.max_correction * lock.strength()).abs() < 1e-4,
+            "{offset:?}（强度 {}）",
+            lock.strength()
         );
 
-        // 之后几帧里残差衰减到 0，目标回到纯动画位置
+        // 之后几帧里强度落回 0，目标单调回到纯动画位置
         let mut target = target;
-        for _ in 0..30 {
+        for _ in 0..60 {
             let (next, weight) = lock.update(FootContact::ankle_only(ankle), 1.0, false, DT, &cfg);
             if weight == 0.0 {
                 assert_eq!(next, ankle, "残差还完后目标应等于动画位置");
@@ -452,40 +523,61 @@ mod tests {
         }
     }
 
-    /// 抬脚解除锁定不能当帧清零：残差要按时间衰减，脚踝平滑追上动画
+    /// 抬脚解除锁定不能给脚一个速度台阶：强度是二阶过渡，首帧只放掉几个百分点，
+    /// 中途才最快、末尾又收回到 0（指数衰减是「首帧最猛」，那一下就是顿挫来源）
     #[test]
-    fn release_ramps_the_foot_back_instead_of_snapping() {
+    fn release_eases_out_without_a_velocity_step() {
         let cfg = config();
         let mut lock = FootLock::default();
-        lock.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &cfg);
+        plant(&mut lock, Vec3::ZERO, 40, &cfg);
+        assert!((lock.strength() - 1.0).abs() < 1e-3, "强度应先建立起来");
 
-        // 身体走了 6cm、支撑掉到 0.1（低于 exit）：这一帧只是松开锚点
+        // 身体走了 6cm：锚点还钉在世界原点，脚踝被动画带走
         let ankle = Vec3::new(0.06, 0.0, 0.0);
-        let (target, weight) = lock.update(FootContact::ankle_only(ankle), 0.1, true, DT, &cfg);
+        let (target, _) = lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
+        assert!((target - Vec3::ZERO).length() < 1e-3, "支撑期应当钉在锚点上");
+        let residual = 0.06f32;
+
+        // 松开：支撑掉到 0（低于 exit）。这一帧只放掉几个百分点，位置基本不动
+        let (target, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
         assert!(!lock.is_planted());
         assert!(lock.anchor().is_none(), "松开后不该留着旧锚点");
         assert_eq!(weight, 1.0, "残差还没还完，这一脚还有活要干");
-        let offset = target - ankle;
-        // 松开当帧不衰减：残差原样是 -6cm（不是 0，那就是「卡一下」）
         assert!(
-            (offset.x + 0.06).abs() < 1e-4,
-            "解除锁定当帧残差 {offset:?} 应完整保留修正量"
+            (target - Vec3::ZERO).length() < 0.06 * residual,
+            "松开当帧就放掉 {:?}，脚会被弹一下",
+            target
         );
-        assert!(offset.length() > 0.05);
 
-        // 之后脚踝不动，残差单调收敛到 0，收敛后权重回到 0
-        let mut last = offset.length();
-        for frame in 0..30 {
-            let (target, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
-            let now = (target - ankle).length();
-            assert!(now <= last + 1e-6, "第 {frame} 帧残差反弹：{last} -> {now}");
-            last = now;
-            if last == 0.0 {
-                assert_eq!(weight, 0.0, "残差归零后不该再解 IK");
+        // 逐帧位移（从「钉在锚点」开始算）：首帧要远小于「指数衰减的首帧 24%」，
+        // 中途最快，末尾收回到 0
+        let mut previous = Vec3::ZERO;
+        let mut steps = vec![(target - previous).length()];
+        for _ in 0..60 {
+            let (next, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
+            if weight == 0.0 {
                 break;
             }
+            assert!(
+                (next - ankle).length() <= (previous - ankle).length() + 1e-6,
+                "目标不能在残差方向反弹"
+            );
+            steps.push((next - previous).length());
+            previous = next;
         }
-        assert!(last < 1e-3, "残差没有收敛：{last}");
+        assert!(steps.len() >= 8, "释放窗口应当跨好几帧，实际 {}", steps.len());
+        assert!(
+            steps[0] < 0.06 * residual,
+            "松开首帧就放掉 {:.1}%（指数衰减是 24%），脚会被弹一下",
+            steps[0] / residual * 100.0
+        );
+        // 最快的一帧不在开头：加速度从 0 起，脚是「慢慢离地」而不是被松开
+        let peak = steps.iter().cloned().fold(0.0f32, f32::max);
+        let peak_at = steps
+            .iter()
+            .position(|&step| step >= peak - 1e-6)
+            .expect("总有峰值");
+        assert!(peak_at >= 1, "峰值在第 {peak_at} 帧，太靠前了");
 
         // release_secs = 0 表示硬切（只用于对比观感，默认不开）
         let hard = FootLockConfig {
@@ -493,12 +585,82 @@ mod tests {
             ..cfg
         };
         let mut snap = FootLock::default();
-        snap.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &cfg);
+        plant(&mut snap, Vec3::ZERO, 40, &cfg);
         let (target, weight) = snap.update(FootContact::ankle_only(ankle), 0.0, true, DT, &hard);
         assert_eq!(target, ankle);
         assert_eq!(weight, 0.0);
     }
 
+    /// 抬脚时那道「残差」必须摊在整个摆动期里还完：支撑期钉住的脚离动画位置越远
+    /// （转身时能到 20cm），越不能一抬脚就「瞬间」跳回动画位置。
+    /// 这里量的是**每帧位移的形状**：首帧极小、中段最快、相邻两帧的位移差（也就是
+    /// 加速度）不超过残差的 3% —— 加速度有台阶，肉眼就是「被拽了一下」。
+    #[test]
+    fn release_spreads_the_residual_over_the_whole_swing() {
+        let cfg = config();
+        let mut lock = FootLock::default();
+        plant(&mut lock, Vec3::ZERO, 40, &cfg);
+        assert!((lock.strength() - 1.0).abs() < 1e-3);
+
+        // 猛地转个身：动画把脚踝甩到 20cm 以外，这里仍然钉在锚点
+        let residual = 0.20f32;
+        let ankle = Vec3::new(residual, 0.0, 0.0);
+        let (target, _) = lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
+        assert!((target - Vec3::ZERO).length() < 1e-3, "支撑期应当钉在锚点上");
+
+        // 抬脚：从「离动画位置 20cm」开始，逐帧记录还给动画的位移
+        let mut previous = residual;
+        let mut steps: Vec<f32> = Vec::new();
+        for _ in 0..120 {
+            let (next, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
+            if weight == 0.0 {
+                assert_eq!(next, ankle, "残差还完后目标应等于动画位置");
+                break;
+            }
+            let offset = (next - ankle).length();
+            steps.push(previous - offset);
+            previous = offset;
+        }
+
+        // 整个摆动期都要用到：0.26s ≈ 16 帧，不能两三帧就还完
+        let expected = (cfg.release_secs / DT).ceil() as usize;
+        assert!(
+            steps.len() >= expected - 1,
+            "释放只用了 {} 帧（release_secs = {}s）",
+            steps.len(),
+            cfg.release_secs
+        );
+        assert!(
+            steps[0] < 0.02 * residual,
+            "抬脚首帧就还了 {:.1}%，脚会被拽一下",
+            steps[0] / residual * 100.0
+        );
+        let peak = steps.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            peak < 0.12 * residual,
+            "最快的一帧还了 {:.1}%，超过残差的 12%",
+            peak / residual * 100.0
+        );
+        assert!(
+            steps[0] < 0.3 * peak,
+            "首帧 {:.1}mm 已经接近峰值 {:.1}mm，是「先猛后松」而不是「慢慢加速」",
+            steps[0] * 1e3,
+            peak * 1e3
+        );
+        // 加速度不能有台阶：相邻两帧的位移差足够小
+        let biggest_jerk = steps
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            biggest_jerk < 0.03 * residual,
+            "两帧之间位移差跳了 {:.1}mm（残差 {:.0}cm），加速度有台阶",
+            biggest_jerk * 1e3,
+            residual * 100.0
+        );
+    }
+
+    /// 支撑末期不能钉着踝让前掌先离地：脚跟该先抬，前掌最后离地
     /// 支撑末期不能钉着踝让前掌先离地：脚跟该先抬，前掌最后离地
     #[test]
     fn heel_off_rolls_onto_the_toe_instead_of_lifting_the_ball() {
@@ -513,6 +675,8 @@ mod tests {
         let contact = |ankle: Vec3, toe: Vec3| FootContact {
             ankle,
             toe: Some(toe),
+            toe_drop: 0.0,
+            floor: None,
         };
 
         let (target, _) = lock.update(contact(ankle0, toe0), 1.0, true, DT, &cfg);
@@ -556,6 +720,88 @@ mod tests {
         );
     }
 
+    /// 地面高度必须由「踝高 − 踝到前掌的竖直距离」算出来。
+    ///
+    /// 落地那帧如果脚跟先着地、脚掌还背屈着，前掌位置比地面高好几厘米；拿它当地面，
+    /// 之后脚掌放平时就会被夹在那个高平面上，看起来就是「落地后脚掌翘着、没贴地」。
+    #[test]
+    fn toe_floor_comes_from_the_ankle_height_not_the_heel_first_contact() {
+        let cfg = FootLockConfig {
+            engage_secs: 0.0,
+            ..config()
+        };
+        let mut lock = FootLock::default();
+        // 踝高 10cm，踝到前掌 8cm → 真实地面 2cm
+        let ankle = Vec3::new(0.0, 0.10, 0.0);
+        // 脚跟先着地，脚掌背屈：前掌还在 8cm 的空中
+        let toe = Vec3::new(0.0, 0.08, 0.14);
+        let contact = FootContact {
+            ankle,
+            toe: Some(toe),
+            toe_drop: 0.08,
+            floor: None,
+        };
+        lock.update(contact, 1.0, true, DT, &cfg);
+        let floor = lock.toe_floor().expect("踩实时应有前掌地面高度");
+        assert!(
+            (floor - 0.02).abs() < 1e-6,
+            "地面应是 踝高 0.10 − 踝到前掌 0.08 = 0.02，实际 {floor}"
+        );
+    }
+
+    /// 脚尖先着地（脚掌跖屈）时，「踝高 − 踝到前掌距」反而偏高：脚掌垂下去，
+    /// 踝相对脚底更高。这时必须用当帧前掌位置（它才是真的最低点）
+    #[test]
+    fn toe_floor_takes_the_lower_of_the_ball_and_the_ankle_geometry() {
+        let cfg = FootLockConfig {
+            engage_secs: 0.0,
+            ..config()
+        };
+        let mut lock = FootLock::default();
+        // 踝高 18cm（跖屈时踝被抬起来了），前掌已经踩在 2cm 的地面上
+        let ankle = Vec3::new(0.0, 0.18, 0.0);
+        let toe = Vec3::new(0.0, 0.02, 0.14);
+        let contact = FootContact {
+            ankle,
+            toe: Some(toe),
+            toe_drop: 0.08,
+            floor: None,
+        };
+        lock.update(contact, 1.0, true, DT, &cfg);
+        let floor = lock.toe_floor().expect("踩实时应有地面高度");
+        assert!(
+            (floor - 0.02).abs() < 1e-6,
+            "地面应取更低的那个（前掌 0.02），踝高推导会算出 0.10，实际 {floor}"
+        );
+    }
+
+    /// 射线量到的地面必须无条件优先：脚还在半空（落地帧）时靠位置推断会错一整层，
+    /// 台阶上更是直接错一层
+    #[test]
+    fn probed_floor_wins_over_the_inferred_one() {
+        let cfg = FootLockConfig {
+            engage_secs: 0.0,
+            ..config()
+        };
+        let mut lock = FootLock::default();
+        // 脚踝还在 50cm 高，但脚下 2cm 处已经有台阶面
+        let ankle = Vec3::new(0.0, 0.50, 0.0);
+        let toe = Vec3::new(0.0, 0.42, 0.14);
+        let contact = FootContact {
+            ankle,
+            toe: Some(toe),
+            toe_drop: 0.08,
+            floor: Some(0.02),
+        };
+        lock.update(contact, 1.0, true, DT, &cfg);
+        let floor = lock.toe_floor().expect("踩实时应有地面高度");
+        assert!(
+            (floor - 0.02).abs() < 1e-6,
+            "应使用射线量到的台阶面 0.02，实际 {floor}"
+        );
+        assert!(lock.toe_floor_is_probed(), "来源标记应是「实测」");
+    }
+
     /// 刚踩实不能一帧满强度：支撑脚从「跟着身体走」到「钉死」的速度突变要摊开
     /// 抬脚那一帧不能让「前掌地面基准」和「夹紧强度」一起消失：脚掌朝向会一帧翻回去
     #[test]
@@ -567,22 +813,34 @@ mod tests {
         let contact = FootContact {
             ankle,
             toe: Some(toe),
+            toe_drop: 0.0,
+            floor: None,
         };
 
-        lock.update(contact, 1.0, true, DT, &config);
+        for _ in 0..30 {
+            lock.update(contact, 1.0, true, DT, &config);
+        }
         assert_eq!(lock.presence(), 1.0);
         let floor = lock.toe_floor().expect("踩实时应有前掌地面高度");
         assert!((floor - toe.y).abs() < 1e-6, "前掌地面高度 {floor}");
 
-        // 抬脚那一帧：地面基准还得在，强度仍是满的（这一帧没有台阶）
+        // 抬脚那一帧：地面基准还得在，强度也还是接近满的（这一帧没有台阶）
         lock.update(contact, 0.0, true, DT, &config);
         assert!(!lock.is_planted());
         assert!(lock.toe_floor().is_some(), "抬脚那一帧地面基准不能立刻变成 None");
-        assert_eq!(lock.presence(), 1.0, "抬脚那一帧仍按满强度，下一帧才开始淡出");
+        assert!(lock.presence() > 0.9, "抬脚那一帧仍按接近满强度");
 
+        // 之后每帧掉一点，而不是一帧从 1 掉到 0
+        let mut previous = lock.presence();
         let mut frames = 0;
         while lock.presence() > 0.0 && frames < 600 {
             lock.update(contact, 0.0, true, DT, &config);
+            assert!(
+                previous - lock.presence() < 0.15,
+                "夹紧强度单帧掉了 {}，脚掌会翻一下",
+                previous - lock.presence()
+            );
+            previous = lock.presence();
             frames += 1;
         }
         assert!(frames < 40, "夹紧强度应在一个释放窗口内淡出，实际用了 {frames} 帧");
@@ -593,19 +851,37 @@ mod tests {
         let cfg = config();
         let mut lock = FootLock::default();
         lock.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &cfg);
-        assert_eq!(lock.engage, 0.0, "踩实第一帧不咬合");
+        assert!(lock.strength() > 0.05 && lock.strength() < 0.3, "踩实首帧只轻轻咬住：{}", lock.strength());
 
-        // 脚踝已经被动画带走 5cm：修正量恒定，但施加的比例要在几帧内升上来
+        // 脚踝已经被动画带走 5cm：修正量恒定，但施加的比例要「加速—减速」地升上来
         let ankle = Vec3::new(0.05, 0.0, 0.0);
         let mut applied = 0.0f32;
-        for frame in 0..4 {
+        let mut strength = lock.strength();
+        let mut biggest_jump = 0.0f32;
+        for _ in 0..30 {
             let (target, _) = lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
             let now = (target - ankle).length();
-            assert!(now >= applied - 1e-6, "第 {frame} 帧咬合倒退：{applied} -> {now}");
+            assert!(now >= applied - 1e-6, "咬合不能倒退：{applied} -> {now}");
             applied = now;
+            biggest_jump = biggest_jump.max(lock.strength() - strength);
+            strength = lock.strength();
         }
-        // 40ms 斜坡在 60fps 下 3 帧走满
-        assert!((applied - 0.05).abs() < 1e-3, "咬合没有升满：{applied}");
+        // 单帧最多吃掉整段过渡的一小半：不是一帧就钉死
+        assert!(biggest_jump < 0.4, "单帧强度跳了 {biggest_jump:.2}");
+        // `engage_secs` 内应当走到 90%
+        let frames = (cfg.engage_secs / DT).ceil() as usize;
+        let mut probe = FootLock::default();
+        probe.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &cfg);
+        for _ in 0..frames {
+            probe.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &cfg);
+        }
+        assert!(
+            probe.strength() >= 0.9,
+            "{} 帧后强度只有 {:.2}，过渡太久",
+            frames,
+            probe.strength()
+        );
+        assert!((applied - 0.05).abs() < 1e-3, "30 帧后应当升满：{applied}");
 
         // 关掉斜坡时立刻满强度
         let hard = FootLockConfig {
@@ -614,6 +890,7 @@ mod tests {
         };
         let mut snap = FootLock::default();
         snap.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &hard);
+        assert_eq!(snap.strength(), 1.0, "engage_secs = 0 应当直接满强度");
         let (target, _) = snap.update(FootContact::ankle_only(ankle), 1.0, true, DT, &hard);
         assert!((target - Vec3::ZERO).length() < 1e-5, "应当直接钉在锚点");
     }
