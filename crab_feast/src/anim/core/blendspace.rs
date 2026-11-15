@@ -97,9 +97,8 @@ pub fn weights_2d(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)> {
 ///
 /// 恰好落在某个采样点上时该点独占（距离为 0，权重发散），否则按距离衰减。
 fn local_distance_weights(samples: &[Sample2D], point: [f32; 2]) -> Vec<(String, f32)> {
-    let distance_sq = |sample: &Sample2D| {
-        (sample.at[0] - point[0]).powi(2) + (sample.at[1] - point[1]).powi(2)
-    };
+    let distance_sq =
+        |sample: &Sample2D| (sample.at[0] - point[0]).powi(2) + (sample.at[1] - point[1]).powi(2);
     let nearest = samples
         .iter()
         .map(distance_sq)

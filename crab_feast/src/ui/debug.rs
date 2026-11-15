@@ -13,9 +13,9 @@ use avian3d::prelude::*;
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 
-use crate::anim::{FootIk, FootIkSettings};
-use crate::ui::menu::{widgets, MenuConfig, MenuPageBody, MenuPageDef, MenuSet};
 use crate::GameState;
+use crate::anim::{FootIk, FootIkSettings};
+use crate::ui::menu::{MenuConfig, MenuPageBody, MenuPageDef, MenuSet, widgets};
 
 /// 菜单页面 id
 pub const DEBUG_PAGE: &str = "debug";

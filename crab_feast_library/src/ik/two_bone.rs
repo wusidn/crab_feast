@@ -147,7 +147,11 @@ mod tests {
     fn identity_target_keeps_the_pose() {
         let (root, joint, end) = sample_chain();
         let solution = solve_two_bone(root, joint, end, end, joint - root).expect("应当有解");
-        assert!((solution.joint - joint).length() < 1e-4, "{:?}", solution.joint);
+        assert!(
+            (solution.joint - joint).length() < 1e-4,
+            "{:?}",
+            solution.joint
+        );
         assert!((solution.end - end).length() < 1e-4, "{:?}", solution.end);
         assert!(!solution.clamped);
     }
@@ -166,7 +170,11 @@ mod tests {
             ((solution.joint - solution.end).length() - (end - joint).length()).abs() < 1e-4,
             "下段长度被改了"
         );
-        assert!((solution.end - target).length() < 1e-4, "{:?}", solution.end);
+        assert!(
+            (solution.end - target).length() < 1e-4,
+            "{:?}",
+            solution.end
+        );
     }
 
     #[test]

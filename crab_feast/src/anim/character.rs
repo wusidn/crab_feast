@@ -447,7 +447,11 @@ fn request_character(
         );
     }
     runtime.clips_for = Some(index);
-    info!("剪辑表刷新：{}（#{index}），{} 条", def.name, runtime.clips.len());
+    info!(
+        "剪辑表刷新：{}（#{index}），{} 条",
+        def.name,
+        runtime.clips.len()
+    );
 }
 
 /// 资源加载完成后换模型：旧角色会一直播放到换上的这一帧

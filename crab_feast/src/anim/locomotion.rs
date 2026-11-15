@@ -77,18 +77,16 @@ fn drive_locomotion(
         return;
     }
 
-    let [yaw, speed] = params_for(
-        avatars.iter().next().map(|(state, intent)| {
-            (
-                state.error_deg,
-                if intent.magnitude > 1e-3 {
-                    intent.magnitude
-                } else {
-                    0.0
-                },
-            )
-        }),
-    );
+    let [yaw, speed] = params_for(avatars.iter().next().map(|(state, intent)| {
+        (
+            state.error_deg,
+            if intent.magnitude > 1e-3 {
+                intent.magnitude
+            } else {
+                0.0
+            },
+        )
+    }));
 
     // 参数轴限速：参数一跳，权重就跟着跳，姿态就是一帧台阶。yaw 现在覆盖整圈，
     // 所以限速要按**最短弧**走，否则 180° 附近抖一下会让参数绕一整圈。
@@ -215,8 +213,9 @@ mod tests {
     fn any_direction_keeps_speed_positive() {
         // 整圈都不给速度翻符号：翻符号必然经过 speed=0，而那里只有 Idle，
         // 转身时腿就会闪一下。这是 A 方案要守住的不变量。
-        for error in [0.0, 45.0, 90.0, 91.0, 120.0, 150.0, 179.0, 180.0,
-                      -45.0, -91.0, -150.0, -180.0] {
+        for error in [
+            0.0, 45.0, 90.0, 91.0, 120.0, 150.0, 179.0, 180.0, -45.0, -91.0, -150.0, -180.0,
+        ] {
             let [yaw, speed] = params_for(Some((error, 0.8)));
             assert!((speed - 0.8).abs() < 1e-6, "error {error} speed {speed}");
             assert!((yaw + error).abs() < 1e-6, "error {error} yaw {yaw}");

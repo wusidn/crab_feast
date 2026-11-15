@@ -560,11 +560,7 @@ fn clip_support(events: [Option<f32>; 4], phase: f32) -> [f32; 2] {
 ///
 /// 权重全为零（例如纯 Idle 没有任何步态事件）时输出 0：脚部 IK 自然不介入，
 /// 站着不动时不需要锁脚。
-fn blended_contacts(
-    plans: &[SamplePlan],
-    phase: f32,
-    reference: &[Option<f32>; 4],
-) -> [f32; 2] {
+fn blended_contacts(plans: &[SamplePlan], phase: f32, reference: &[Option<f32>; 4]) -> [f32; 2] {
     let mut sum = [0.0f32; 2];
     let mut total = 0.0;
     for plan in plans {
@@ -617,7 +613,8 @@ impl SamplePlan {
         // 单调映射——硬配必然要绕一个整圈，权重一动映射就翻脸，脚被拽着瞬移。
         // 所以倒放只用全局相位反向采样：节奏由统一时间轴给，脚怎么迈由剪辑自己决定。
         if self.reverse {
-            return (duration - phase.rem_euclid(1.0) * duration).rem_euclid(duration.max(f32::EPSILON));
+            return (duration - phase.rem_euclid(1.0) * duration)
+                .rem_euclid(duration.max(f32::EPSILON));
         }
         let points = gait_segments(&self.events(), reference);
         let local_phase = warp_phase(phase, &points);
@@ -766,7 +763,10 @@ mod tests {
                 plans[1].sample_time(phase, &reference),
             );
             if let Some(before) = prev {
-                for (index, (a, b)) in [(before.0, now.0), (before.1, now.1)].into_iter().enumerate() {
+                for (index, (a, b)) in [(before.0, now.0), (before.1, now.1)]
+                    .into_iter()
+                    .enumerate()
+                {
                     let mut delta = (b - a).rem_euclid(1.0);
                     if delta > 0.5 {
                         delta -= 1.0;
@@ -879,7 +879,10 @@ mod tests {
         for phase in [0.0, 0.25, 0.5, 0.75] {
             let a = blended_contacts(&single, phase, &reference);
             let b = blended_contacts(&scaled, phase, &reference);
-            assert!((a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5, "{phase}: {a:?} vs {b:?}");
+            assert!(
+                (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5,
+                "{phase}: {a:?} vs {b:?}"
+            );
         }
         // 触地事件表不完整（例如 Idle 只有触地没有离地）时判定为不踩实
         let incomplete = vec![SamplePlan {
@@ -911,27 +914,51 @@ mod tests {
         let clips: Vec<(&str, ClipMeta)> = vec![
             (
                 "Walking",
-                meta([Some(0.312), Some(0.781), Some(0.823), Some(0.281)], 1.190, 1.033),
+                meta(
+                    [Some(0.312), Some(0.781), Some(0.823), Some(0.281)],
+                    1.190,
+                    1.033,
+                ),
             ),
             (
                 "Running",
-                meta([Some(0.406), Some(0.625), Some(0.927), Some(0.135)], 2.114, 0.700),
+                meta(
+                    [Some(0.406), Some(0.625), Some(0.927), Some(0.135)],
+                    2.114,
+                    0.700,
+                ),
             ),
             (
                 "LeftStrafeWalking",
-                meta([Some(0.312), Some(0.802), Some(0.792), Some(0.302)], 1.234, 1.033),
+                meta(
+                    [Some(0.312), Some(0.802), Some(0.792), Some(0.302)],
+                    1.234,
+                    1.033,
+                ),
             ),
             (
                 "RightStrafeWalking",
-                meta([Some(0.312), Some(0.802), Some(0.792), Some(0.302)], 1.234, 1.033),
+                meta(
+                    [Some(0.312), Some(0.802), Some(0.792), Some(0.302)],
+                    1.234,
+                    1.033,
+                ),
             ),
             (
                 "LeftStrafe",
-                meta([Some(0.417), Some(0.656), Some(0.917), Some(0.188)], 2.079, 0.667),
+                meta(
+                    [Some(0.417), Some(0.656), Some(0.917), Some(0.188)],
+                    2.079,
+                    0.667,
+                ),
             ),
             (
                 "RightStrafe",
-                meta([Some(0.417), Some(0.656), Some(0.917), Some(0.188)], 2.079, 0.667),
+                meta(
+                    [Some(0.417), Some(0.656), Some(0.917), Some(0.188)],
+                    2.079,
+                    0.667,
+                ),
             ),
         ];
         let lookup = |clip: &str| -> ClipMeta {
@@ -1020,7 +1047,11 @@ mod tests {
                         )
                     })
                     .collect();
-                println!("  {yaw:6.1} ref={:?} → {}", reference.map(|e| e.map(|v| (v * 1000.0).round() / 1000.0)), times.join(" "));
+                println!(
+                    "  {yaw:6.1} ref={:?} → {}",
+                    reference.map(|e| e.map(|v| (v * 1000.0).round() / 1000.0)),
+                    times.join(" ")
+                );
                 yaw += 1.0;
             }
         }
@@ -1075,7 +1106,11 @@ mod tests {
                             if delta.abs() > 0.01 {
                                 println!(
                                     "    !! yaw {yaw:.2} {clip} delta {delta:+.4} (旧 {old:.4} → 新 {time:.4}，权重 {:.3}, 参考 {:?})",
-                                    plans.iter().find(|p2| &p2.clip == clip).map(|p2| p2.weight).unwrap_or(0.0),
+                                    plans
+                                        .iter()
+                                        .find(|p2| &p2.clip == clip)
+                                        .map(|p2| p2.weight)
+                                        .unwrap_or(0.0),
                                     reference.map(|e| e.map(|v| (v * 1000.0).round() / 1000.0))
                                 );
                             }

@@ -13,8 +13,7 @@ pub fn game_spaces() -> Vec<BlendSpaceSpec> {
         BlendSpaceSpec {
             id: "locomotion".to_string(),
             title: "移动混合".to_string(),
-            description: "移动混合：朝向 × 速度，yaw 覆盖整圈（±180°），速度恒为非负"
-                .to_string(),
+            description: "移动混合：朝向 × 速度，yaw 覆盖整圈（±180°），速度恒为非负".to_string(),
             params: [
                 ParamSpec::new(
                     "yaw",

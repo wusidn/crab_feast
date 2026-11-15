@@ -217,6 +217,15 @@ pub struct FootLock {
     /// `toe_floor` 是射线量到的（true）还是推断的（false）。推断值可能是假的，
     /// 夹紧那边要据此决定要不要相信它
     toe_floor_probed: bool,
+    /// 上一帧动画给出的踝位置（世界）。用来量「动画自己挪脚有多快」
+    prev_ankle: Option<Vec3>,
+    /// 近 [`ANIM_PEAK_TAU`] 毫秒里动画挪脚速度的峰值（m/s）。还残差的节奏以它为上限：
+    /// 动画把脚挪得快，残差就还得快；动画站着不动，残差就原地冻结
+    anim_peak: f32,
+    /// 动画挪脚的**当帧速度**，只做 50ms 平滑（闸门用）。
+    /// 不能拿 [`Self::anim_peak`] 当闸门：那是 0.25s 峰值，动画停下了它还会
+    /// 残留 0.25s，闸门就等于没开 —— 收脚恰好就发生在这 0.26s 里
+    anim_speed: f32,
     /// 朝向夹紧的剩余强度（0..1），跟 [`FootLock::strength`] 同步：
     /// 少了它，「前掌不穿地」的转动会在抬脚那一帧被整段撤掉，脚掌一帧翻十几度
     presence: f32,
@@ -237,6 +246,9 @@ impl FootLock {
         self.ramp_secs = 0.0;
         self.ankle_base = 0.0;
         self.toe_vec = Vec3::ZERO;
+        self.prev_ankle = None;
+        self.anim_peak = 0.0;
+        self.anim_speed = 0.0;
         self.toe_floor = None;
         self.toe_floor_probed = false;
         self.presence = 0.0;
@@ -344,6 +356,19 @@ impl FootLock {
         }
         let toe = contact.toe.filter(|toe| toe.is_finite());
 
+        // 动画自己挪脚有多快（世界空间）。取近 80ms 的**峰值**而不是当帧瞬时值：
+        // 测速不能靠「碰巧这一帧在动」，也得等得到「刚从别处瞬移过来」这种单帧跳变
+        if let Some(prev) = self.prev_ankle {
+            let speed = (ankle - prev).length() / dt.max(1e-4);
+            let decay = (-dt.max(0.0) / ANIM_PEAK_TAU).exp();
+            self.anim_peak = speed.max(self.anim_peak * decay);
+            let gate_decay = (-dt.max(0.0) / ANIM_SPEED_TAU).exp();
+            self.anim_speed = speed.max(self.anim_speed * gate_decay);
+        } else {
+            self.anim_peak = 0.0;
+        }
+        self.prev_ankle = Some(ankle);
+
         let support = if support.is_finite() {
             support.clamp(0.0, 1.0)
         } else {
@@ -377,15 +402,16 @@ impl FootLock {
                     // 真实地面只会比两者中更低那个更接近脚掌的实际最低点
                     // 射线量到的地面最可信（台阶、斜坡都靠它）；没有物理时退回推断
                     self.toe_floor_probed = contact.floor.is_some_and(|floor| floor.is_finite());
-                    self.toe_floor = contact.floor.filter(|floor| floor.is_finite()).or_else(|| {
-                        toe.map(|toe| {
-                            if contact.toe_drop > 1e-4 {
-                                toe.y.min(ankle.y - contact.toe_drop)
-                            } else {
-                                toe.y
-                            }
-                        })
-                    });
+                    self.toe_floor =
+                        contact.floor.filter(|floor| floor.is_finite()).or_else(|| {
+                            toe.map(|toe| {
+                                if contact.toe_drop > 1e-4 {
+                                    toe.y.min(ankle.y - contact.toe_drop)
+                                } else {
+                                    toe.y
+                                }
+                            })
+                        });
                 }
             } else if support <= config.plant_exit {
                 self.planted = false;
@@ -450,11 +476,9 @@ impl FootLock {
         // 之后不再改动它 —— 放开的形状只由 `strength` 决定，这样首尾速度才能都是 0
         let anchor = self.anchor.or(old_anchor);
         let toe_vec_now = toe.map(|toe| toe - ankle).unwrap_or(self.toe_vec);
+        let pivot = self.roll * (self.toe_vec - toe_vec_now);
         let pinned = match anchor {
-            Some(anchor) => FootLock::clamp_residual(
-                anchor + self.roll * (self.toe_vec - toe_vec_now) - ankle,
-                config,
-            ),
+            Some(anchor) => FootLock::clamp_residual(anchor + pivot - ankle, config),
             None => Vec3::ZERO,
         };
 
@@ -481,7 +505,44 @@ impl FootLock {
         } else {
             config.release_secs
         };
-        self.progress = advance_progress(self.progress, want, dt, secs);
+        // 动画自己不动，就不许按钟往下衰减：`release_secs` 的钟一直在跑，
+        // 动画站着不动它也一样跑 —— 那就是把 20~30cm 的残差在 0.26s 里匀速
+        // 拖过地面，用户看到的就是「收脚」。
+        // 闸门取**当帧**脚速（50ms 平滑）而不是 `anim_peak`：后者带 0.25s 尾巴，
+        // 而「停下」这件事只有一两帧的窗口，用峰值等于闸门没开。
+        // 只拦「横向的大债」：看得见的拖脚是横向贴地的位移，竖直分量（地板把
+        // 脚踝顶起来那段）本来就要跟着地面；而且抬跟那套刚体耦合（`heel_k` 与
+        // 踝偏移同步淡出）要求 10cm 级的债在 0.1s 内走完，拦了会把脚掌转角
+        // 和踝平移拆开，反倒出台阶。留 `STANDING_CREEP` 下限，保证动画彻底
+        // 静止时残差也会极慢收敛，不至于永远挂在脚上
+        let horiz = (self.residual.x * self.residual.x + self.residual.z * self.residual.z).sqrt();
+        let gate_applies = !self.planted && horiz > GATE_DEBT;
+        let anim_gate = if !gate_applies {
+            1.0
+        } else {
+            STANDING_CREEP.max(smoothstep((self.anim_speed / ANIM_STILL_SPAN).clamp(0.0, 1.0)))
+        };
+        let mut progress = advance_progress(self.progress, want, dt * anim_gate, secs);
+        // 离地后还残差 = 把脚横向拖回去。这个速度必须**跟着动画自己挪脚**：
+        // 停下时动画会在 3~4 帧里把脚横向瞬移 30~60cm，锁脚却按 `release_secs`
+        // 的节奏在地上拖 —— 脚已经落地了还在被拖 20~30cm，看起来就是「收脚/蹭地」。
+        // 动画挪得快，残差就还得快（世界位移始终由动画主导）；动画站着不动，
+        // 残差原地冻结（静止的横向偏移看不出来，在地上拖一段才看得出来）。
+        // 只在「残差已经大到摊在 0.26s 里就等于在地上拖」时才接管节奏：
+        // 平时几厘米的残差照旧按 `release_secs` 平滑还完，手感不变。
+        // `enabled == false`（IK 被关掉）不走这条路：那是 A/B 对比用的，
+        // 脚本来就要跳回去，硬切只会更难看
+        if enabled && !self.planted {
+            let residue = self.residual.length();
+            if residue > BIG_DEBT && self.anim_peak > FAST_PACE {
+                let budget = (self.anim_peak * dt.max(0.0) * RELEASE_GAIN / residue).clamp(0.0, 1.0);
+                let newest = (smoothstep(progress) - budget).max(0.0);
+                if newest < self.strength {
+                    progress = progress.min(inverse_smoothstep(newest));
+                }
+            }
+        }
+        self.progress = progress;
         self.strength = smoothstep(self.progress);
 
         // 退干净后清零：残差留着会让这一脚每帧多解一次 IK
@@ -491,11 +552,19 @@ impl FootLock {
             self.residual = Vec3::ZERO;
         }
 
-        // 前掌朝向夹紧跟强度同步淡出，脚掌朝向不会有台阶
+        // 前掌朝向夹紧跟强度同步淡出，脚掌朝向不会有台阶。
+        // 但「跟着动画快速还残差」那几帧不能把它一起拉掉：残差是脚踝的**平移**，
+        // 「前掌不穿地」是姿态守卫，两个各按各的节奏 —— 守卫至少摊满 `release_secs`，
+        // 否则放开的当帧前掌就少了一段夹紧、一帧扫进地里（实测 17mm）
         self.presence = if self.planted {
             1.0
         } else {
-            self.strength
+            let step = if config.release_secs > f32::EPSILON {
+                dt.max(0.0) / config.release_secs
+            } else {
+                1.0
+            };
+            (self.presence - step).clamp(0.0, 1.0).min(self.strength)
         };
 
         let applied = self.residual * self.strength;
@@ -522,6 +591,50 @@ impl FootLock {
 }
 
 /// `smoothstep`：`t` 在 0..1 上单调、两端导数为 0，把折角磨平
+/// 「动画刚才挪脚多快」的记忆时长（秒）。要盖过 `release_secs`（0.26s）：
+/// 停下时那一下瞬移就是这笔残差的**来由**，还的时候要按同一个节奏走完，
+/// 不能走一半就忘了刚才动画有多快、退回慢慢拖
+const ANIM_PEAK_TAU: f32 = 0.25;
+
+/// 算「动画在瞬移」的挪脚速度门槛（m/s）。支撑期的正常挪脚是 1~4m/s，
+/// 停下时动画把脚甩进站位能到 10~20m/s —— 只有后者才该改变还残差的节奏
+const FAST_PACE: f32 = 6.0;
+
+/// 需要「跟着动画还」的残差下限（米）。几厘米的残差摊在 `release_secs` 里
+/// 只有十几厘米每秒，在地上也看不出来；超过这个量级才必须跟着动画一起还
+const BIG_DEBT: f32 = 0.08;
+
+/// 动画脚速的短窗平滑时间常数（秒）：闸门用当帧速度，不能带 0.25s 的尾巴
+const ANIM_SPEED_TAU: f32 = 0.05;
+/// 闸门只拦横向残差超过这个量级的债（米）。实测分档：15~18cm 摊在
+/// `release_secs` 里看不出来（Castle 直走那几轮 0 坏轮），20cm 以上才是
+/// 肉眼可见的贴地拖行（Big Vegas 右脚 23.5cm）；抬跟的刚体耦合
+/// （`heel_k` 与踝偏移同步淡出）也要求 10cm 级的债在 0.1s 内还完
+const GATE_DEBT: f32 = 0.20;
+
+/// 闸门完全打开所需的脚速（m/s）。低于这个速度就认为「动画没在挪脚」
+const ANIM_STILL_SPAN: f32 = 0.5;
+/// 闸门的下限：动画彻底静止时残差按这个比例（相对正常 `release_secs` 节奏）
+/// 极慢收敛，避免一笔残差永远挂着
+const STANDING_CREEP: f32 = 0.10;
+
+/// 还残差的增益：每帧最多还「动画这一帧挪了多远」的多少倍。
+/// 1.0 = 世界位移最多是动画的两倍（再多就是 IK 在主导，看得出来了）
+const RELEASE_GAIN: f32 = 0.8;
+
+/// [`smoothstep`] 的反函数（解析解）。把「限速后的强度」换算回线性进度，
+/// 两者才不会各跑各的、后段突然追上来
+fn inverse_smoothstep(s: f32) -> f32 {
+    let s = s.clamp(0.0, 1.0);
+    if s <= 0.0 {
+        return 0.0;
+    }
+    if s >= 1.0 {
+        return 1.0;
+    }
+    0.5 - ((1.0 - 2.0 * s).asin() / 3.0).sin()
+}
+
 fn smoothstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -684,7 +797,8 @@ mod tests {
         for frame in 0..20 {
             ankle += Vec3::new(0.01, 0.0, 0.0);
             let enabled = frame % 2 == 0;
-            let (target, weight) = lock.update(FootContact::ankle_only(ankle), 1.0, enabled, DT, &config());
+            let (target, weight) =
+                lock.update(FootContact::ankle_only(ankle), 1.0, enabled, DT, &config());
             assert!(target.is_finite());
             assert!((0.0..=1.0).contains(&weight));
             if enabled {
@@ -713,7 +827,10 @@ mod tests {
         // 身体走了 6cm：锚点还钉在世界原点，脚踝被动画带走
         let ankle = Vec3::new(0.06, 0.0, 0.0);
         let (target, _) = lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
-        assert!((target - Vec3::ZERO).length() < 1e-3, "支撑期应当钉在锚点上");
+        assert!(
+            (target - Vec3::ZERO).length() < 1e-3,
+            "支撑期应当钉在锚点上"
+        );
         let residual = 0.06f32;
 
         // 松开：支撑掉到 0（低于 exit）。这一帧只放掉几个百分点，位置基本不动
@@ -743,7 +860,11 @@ mod tests {
             steps.push((next - previous).length());
             previous = next;
         }
-        assert!(steps.len() >= 8, "释放窗口应当跨好几帧，实际 {}", steps.len());
+        assert!(
+            steps.len() >= 8,
+            "释放窗口应当跨好几帧，实际 {}",
+            steps.len()
+        );
         assert!(
             steps[0] < 0.06 * residual,
             "松开首帧就放掉 {:.1}%（指数衰减是 24%），脚会被弹一下",
@@ -773,6 +894,116 @@ mod tests {
     /// （转身时能到 20cm），越不能一抬脚就「瞬间」跳回动画位置。
     /// 这里量的是**每帧位移的形状**：首帧极小、中段最快、相邻两帧的位移差（也就是
     /// 加速度）不超过残差的 3% —— 加速度有台阶，肉眼就是「被拽了一下」。
+    /// 动画自己停住不动时，残差**不许**按 `release_secs` 的钟往下还 ——
+    /// 这就是「收脚」：动画站着不动，锁脚却用 0.26s 把 20~30cm 匀速拖过地面。
+    /// 残差的归还速度必须由动画自己的动作驱动：动画不挪脚，就原地冻着
+    #[test]
+    fn a_parked_animation_does_not_drag_its_residual_out() {
+        let cfg = config();
+        let mut lock = FootLock::default();
+        let planted_at = Vec3::new(0.0, 0.24, 0.0);
+        for _ in 0..40 {
+            lock.update(FootContact::ankle_only(planted_at), 1.0, true, DT, &cfg);
+        }
+        assert!(lock.planted && (lock.strength() - 1.0).abs() < 1e-3);
+
+        // 转完身站稳：身体带着脚踝慢慢走开 20cm（16 帧，0.75m/s），锁脚钉在原处
+        let mut ankle = planted_at;
+        for _ in 0..16 {
+            ankle.x += 0.22 / 16.0;
+            lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
+        }
+
+        // 抬脚，之后动画**完全静止**（脚不动）
+        let (target, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
+        assert_eq!(weight, 1.0);
+        let at_release = (target - ankle).length();
+        assert!(at_release > 0.17, "应当还欠 22cm，实际 {:.3}m", at_release);
+
+        // 0.5s（= release_secs 的两倍）脚一动不动：这一步只许极慢地爬
+        let mut after = at_release;
+        for _ in 0..(0.5 / DT) as usize {
+            let (target, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
+            if weight == 0.0 {
+                after = 0.0;
+                break;
+            }
+            after = (target - ankle).length();
+        }
+        assert!(
+            after > at_release * 0.7,
+            "动画静止 0.5s 就还掉了 {:.0}%（{:.1}cm → {:.1}cm），等于在地上拖脚",
+            (1.0 - after / at_release) * 100.0,
+            at_release * 100.0,
+            after * 100.0
+        );
+
+        // 动画重新迈脚（每帧 1cm ≈ 0.6m/s）：这时候才该把债还掉
+        let mut frames = 0;
+        let mut repaid = false;
+        for i in 0..120 {
+            ankle.x += 0.01;
+            let (_, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
+            frames = i + 1;
+            if weight == 0.0 {
+                repaid = true;
+                break;
+            }
+        }
+        assert!(repaid, "动画恢复迈脚后残差应当还完（{frames} 帧还没还完）");
+    }
+
+    /// 动画把脚**瞬移**（停下时速度参数塌到 0，3~4 帧就甩进站立位，实测每帧 20~60cm）
+    /// 时，残差必须跟着动画的节奏还 —— 摊在 `release_secs` 里等于让脚在地上被拖
+    /// 20~30cm，那就是「停下后收脚」。这里量两件事：还完的帧数与动画同步，
+    /// 并且脚的世界位移每帧不超过动画自己的 2 倍（再快就是 IK 在主导了）
+    #[test]
+    fn teleporting_animation_takes_its_residual_back_at_its_own_pace() {
+        let cfg = config();
+        let mut lock = FootLock::default();
+        plant(&mut lock, Vec3::ZERO, 40, &cfg);
+        assert!((lock.strength() - 1.0).abs() < 1e-3);
+
+        // 支撑期钉住，动画一帧把脚甩走 15cm（≈9m/s，实测瞬移的量级）
+        let slam = 0.15f32;
+        let ankle = Vec3::new(slam, 0.0, 0.0);
+        lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
+        let offset_before = (lock.anchor().expect("还钉着") - ankle).length();
+        assert!(
+            (offset_before - slam).abs() < 1e-3,
+            "残差应当积累到 {slam}，实际 {offset_before}"
+        );
+
+        // 抬脚 + 动画停住：残差要在这两三帧里还完，而不是摊 0.26s（16 帧）
+        let mut previous = offset_before;
+        let mut frames = 0;
+        let mut world_steps: Vec<f32> = Vec::new();
+        let mut previous_target = ankle;
+        for _ in 0..40 {
+            let (next, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
+            frames += 1;
+            world_steps.push((next - previous_target).length());
+            previous_target = next;
+            if weight == 0.0 {
+                break;
+            }
+            let offset = (next - ankle).length();
+            assert!(offset <= previous + 1e-5, "目标不能在残差方向反弹");
+            previous = offset;
+        }
+        assert!(
+            frames <= 6,
+            "动画一帧挪 {slam}m，残差却花了 {frames} 帧才还完 —— 又会在地上拖"
+        );
+        let worst = world_steps.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            worst <= slam * 2.0 + 1e-4,
+            "有一帧脚走了 {:.1}cm，超过动画自身每帧位移（{:.0}cm）的两倍",
+            worst * 100.0,
+            slam * 100.0
+        );
+    }
+
     #[test]
     fn release_spreads_the_residual_over_the_whole_swing() {
         let cfg = config();
@@ -780,61 +1011,65 @@ mod tests {
         plant(&mut lock, Vec3::ZERO, 40, &cfg);
         assert!((lock.strength() - 1.0).abs() < 1e-3);
 
-        // 猛地转个身：动画把脚踝甩到 20cm 以外，这里仍然钉在锚点
+        // 猛地转个身：身体连着走开 20cm，锁脚一直钉在锚点上（第 16 帧时差 20cm）
         let residual = 0.20f32;
-        let ankle = Vec3::new(residual, 0.0, 0.0);
-        let (target, _) = lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
-        assert!((target - Vec3::ZERO).length() < 1e-3, "支撑期应当钉在锚点上");
+        let mut ankle = Vec3::ZERO;
+        let stride = residual / 16.0;
+        for _ in 0..16 {
+            ankle.x += stride;
+            let (target, _) = lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
+            assert!(
+                (target - Vec3::ZERO).length() < 1e-3,
+                "支撑期应当钉在锚点上"
+            );
+        }
 
-        // 抬脚：从「离动画位置 20cm」开始，逐帧记录还给动画的位移
-        let mut previous = residual;
-        let mut steps: Vec<f32> = Vec::new();
+        // 抬脚：残差从 20cm 开始还。摆动期动画自己也在挪脚（脚在走），
+        // 归还节奏才允许往前走 —— 动画停了就不许再还，那条约定单独用
+        // `a_parked_animation_does_not_drag_its_residual_out` 测。
+        // 这里只看「形状」：强度（= 残差被施加的比例）每帧掉多少
+        let mut strengths: Vec<f32> = Vec::new();
+        let mut swung = ankle;
         for _ in 0..120 {
-            let (next, weight) = lock.update(FootContact::ankle_only(ankle), 0.0, true, DT, &cfg);
+            swung.x += 0.01;
+            let (_, weight) = lock.update(FootContact::ankle_only(swung), 0.0, true, DT, &cfg);
             if weight == 0.0 {
-                assert_eq!(next, ankle, "残差还完后目标应等于动画位置");
                 break;
             }
-            let offset = (next - ankle).length();
-            steps.push(previous - offset);
-            previous = offset;
+            strengths.push(lock.strength());
         }
 
         // 整个摆动期都要用到：0.26s ≈ 16 帧，不能两三帧就还完
         let expected = (cfg.release_secs / DT).ceil() as usize;
         assert!(
-            steps.len() >= expected - 1,
+            strengths.len() >= expected - 1,
             "释放只用了 {} 帧（release_secs = {}s）",
-            steps.len(),
+            strengths.len(),
             cfg.release_secs
         );
+        // 首帧不能猛地掉一大块：那是「先猛后松」，脚会被拽一下
+        let first = 1.0 - strengths[0];
         assert!(
-            steps[0] < 0.02 * residual,
+            first < 0.03,
             "抬脚首帧就还了 {:.1}%，脚会被拽一下",
-            steps[0] / residual * 100.0
+            first * 100.0
         );
-        let peak = steps.iter().cloned().fold(0.0f32, f32::max);
-        assert!(
-            peak < 0.12 * residual,
-            "最快的一帧还了 {:.1}%，超过残差的 12%",
-            peak / residual * 100.0
-        );
-        assert!(
-            steps[0] < 0.3 * peak,
-            "首帧 {:.1}mm 已经接近峰值 {:.1}mm，是「先猛后松」而不是「慢慢加速」",
-            steps[0] * 1e3,
-            peak * 1e3
-        );
-        // 加速度不能有台阶：相邻两帧的位移差足够小
+        // 每帧掉的量先增后减（smoothstep），相邻两帧不能有台阶
+        let steps: Vec<f32> = {
+            let mut all = vec![1.0f32];
+            all.extend(strengths.iter().copied());
+            all.windows(2).map(|pair| pair[0] - pair[1]).collect()
+        };
+        let peak = steps.iter().copied().fold(0.0f32, f32::max);
         let biggest_jerk = steps
             .windows(2)
             .map(|pair| (pair[1] - pair[0]).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            biggest_jerk < 0.03 * residual,
-            "两帧之间位移差跳了 {:.1}mm（残差 {:.0}cm），加速度有台阶",
-            biggest_jerk * 1e3,
-            residual * 100.0
+            biggest_jerk < 0.35 * peak,
+            "两帧之间掉速跳了 {:.1}%（峰值 {:.1}%），加速度有台阶",
+            biggest_jerk * 100.0,
+            peak * 100.0
         );
     }
 
@@ -1150,7 +1385,10 @@ mod tests {
         // 抬脚那一帧：地面基准还得在，强度也还是接近满的（这一帧没有台阶）
         lock.update(contact, 0.0, true, DT, &config);
         assert!(!lock.is_planted());
-        assert!(lock.toe_floor().is_some(), "抬脚那一帧地面基准不能立刻变成 None");
+        assert!(
+            lock.toe_floor().is_some(),
+            "抬脚那一帧地面基准不能立刻变成 None"
+        );
         assert!(lock.presence() > 0.9, "抬脚那一帧仍按接近满强度");
 
         // 之后每帧掉一点，而不是一帧从 1 掉到 0
@@ -1166,7 +1404,10 @@ mod tests {
             previous = lock.presence();
             frames += 1;
         }
-        assert!(frames < 40, "夹紧强度应在一个释放窗口内淡出，实际用了 {frames} 帧");
+        assert!(
+            frames < 40,
+            "夹紧强度应在一个释放窗口内淡出，实际用了 {frames} 帧"
+        );
     }
 
     #[test]
@@ -1174,7 +1415,11 @@ mod tests {
         let cfg = config();
         let mut lock = FootLock::default();
         lock.update(FootContact::ankle_only(Vec3::ZERO), 1.0, true, DT, &cfg);
-        assert!(lock.strength() > 0.05 && lock.strength() < 0.3, "踩实首帧只轻轻咬住：{}", lock.strength());
+        assert!(
+            lock.strength() > 0.05 && lock.strength() < 0.3,
+            "踩实首帧只轻轻咬住：{}",
+            lock.strength()
+        );
 
         // 脚踝已经被动画带走 5cm：修正量恒定，但施加的比例要「加速—减速」地升上来
         let ankle = Vec3::new(0.05, 0.0, 0.0);
