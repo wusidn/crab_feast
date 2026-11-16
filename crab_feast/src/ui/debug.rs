@@ -15,6 +15,7 @@ use bevy::prelude::*;
 
 use crate::GameState;
 use crate::anim::{FootIk, FootIkSettings};
+use crate::input::{FacingController, FacingState};
 use crate::ui::menu::{MenuConfig, MenuPageBody, MenuPageDef, MenuSet, widgets};
 
 /// 菜单页面 id
@@ -307,8 +308,14 @@ fn update_foot_ik_status(
     settings: Res<FootIkSettings>,
     scale: Res<DebugTimeScale>,
     ik: Query<&FootIk>,
+    facing: Query<(&FacingState, &FacingController)>,
     mut labels: Query<&mut Text, With<FootIkStatus>>,
 ) {
+    // 转向门控读数：support → 实际顶速。跑动时看这一对数就知道腾空段有没有压住
+    let turn = facing
+        .iter()
+        .next()
+        .map(|(state, controller)| (state.support, controller.turn_speed_at(state.support)));
     let line = if !settings.enabled {
         "已关闭".to_string()
     } else if let Some(ik) = ik.iter().next() {
@@ -323,6 +330,8 @@ fn update_foot_ik_status(
             let [ankle_left, ankle_right] = ik.ankle_deg();
             // 前掌骨折角：抬跟时脚趾要留在地上，这个数应该跟着抬跟一起长
             let [toe_left, toe_right] = ik.toe_bend_deg();
+            // 偏航补偿：踩实期间把脚掌拧回来的角度，顶到 foot_yaw_limit 就是撑不住了
+            let [yaw_left, yaw_right] = ik.yaw_lock_deg();
             let [strength_left, strength_right] = ik.strength();
             // 承重点：踩实后期承重点滑到前掌（「掌」），前期钉踝（「踝」）。
             // 踝角 = 脚掌与小腿的夹角，90 = 站立、蹬地时该到 130~160
@@ -345,8 +354,14 @@ fn update_foot_ik_status(
                 ),
                 None => "-".to_string(),
             };
+            // 转向门控：前一个数是低通过的「脚在地上」权重，后一个数是它算出来的顶速。
+            // 跑动时应当看到它随跑步节奏在 45~90°/s 之间来回走（腾空 45、支撑 90）
+            let turn = match turn {
+                Some((support, speed)) => format!("{support:.2}→{speed:.0}°/s"),
+                None => "-".to_string(),
+            };
             format!(
-                "权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 抬跟 {:.0}%/{:.0}% · 踝角 {:.0}°/{:.0}° · 趾 {:.0}°/{:.0}° · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
+                "权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 抬跟 {:.0}%/{:.0}% · 踝角 {:.0}°/{:.0}° · 趾 {:.0}°/{:.0}° · 偏航 {:.0}°/{:.0}° · 转向 {} · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
                 ik.blend(),
                 contact_left,
                 contact_right,
@@ -360,6 +375,9 @@ fn update_foot_ik_status(
                 ankle_right,
                 toe_left,
                 toe_right,
+                yaw_left,
+                yaw_right,
+                turn,
                 left,
                 right,
                 ground(0),

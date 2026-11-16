@@ -20,6 +20,10 @@
 //! - 抬脚解除锁定时**不是**立刻回到动画姿态：`FootLock` 把还没还回去的修正量
 //!   按 `FootIkSettings::release_secs` 衰减到 0，脚踝是平滑追上动画，
 //!   否则支撑期攒下的几厘米修正量会在当帧消失，看起来就是「卡一下」。
+//! - 锁脚钉的是**位置**（锚点），脚掌的**朝向**另有一条偏航锁（[`FootYawLock`]）：
+//!   踩实那一刻的脚掌世界朝向记成基准，身体转了就把脚掌反向拧回去 ——
+//!   否则脚掌的旋转一直跟着动画的 hips 走，抬起一只脚原地转身时着地那只脚
+//!   会在原地「拧螺丝」。
 
 use avian3d::prelude::{SpatialQuery, SpatialQueryFilter};
 use bevy::math::{Affine3A, Dir3};
@@ -30,6 +34,7 @@ use crab_feast_library::ik::{
 };
 
 use crate::GameState;
+use crate::input::wrap_pi;
 
 use super::character::{AnimModelRoot, AnimRuntime};
 use super::driver::{AnimFocus, PoseDriver, drive_pose};
@@ -119,6 +124,14 @@ pub struct FootIkSettings {
     pub ground_probe_rise: f32,
     /// 射线最长向下多少米（参考骨架口径，按腿长换算）。太小的话站在台阶上方量不到下一层
     pub ground_probe_depth: f32,
+    /// 支撑期脚掌**世界朝向**允许被身体带偏多少度：踩实那一刻的脚掌朝向记成基准，
+    /// 身体转了之后把脚掌反向拧回去；偏到这条上限之外就不再拧（脚掌跟着身体撇）。
+    ///
+    /// 为什么要它：锁脚只钉了**位置**（锚点），脚掌的旋转一直原样跟着动画的 hips 走
+    /// —— 抬起一只脚原地转身时，着地那只脚就被身体拖着在地上原地拧。
+    /// 为什么不无限拧：踝关节本身不产生偏航，全靠髋的外旋。真人撑着脚转到 ~30° 就
+    /// 拧不动了，再转就是脚在地上撇。0 = 不锁（退回旧行为）
+    pub foot_yaw_limit: f32,
     /// 落地后「把脚掌从空中的限速值过渡到动画值」的时长（秒）。
     ///
     /// 空中限速会让脚掌滞后动画十几度，落地那一帧如果直接把 `planted` 的分支切成
@@ -154,6 +167,8 @@ impl Default for FootIkSettings {
             // 60ms（约 4 帧）：掐掉抬脚时的单帧朝向跳变，又不至于让脚掌跟不上摆动
             foot_max_rate: 360.0,
             ground_probe: true,
+            // 30°：髋外旋能撑住的量级；再大脚掌相对小腿就明显歪了
+            foot_yaw_limit: 30.0,
             // 30cm：比一条小腿短得多，不会从台阶上方误打到下面的地面
             ground_probe_rise: 0.30,
             // 1.5m：够跨过一层楼梯（约 17cm）和常见落差，又不会打到很远的房间地板
@@ -246,6 +261,8 @@ pub struct FootIk {
     /// 抬跟的淡出进度（1 = 还在支撑期，0 = 离地后已经收干净），按
     /// [`LIFT_RELEASE_SECS`] 推进。和锁脚的强度分开，脚离地时不会拖着放平
     lift_out: [f32; 2],
+    /// 两只脚的脚掌偏航锁状态（踩实期间不让脚掌被身体拧着走）
+    yaw_locks: [FootYawLock; 2],
 }
 
 impl Default for FootIk {
@@ -271,6 +288,7 @@ impl Default for FootIk {
             ankle: [0.0; 2],
             toe_bend: [0.0; 2],
             lift_out: [0.0; 2],
+            yaw_locks: [FootYawLock::default(); 2],
         }
     }
 }
@@ -298,6 +316,7 @@ impl FootIk {
         self.ankle = [0.0; 2];
         self.toe_bend = [0.0; 2];
         self.lift_out = [0.0; 2];
+        self.yaw_locks = [FootYawLock::default(); 2];
     }
 
     /// 骨架缓存是否就绪（模型还在异步加载时为 false）
@@ -354,6 +373,17 @@ impl FootIk {
     #[allow(dead_code)] // 调试面板 / 测试读数用
     pub fn toe_bend_deg(&self) -> [f32; 2] {
         self.toe_bend
+    }
+
+    /// 两只脚这一帧施加的偏航补偿（度）。正 = 把脚掌往左（+Y）拧回去。
+    ///
+    /// 面板上要跟 `foot_yaw_limit` 对着看：读数已经顶到上限，说明这只脚
+    /// 撑不住了、正跟着身体在地上撇（那是真实反应，不是 bug）
+    pub fn yaw_lock_deg(&self) -> [f32; 2] {
+        [
+            self.yaw_locks[0].applied.to_degrees(),
+            self.yaw_locks[1].applied.to_degrees(),
+        ]
     }
 
     /// 两只脚这一帧施加的锁脚强度（0..1），调试面板看「加压/放开」的过程
@@ -646,6 +676,7 @@ fn solve_foot_ik(
             ankle,
             toe_bend,
             lift_out,
+            yaw_locks,
             ..
         } = &mut *ik;
         let ground = *ground;
@@ -674,6 +705,7 @@ fn solve_foot_ik(
             *pitch = [0.0; 2];
             *ankle = [0.0; 2];
             *lift_out = [0.0; 2];
+            *yaw_locks = [FootYawLock::default(); 2];
             continue;
         }
 
@@ -740,6 +772,42 @@ fn solve_foot_ik(
             // 重心（骨盆）= 脊椎链最末一节的世界位置。抬跟时机拿它沿脚掌朝向投影，
             // 判「重心有没有压过着地脚」；用本帧自己乘出来的矩阵，不落后一帧
             let body = Some(Vec3::from(spine_world.translation));
+
+            // ---- 脚掌偏航锁：踩实期间脚掌的世界朝向不许被身体拧着转 ----
+            // 必须在 `locks[index].update` **之前**做：锚点记录、抬跟的脚向量、
+            // 「前掌不穿地」的夹紧全都按这具几何算，先拧再交出去，三者口径才一致。
+            // 踩实判定取**上一帧**的状态：偏航锁要先把几何拧好再交给 `FootLock`，
+            // 而 `FootLock` 的迟滞是在它自己的 `update` 里翻的。落地过渡那一段
+            // 仍然用本帧翻过之后的状态（见下面 `planted_now`），语义和以前一致
+            let planted_before = locks[index].is_planted();
+            let replanted_before = planted_before && air_secs[index] >= TOUCHDOWN_RESTART_SECS;
+            let yaw_anim = pose.toe.and_then(|toe| foot_yaw(pose.end, toe));
+            let yaw_deg = yaw_locks[index]
+                .update(
+                    yaw_anim,
+                    planted_before,
+                    replanted_before,
+                    settings.foot_yaw_limit,
+                    dt,
+                )
+                .to_degrees();
+            // 再乘全局淡入：和位置修正一样，IK 关掉的过程中这条锁也要跟着放，
+            // 否则位置已经交还动画、脚掌朝向还拧着 → 结束时脚突然撇一下
+            let yaw_out = yaw_deg * blend;
+            if yaw_out.abs() > 1e-3 {
+                // 绕地面法线拧（斜坡上仍贴着坡面；没有射线命中就退回世界竖直轴）。
+                // 脚掌连同前掌整块刚体转，绕的是踝：踝还钉在锚点上，转出去的是前掌
+                let up = ground[index].map_or(Vec3::Y, |hit| hit.normal);
+                let rigid = Quat::from_axis_angle(up, yaw_out.to_radians());
+                pose.foot_rot = (rigid * pose.foot_rot).normalize();
+                if let Some(toe_rot) = pose.toe_rot {
+                    pose.toe_rot = Some((rigid * toe_rot).normalize());
+                }
+                if let Some(toe) = pose.toe {
+                    pose.toe = Some(pose.end + rigid * (toe - pose.end));
+                }
+            }
+
             // 目标位置里已经带着「解除锁定后还没还完的残差」，
             // 所以抬脚是平滑追上动画，不会从锚点瞬移回去
             let (lock_target, lock_weight) = locks[index].update(
@@ -946,8 +1014,11 @@ fn solve_foot_ik(
             // 前掌该抬的一步不能省。乘上就等于落地首帧不夹、第二帧全量补上，
             // 观感就是「落下去又弹一下」
             let clamp_weight = locks[index].presence().clamp(0.0, 1.0);
-            // 落地过渡：踩实后几帧内把脚掌从空中的限速值拉到动画值
+            // 落地过渡：踩实后几帧内把脚掌从空中的限速值拉到动画值。
+            // 这一段的 `planted_now` 要用**本帧**更新后的状态（锁脚的迟滞在这一帧才翻），
+            // 用上一帧的会让抬脚/落地整体晚一帧，脚掌会多憋一帧再放
             let planted_now = locks[index].is_planted();
+            let replanted = planted_now && air_secs[index] >= TOUCHDOWN_RESTART_SECS;
             let (landing_now, air_secs_now) = advance_landing(
                 landing[index],
                 planted_now,
@@ -956,7 +1027,7 @@ fn solve_foot_ik(
                 settings.foot_landing_secs,
             );
             // 真的落下来了：把「落地这一刻」的踝角记成过渡起点
-            if planted_now && air_secs[index] >= TOUCHDOWN_RESTART_SECS {
+            if replanted {
                 landing_from[index] = foot_rots[index];
             }
             landing[index] = landing_now;
@@ -1165,6 +1236,103 @@ const ANKLE_FLOOR_RATE: f32 = 240.0;
 /// —— 观感正是「被身体带着走」。0.10s 只盖住三四帧，蹬完那一下还留在脚上，
 /// 然后立刻交回动画去做摆动期的背屈
 const LIFT_RELEASE_SECS: f32 = 0.10;
+
+/// 脚离地后，压着的偏航补偿按这个时间常数（秒）指数放掉。
+///
+/// 用指数而不是匀速：偏航补偿是「脚掌朝向」这把锁，离地后动画马上要做摆动期的
+/// 外旋/内旋，匀速还债在结尾会留一个折角；指数衰减前段快、后段几乎贴住 0，
+/// 且跨帧连续 —— 抬脚那一帧不会看到脚掌「弹」一下。
+const YAW_RELEASE_SECS: f32 = 0.10;
+
+/// 单只脚的偏航锁：踩实期间让脚掌的**世界朝向**不跟着身体的偏航转。
+///
+/// 锁脚（[`FootLock`]）只管位置，脚掌旋转一直原样跟着动画的 hips 走 ——
+/// 抬起一只脚原地转身时，着地那只脚就在地上原地拧。这里把「踩实那一刻的脚掌
+/// 世界朝向」记成基准，每帧反向补偿；补偿量夹在 `foot_yaw_limit` 内，
+/// 超出之后脚掌跟着身体撇（真人靠髋外旋也就能撑住这个量级）。
+#[derive(Clone, Copy, Default, Debug)]
+struct FootYawLock {
+    /// 踩实时锁定的脚掌世界朝向（弧度，见 [`foot_yaw`]）；`None` = 没有基准
+    reference: Option<f32>,
+    /// 本帧施加的补偿角（弧度，绕地面法线；正 = 让脚掌逆时针回去）
+    applied: f32,
+    /// 上一帧量到的脚掌朝向：用来认出「脚掌被动画掰到失控、方位角翻过去」的读数
+    last_yaw: Option<f32>,
+}
+
+/// 一帧之内脚掌朝向跳多少度就算「量错了」。真转身 90°/s 只有 1.5°/帧，
+/// 脚掌接近竖直时踝→前掌的水平分量会翻到脚踝后面，读数直接错 180°
+const YAW_JUMP_MAX: f32 = 0.5;
+
+impl FootYawLock {
+    /// 推进一帧，返回本帧要施加的补偿角（弧度）。
+    ///
+    /// `yaw_now`：动画给的（未补偿的）脚掌朝向；`planted`：是否在支撑期；
+    /// `replanted`：本帧是不是一次**新的**踩实（离地够久、锚点重建的那一帧）。
+    fn update(
+        &mut self,
+        yaw_now: Option<f32>,
+        planted: bool,
+        replanted: bool,
+        limit_deg: f32,
+        dt: f32,
+    ) -> f32 {
+        let limit = limit_deg.max(0.0).to_radians();
+        if !planted {
+            // 离地：基准作废（下一段支撑重新记），压着的补偿指数放掉
+            self.reference = None;
+            self.last_yaw = None;
+            self.applied *= (-dt.max(0.0) / YAW_RELEASE_SECS).exp();
+            if self.applied.abs() < 1e-4 {
+                self.applied = 0.0;
+            }
+            return self.applied;
+        }
+
+        // 量不到朝向（骨架没有前掌骨 / 脚掌快竖直）：**保持现状**。
+        // 不能归零 —— 那等于一帧把脚掌拧回去，比不锁还难看
+        let Some(yaw_now) = yaw_now.filter(|yaw| yaw.is_finite()) else {
+            return self.applied;
+        };
+
+        if replanted || self.reference.is_none() {
+            // 新的一段支撑：把「此刻脚掌实际所在的朝向」记成基准。
+            // 不能直接记 `yaw_now`：上一段支撑的补偿在离地后还没放完（按
+            // `YAW_RELEASE_SECS` 衰减），一帧抹掉的话落地那一下脚掌会跳
+            self.reference = Some(wrap_pi(yaw_now + self.applied));
+        } else if let Some(last) = self.last_yaw
+            && wrap_pi(yaw_now - last).abs() > YAW_JUMP_MAX
+        {
+            // 一帧跳了几十度：只可能是方位角翻过去了（脚掌被动画掰到竖直以上），
+            // 这个读数作废，保持上一帧的补偿
+            return self.applied;
+        }
+        self.last_yaw = Some(yaw_now);
+
+        let want = self
+            .reference
+            .map_or(0.0, |reference| wrap_pi(reference - yaw_now));
+        self.applied = if limit > 0.0 {
+            want.clamp(-limit, limit)
+        } else {
+            0.0
+        };
+        self.applied
+    }
+}
+
+/// 脚掌在世界水平面内的朝向（弧度，与 `input::yaw_of` 同口径：`atan2(x, z)`）。
+///
+/// 只取 `踝 → 前掌` 这根骨头的水平分量：抬跟时它会被俯下去，但水平方位角不变，
+/// 所以整个支撑期都量得到，不需要另外定义「脚掌正前方」这个轴。
+///
+/// 脚掌越接近竖直，水平分量越小、方位角越不可信（抬跟到 76° 时只剩 1/4），
+/// 超过 60° 就直接判为量不到 —— 再往后这根向量会翻到踝后面，读数错 180°
+fn foot_yaw(ankle: Vec3, toe: Vec3) -> Option<f32> {
+    let full = toe - ankle;
+    let flat = Vec3::new(full.x, 0.0, full.z);
+    (flat.length_squared() >= 0.25 * full.length_squared()).then(|| flat.x.atan2(flat.z))
+}
 
 /// 折算出来的「脚掌相对地面的俯角」上限（度）。
 ///
@@ -2227,6 +2395,30 @@ mod tests {
         assert!(
             drift < 0.005,
             "脚踝偏离锚点 {drift:.4}m（身体转 18° 本会把脚横向带走 {hip_drift:.4}m）"
+        );
+
+        // 位置锁住了还不够：脚掌的**朝向**也得钉住，否则身体一转脚掌就在地上「拧螺丝」。
+        // 第 0 帧身体已经转了 0.9°，之后 20 帧转到 18° —— 没有偏航锁的话脚掌会跟着转 17° 多
+        let toe_entity = left.toe.expect("左脚应当有前掌骨");
+        let mut matrix = Affine3A::IDENTITY;
+        for entity in [
+            root,
+            model,
+            armature,
+            hips,
+            left_bones.0,
+            left_bones.1,
+            left_bones.2,
+            toe_entity,
+        ] {
+            let local = world.get::<Transform>(entity).expect("骨骼");
+            matrix *= local.compute_affine();
+        }
+        let toe = Vec3::from(matrix.translation);
+        let yaw_deg = foot_yaw(ankle, toe).expect("脚掌平放，量得到").to_degrees();
+        assert!(
+            (yaw_deg - 0.9).abs() < 1.0,
+            "着地脚的朝向跟着身体转了：{yaw_deg:.1}°（身体已转到 18°，没锁时约 17.1°）"
         );
 
         // 骨长不能被 IK 拉长：两段都应保持 0.35m
@@ -4108,5 +4300,172 @@ mod tests {
                 },
             )
             .expect("骨架发现跑不起来");
+    }
+
+    // ---- 偏航锁：踩实期间脚掌的世界朝向必须钉住 ----
+
+    /// 脚掌朝向与 `Quat::from_rotation_y` 同口径：绕 +Y 转 θ，读数就加 θ
+    #[test]
+    fn foot_yaw_matches_the_rotation_convention() {
+        let ankle = Vec3::ZERO;
+        assert!((foot_yaw(ankle, Vec3::new(0.0, 0.0, 1.0)).unwrap()).abs() < 1e-5);
+        for deg in [-120.0_f32, -45.0, 30.0, 90.0, 170.0] {
+            let rot = Quat::from_rotation_y(deg.to_radians());
+            let toe = rot * Vec3::new(0.0, -0.1, 1.0);
+            let yaw = foot_yaw(ankle, toe).unwrap();
+            assert!(
+                (wrap_pi(yaw - deg.to_radians()).abs()) < 1e-4,
+                "deg={deg} yaw={}",
+                yaw.to_degrees()
+            );
+        }
+        // 几乎竖直的脚掌量不到朝向（水平分量不足一半，方位角会被俯仰搅乱）
+        assert!(foot_yaw(ankle, Vec3::new(0.0, 1.0, 0.0)).is_none());
+        assert!(foot_yaw(ankle, Vec3::new(0.0, 0.9, 0.2)).is_none());
+    }
+
+    /// 踩实不动脚、身体按 90°/s 转：脚掌的世界朝向必须原地不动，
+    /// 补偿量线性长起来，超过 `foot_yaw_limit` 之后才跟着身体撇
+    #[test]
+    fn planted_foot_keeps_its_world_yaw() {
+        let dt = 1.0 / 60.0;
+        let limit = 30.0_f32;
+        let mut lock = FootYawLock::default();
+        let mut body = 0.0_f32;
+
+        for frame in 0..90 {
+            // 身体转了之后，动画给的脚掌朝向就跟着 body 的偏航走 —— 这正是 bug 的来源
+            let applied = lock.update(Some(body), true, frame == 0, limit, dt);
+            let world_deg = wrap_pi(body + applied).to_degrees();
+            let body_deg = body.to_degrees();
+            // 撑得住：世界朝向钉死在 0；撑不住：跟着身体撇，但落后正好一个上限
+            let want_world = if body_deg <= limit {
+                0.0
+            } else {
+                body_deg - limit
+            };
+            assert!(
+                (world_deg - want_world).abs() < 1e-3,
+                "body={body_deg:.1}° world={world_deg:.2}° applied={:.2}°",
+                applied.to_degrees()
+            );
+            assert!(
+                applied.to_degrees() >= -limit - 1e-3,
+                "补偿超了上限：{:.2}°",
+                applied.to_degrees()
+            );
+            body += 1.5_f32.to_radians();
+        }
+        assert!(
+            (lock.applied.to_degrees() + limit).abs() < 1e-3,
+            "转了 135° 之后应当压在 -{limit}° 上限上，实际 {:.2}°",
+            lock.applied.to_degrees()
+        );
+    }
+
+    /// 抬脚之后补偿按指数放掉：单调、连续，一个摆动期内基本归零
+    #[test]
+    fn yaw_lock_releases_after_lift() {
+        let dt = 1.0 / 60.0;
+        let mut lock = FootYawLock::default();
+        // 踩实时脚掌朝 0，随后身体慢慢把它带到 0.5 rad（1.7°/帧，和 90°/s 的实速同量级），
+        // 补偿应当恰好是 -0.5；一步跳 34° 会被 `YAW_JUMP_MAX` 当成量错
+        lock.update(Some(0.0), true, true, 30.0, dt);
+        let drift = 0.5_f32;
+        let mut yaw = 0.0f32;
+        while yaw < drift {
+            yaw = (yaw + 0.03).min(drift);
+            lock.update(Some(yaw), true, false, 30.0, dt);
+        }
+        let held = lock.applied;
+        assert!((held + drift).abs() < 1e-4, "基准没锁上：{held}");
+
+        let mut previous = held;
+        for _ in 0..30 {
+            let now = lock.update(Some(drift), false, false, 30.0, dt);
+            assert!(now.abs() <= previous.abs() + 1e-6, "放掉的过程不能变大");
+            assert!(previous.abs() - now.abs() < 0.15, "单帧不能跳");
+            previous = now;
+        }
+        // 0.5s 后应当基本归零（时间常数 0.1s）
+        assert!(previous.to_degrees().abs() < 0.5, "没放干净：{previous:?}");
+        assert!(lock.reference.is_none(), "离地后基准应当作废");
+    }
+
+    /// 还没放完就重新踩实：补偿必须接得上，不能一帧跳回去
+    #[test]
+    fn replanting_keeps_the_compensation_continuous() {
+        let dt = 1.0 / 60.0;
+        let mut lock = FootYawLock::default();
+        // 踩实时脚掌朝 0，随后动画逐帧把它带到 0.6 rad（34°），补偿顶到 -30°
+        lock.update(Some(0.0), true, true, 30.0, dt);
+        let yaw = 0.6_f32;
+        let mut now = 0.0f32;
+        while now < yaw {
+            now = (now + 0.03).min(yaw);
+            lock.update(Some(now), true, false, 30.0, dt);
+        }
+        assert!((lock.applied.to_degrees().abs() - 30.0).abs() < 1e-3);
+        // 空中 2 帧：只放掉一点点
+        for _ in 0..2 {
+            lock.update(Some(yaw), false, false, 30.0, dt);
+        }
+        let before = lock.applied;
+        assert!(before.to_degrees().abs() > 20.0, "2 帧不该放光");
+
+        // 重新踩实：基准按「当前实际所在」记，补偿不变
+        let after = lock.update(Some(yaw), true, true, 30.0, dt);
+        assert!(
+            (after - before).abs() < 1e-4,
+            "重新踩实跳了：{:.3}° → {:.3}°",
+            before.to_degrees(),
+            after.to_degrees()
+        );
+    }
+
+    /// 脚掌被动画掰到竖直以上时方位角会翻过去：读数作废，补偿冻结在原地
+    #[test]
+    fn flipped_foot_yaw_freezes_the_lock() {
+        let dt = 1.0 / 60.0;
+        let mut lock = FootYawLock::default();
+        // 先锁住，再让动画把脚掌带到 20°，补偿攒到 -20°
+        lock.update(Some(0.0), true, true, 30.0, dt);
+        let drift = 0.35_f32;
+        for _ in 0..10 {
+            lock.update(Some(drift), true, false, 30.0, dt);
+        }
+        let held = lock.applied;
+        assert!((held + drift).abs() < 1e-3, "基准没锁上：{held}");
+
+        // 量不到（脚掌竖起来了）：冻结，不许清零
+        let now = lock.update(None, true, false, 30.0, dt);
+        assert!(
+            (now - held).abs() < 1e-6,
+            "量不到时应当冻结，实际 {:.2}° → {:.2}°",
+            held.to_degrees(),
+            now.to_degrees()
+        );
+
+        // 读数突然翻 180°：同样算量错，不能采纳
+        let flipped = wrap_pi(drift + std::f32::consts::PI);
+        let now = lock.update(Some(flipped), true, false, 30.0, dt);
+        assert!(
+            (now - held).abs() < 1e-6,
+            "翻过去的读数被采纳了：{:.2}°",
+            now.to_degrees()
+        );
+    }
+
+    /// `foot_yaw_limit = 0` 关掉这条锁，行为退回「脚掌跟着身体转」
+    #[test]
+    fn zero_limit_disables_the_yaw_lock() {
+        let dt = 1.0 / 60.0;
+        let mut lock = FootYawLock::default();
+        lock.update(Some(0.0), true, true, 0.0, dt);
+        for _ in 0..20 {
+            let applied = lock.update(Some(0.4), true, false, 0.0, dt);
+            assert_eq!(applied, 0.0);
+        }
+        assert_eq!(lock.applied, 0.0);
     }
 }

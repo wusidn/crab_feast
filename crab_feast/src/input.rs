@@ -2,6 +2,7 @@ use avian3d::prelude::LinearVelocity;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::anim::PoseDriver;
 use crate::camera::CameraFacing;
 
 /// 控制链的执行顺序。
@@ -56,9 +57,11 @@ pub struct MovementController {
 ///   180° 反向的第一帧角速度就从 0 跳到上限，看着像原地瞬移朝向；
 /// - 比例收尾（[`FOLLOW_RESPONSE`]）决定最后几十度收得多干脆。
 ///
-/// 现在这组（180°/s、700°/s²）就是「倒退着走、身体慢慢转过来」的节奏：180° 反向
-/// 落地约 1 秒，转身过程中一直是边走边转，不是急停急转。往上加就是更快更"机械"，
-/// 往下减就是更慢更沉。历史值：110°/s/无加速度 → 1.75 秒（拖沓），
+/// 现在这组（90°/s、350°/s²）是「身体有重量、但不会拖到失控」的节奏：
+/// 180° 反向约 2.2 秒，90° 约 1.2 秒，全程边走边转。角加速度按 180/700 的原始比例跟着走，
+/// 起步段恒定 0.26 秒走 11.6°，不管顶速调快调慢，起步形状都不变。
+/// 往上加就是更快更"机械"，往下减就是更慢更沉。历史值：180°/s、700°/s² → 1.26 秒；
+/// 30°/s、120°/s² → 6.1 秒（太沉，已否决）；110°/s/无加速度 → 1.75 秒（拖沓）；
 /// 450°/s/3000°/s² → 0.63 秒（节奏对但观感偏假，已被否决）。
 #[derive(Component)]
 pub struct FacingController {
@@ -73,15 +76,31 @@ pub struct FacingController {
 impl Default for FacingController {
     fn default() -> Self {
         Self {
-            turn_speed: 180.0,
-            turn_accel: 700.0,
+            turn_speed: 90.0,
+            turn_accel: 350.0,
             tolerance: 2.0,
         }
     }
 }
 
+impl FacingController {
+    /// 按「脚在地上」权重缩放后的顶速：腾空期打 [`AIR_TURN`] 折。
+    ///
+    /// `support` = 0 表示双脚腾空（跑步 57% 的时间），1 表示至少一只脚踩实。
+    pub fn turn_speed_at(&self, support: f32) -> f32 {
+        let support = support.clamp(0.0, 1.0);
+        self.turn_speed * (AIR_TURN + (1.0 - AIR_TURN) * support)
+    }
+
+    /// 按「脚在地上」权重缩放后的角加速度：腾空期几乎不许再加速（空中没有地面反力）
+    pub fn turn_accel_at(&self, support: f32) -> f32 {
+        let support = support.clamp(0.0, 1.0);
+        self.turn_accel * (AIR_ACCEL + (1.0 - AIR_ACCEL) * support)
+    }
+}
+
 /// 角色本帧的朝向状态，由 [`facing_system`] 写、动画系统读。
-#[derive(Component, Default, Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 pub struct FacingState {
     /// 当前朝向（世界空间弧度，见 [`yaw_of`]）
     pub yaw: f32,
@@ -89,6 +108,21 @@ pub struct FacingState {
     pub yaw_rate: f32,
     /// 目标与当前的带符号夹角（度）。正 = 需要绕 +Y 转，即向左转
     pub error_deg: f32,
+    /// 低通过的「脚在地上」权重（0 = 双脚腾空，1 = 至少一只脚踩实）。
+    /// 转向的顶速和角加速度按它缩放：腾空期没有地面反力，不该越转越快
+    pub support: f32,
+}
+
+impl Default for FacingState {
+    fn default() -> Self {
+        Self {
+            yaw: 0.0,
+            yaw_rate: 0.0,
+            error_deg: 0.0,
+            // 一上来按踩实算：别让刚生成的角色头 80ms 转不动
+            support: 1.0,
+        }
+    }
 }
 
 /// 键盘的走路 / 跑步档位。
@@ -180,7 +214,7 @@ impl MovementSettings {
 impl Default for MovementSettings {
     fn default() -> Self {
         Self {
-            smoothing_enabled: true,
+            smoothing_enabled: false,
             smoothing_factor: 0.5,
         }
     }
@@ -352,6 +386,11 @@ fn movement_system(
 /// 目标方向已经在 [`movement_system`] 里被「输入平滑」低通过了，这里只管限速追，
 /// 不再二次滤波——否则系数小的时候两层滞后叠在一起，转身会慢得反常。
 /// 误差同时写进 [`FacingState`]，动画系统拿它选转向姿态。
+///
+/// 顶速和角加速度还要乘一个「脚在地上」权重：跑步 57% 的时间是双脚腾空
+/// （Running 剪辑 0.70s 周期里支撑只有 0.153s + 0.146s），腾空期没有任何地面反力，
+/// 身体却照样按 90°/s 转，看起来就是「人在空中被拧了一下」。真实跑步的转身力矩
+/// 全来自支撑期，所以这里把转速压到 [`AIR_TURN`] 的份上，落地那个支撑段再补回来。
 fn facing_system(
     mut avatars: Query<(
         &mut Transform,
@@ -360,6 +399,7 @@ fn facing_system(
         &mut FacingState,
     )>,
     time: Res<Time>,
+    driver: Option<Res<PoseDriver>>,
 ) {
     for (mut transform, controller, intent, mut state) in avatars.iter_mut() {
         // 朝向由 Avatar 根节点控制
@@ -373,15 +413,28 @@ fn facing_system(
 
         let error = wrap_pi(target - current);
         let error_deg = error.to_degrees();
-        // 比例控制：误差大时跑满 turn_speed，接近目标自动收速，不会在终点上来回抖
+
+        // 「脚在地上」权重：读的是**上一帧**的值——`drive_pose` 在 `PostUpdate` 跑，
+        // 我们在 `Update`，混合输出的 contacts 只能晚一帧拿到。跑步的腾空段有
+        // 0.19~0.21s，16ms 的滞后不影响门控落在哪一段；这里也不能挪到 `PostUpdate`，
+        // 因为 `solve_foot_ik` 是直接拿 Transform 自己乘世界矩阵的，必须看到本帧的
+        // root 旋转，而 root 旋转就是这里写进去的
+        let support_now = foot_support(driver.as_deref(), intent);
+        let dt = time.delta_secs();
+        state.support += (support_now - state.support) * support_smoothing(dt);
+        let support = state.support;
+        // 腾空期：顶速打 [`AIR_TURN`] 折，角加速度几乎清零（空中没有力矩能加速）
+        let speed_eff = controller.turn_speed_at(support);
+        let accel_eff = controller.turn_accel_at(support);
+
+        // 比例控制：误差大时跑满顶速，接近目标自动收速，不会在终点上来回抖
         let desired = if error_deg.abs() <= controller.tolerance {
             0.0
         } else {
-            error.signum() * (error_deg.abs() * FOLLOW_RESPONSE).min(controller.turn_speed)
+            error.signum() * (error_deg.abs() * FOLLOW_RESPONSE).min(speed_eff)
         };
         // 角加速度限速：转速是「逼近」而不是「赋值」，起步和收尾才有形状
-        let dt = time.delta_secs();
-        let rate = approach(state.yaw_rate, desired, controller.turn_accel * dt);
+        let rate = approach(state.yaw_rate, desired, accel_eff * dt).clamp(-speed_eff, speed_eff);
         state.yaw_rate = rate;
 
         // 单帧转角不许超过剩余误差，避免高转速下冲过头再往回摆
@@ -402,6 +455,51 @@ fn facing_system(
 /// 这个值只影响**收尾**：前半段的快慢由 [`FacingController::turn_speed`] 决定，
 /// 觉得“转得拖沓”但增大会显得假时，先调它，别去抬最大角速度。
 const FOLLOW_RESPONSE: f32 = 10.0;
+
+/// 腾空期还保留多少转向：0 = 空中完全不转，1 = 完全按顶速转（等于关掉门控）。
+///
+/// 跑步一个 0.70s 周期里腾空占 0.40s（Running 剪辑实测 0.211s + 0.190s）。取 0.5：
+/// 腾空 45°/s、每段腾空转 9.5°；落地支撑段 0.15s 转 13.5°，一步 23°（原来是 36°）。
+/// 平均转速 `(0.57 × 0.5 + 0.43) × 90 ≈ 64°/s`，180° 反向约 2.8s（原来 2.2s）。
+const AIR_TURN: f32 = 0.5;
+
+/// 腾空期的角加速度保留比例（350°/s² × 0.1 = 35°/s²）。
+/// 空中没有地面反力，只有角动量守恒：转速可以保持，但不该再加速
+const AIR_ACCEL: f32 = 0.1;
+
+/// 支撑权重低通的时间常数（秒）。跑步的支撑段只有 0.15s、腾空段 0.19~0.21s，
+/// 硬切会让转速每一步抖一个折角；0.08s 能削掉折角又不把腾空段抹平
+const SUPPORT_SMOOTH_SECS: f32 = 0.08;
+
+/// 本帧「至少一只脚踩实」的权重（0 = 双脚腾空，1 = 踩实）。
+///
+/// 取 [`PoseDriver::contacts`] 的较大者：它由剪辑的步态事件插值出来，
+/// 走/跑/跳天然不同（Walking 支撑占 93%、Running 43%、Jump 20%），混合时按剪辑权重
+/// 加权，所以走跑过渡也不用单独处理。
+///
+/// 三种情况一律按踩实算，否则转身会被门控卡死：
+/// - 没挂混合空间（预览、没加载模型、单测这条系统）时 `contacts` 是 0；
+/// - Idle / LeftTurn / RightTurn 这些剪辑只有触地事件、没有离地事件，
+///   `support_window` 需要成对事件才给值，于是恒为 0；
+/// - 刚起步（地速 < 0.5 m/s）还谈不上步态，加速段不该被压住。
+fn foot_support(driver: Option<&PoseDriver>, intent: &LocomotionIntent) -> f32 {
+    let Some(driver) = driver else {
+        return 1.0;
+    };
+    if intent.magnitude < 0.2 || driver.ground_speed < 0.5 {
+        return 1.0;
+    }
+    let [left, right] = driver.contacts;
+    left.max(right).clamp(0.0, 1.0)
+}
+
+/// 一帧的指数低通系数（时间常数 [`SUPPORT_SMOOTH_SECS`]）
+fn support_smoothing(dt: f32) -> f32 {
+    if SUPPORT_SMOOTH_SECS <= f32::MIN_POSITIVE {
+        return 1.0;
+    }
+    (1.0 - (-dt.max(0.0) / SUPPORT_SMOOTH_SECS).exp()).clamp(0.0, 1.0)
+}
 
 /// 带限速的趋近：每帧最多走 `max_delta`，到不了就停在目标上。
 fn approach(current: f32, target: f32, max_delta: f32) -> f32 {
@@ -763,11 +861,16 @@ mod tests {
     fn turn_never_exceeds_cap_and_settles() {
         let mut app = facing_app(180.0);
         let controller = FacingController::default();
+        let dt = 1.0 / 60.0;
         let mut max_rate: f32 = 0.0;
         let mut elapsed = 0.0;
-        for _ in 0..180 {
-            step(&mut app, 1.0 / 60.0);
-            elapsed += 1.0 / 60.0;
+        // 帧数按「180° 走满顶速」的时长给 1.6 倍余量：顶速越低，这圈转得越久，
+        // 写死 180 帧只够 180°/s 那档，30°/s 会永远转不到位
+        let ideal = 180.0 / controller.turn_speed;
+        let frames = ((ideal * 1.6) / dt).ceil() as usize;
+        for _ in 0..frames {
+            step(&mut app, dt);
+            elapsed += dt;
             let state = facing_state(&mut app);
             max_rate = max_rate.max(state.yaw_rate.abs());
             if state.error_deg.abs() <= controller.tolerance {
@@ -784,11 +887,12 @@ mod tests {
             "转不到位：剩余 {}°",
             state.error_deg
         );
-        // 180°：180°/s + 700°/s² 大概 1.1s（起步 0.26s 加速、中段匀速、末段比例收尾）。
-        // 给个宽区间，防止以后调参把「起步加速」悄悄退化成瞬转
+        // 起步加速与末段比例收尾都会比「匀速走完 180°」多一点，所以比值落在 1.0 以上；
+        // 用相对值而不是写死秒数，以后调 turn_speed 不会把这个测试变成噪音
+        let ratio = elapsed / ideal;
         assert!(
-            (0.9..=1.4).contains(&elapsed),
-            "180° 用时 {elapsed}s 不在预期区间"
+            (0.85..=1.35).contains(&ratio),
+            "180° 用时 {elapsed}s（{ratio:.2} 倍理想时长）不在预期区间"
         );
     }
 
@@ -804,5 +908,128 @@ mod tests {
         assert!((gait.speed() - 0.5).abs() < 1e-6);
         gait.toggle();
         assert!(gait.running);
+    }
+
+    // ---- 系统层面：脚在不在空中决定转向顶速 ----
+
+    /// 把角色的 `FacingState` 摆到某个起点（测试里不想等加速段）
+    fn set_facing_state(app: &mut App, f: impl FnOnce(&mut FacingState)) {
+        let world = app.world_mut();
+        let mut query = world.query::<&mut FacingState>();
+        let mut state = query.iter_mut(world).next().expect("角色实体");
+        f(&mut state);
+    }
+
+    /// 双脚腾空（跑步 57% 的时间）：转速必须压在 `AIR_TURN` 那一折上
+    #[test]
+    fn airborne_caps_the_turn_rate() {
+        let mut app = facing_app(180.0);
+        // 跑动中、两只脚都在空中
+        app.insert_resource(PoseDriver {
+            contacts: [0.0, 0.0],
+            ground_speed: 3.0,
+            ..PoseDriver::default()
+        });
+        // 省掉 0.4s 的低通过渡：直接摆成「已到顶速、support 已经放空」
+        // （180° 的误差取最短弧是 -180°，所以顶速是负向的）
+        set_facing_state(&mut app, |state| {
+            state.yaw_rate = -90.0;
+            state.support = 0.0;
+        });
+        step(&mut app, 1.0 / 60.0);
+        let want = FacingController::default().turn_speed * AIR_TURN;
+        let rate = facing_state(&mut app).yaw_rate.abs();
+        assert!(
+            (rate - want).abs() < 2.0,
+            "腾空期角速度 {rate:.1}°/s，期望压在 {want:.1}°/s"
+        );
+    }
+
+    /// 抬脚那一帧不能把转速直接砍掉：支撑权重低通后是渐变，否则每一步都顿一下
+    #[test]
+    fn losing_ground_fades_the_rate_instead_of_snapping() {
+        let mut app = facing_app(180.0);
+        app.insert_resource(PoseDriver {
+            contacts: [1.0, 1.0],
+            ground_speed: 3.0,
+            ..PoseDriver::default()
+        });
+        for _ in 0..40 {
+            step(&mut app, 1.0 / 60.0);
+        }
+        let cruise = facing_state(&mut app).yaw_rate.abs();
+        assert!(cruise > 85.0, "地上没跑到顶速：{cruise:.1}");
+
+        // 两只脚离地
+        app.world_mut().resource_mut::<PoseDriver>().contacts = [0.0, 0.0];
+        let mut previous = cruise;
+        let mut worst = 0.0_f32;
+        for _ in 0..12 {
+            step(&mut app, 1.0 / 60.0);
+            let now = facing_state(&mut app).yaw_rate.abs();
+            worst = worst.max((previous - now).abs());
+            previous = now;
+        }
+        assert!(
+            worst < 20.0,
+            "抬脚那一帧转速掉了 {worst:.1}°/s，会看到顿一下"
+        );
+        let want = FacingController::default().turn_speed * AIR_TURN;
+        assert!(
+            (35.0..=55.0).contains(&previous),
+            "腾空 0.2s 后应贴近 {want:.1}°/s，实际 {previous:.1}°/s"
+        );
+
+        // 落地后要能把欠的转速补回来
+        app.world_mut().resource_mut::<PoseDriver>().contacts = [1.0, 1.0];
+        for _ in 0..30 {
+            step(&mut app, 1.0 / 60.0);
+        }
+        assert!(
+            facing_state(&mut app).yaw_rate.abs() > 85.0,
+            "落地 0.5s 还没回到顶速"
+        );
+    }
+
+    /// Idle / LeftTurn 这些剪辑只有触地事件、没有离地事件，`support_window` 恒为 0；
+    /// 站着原地转身不能被当成「全程腾空」，刚起步的低地速同理
+    #[test]
+    fn gait_without_lift_events_counts_as_grounded() {
+        let mut app = facing_app(180.0);
+        app.insert_resource(PoseDriver {
+            contacts: [0.0, 0.0],
+            ground_speed: 0.0,
+            ..PoseDriver::default()
+        });
+        step(&mut app, 1.0 / 60.0);
+        assert!(
+            facing_state(&mut app).support > 0.99,
+            "地速为 0 时应按踩实算：{}",
+            facing_state(&mut app).support
+        );
+        assert_eq!(foot_support(Some(&empty_driver(3.0)), &idle_intent()), 1.0);
+        assert_eq!(foot_support(Some(&empty_driver(0.0)), &moving_intent()), 1.0);
+        // 真有步态时取两只脚里更强的那只
+        let mut driver = empty_driver(3.0);
+        driver.contacts = [0.2, 0.7];
+        assert!((foot_support(Some(&driver), &moving_intent()) - 0.7).abs() < 1e-6);
+    }
+
+    fn empty_driver(ground_speed: f32) -> PoseDriver {
+        PoseDriver {
+            ground_speed,
+            ..PoseDriver::default()
+        }
+    }
+
+    fn moving_intent() -> LocomotionIntent {
+        LocomotionIntent {
+            direction: FORWARD_LOCAL,
+            magnitude: 1.0,
+        }
+    }
+
+    fn idle_intent() -> LocomotionIntent {
+        LocomotionIntent::default()
     }
 }

@@ -295,8 +295,11 @@ mod tests {
 
         let loaded = read_movement_settings(&path).unwrap().unwrap();
         assert_eq!(loaded.smoothing_factor, 0.8);
-        // 缺的字段走默认值
-        assert!(loaded.smoothing_enabled);
+        // 缺的字段走默认值（默认开关会随游戏调参变，所以对着 Default 断言）
+        assert_eq!(
+            loaded.smoothing_enabled,
+            MovementSettings::default().smoothing_enabled
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -310,14 +313,15 @@ mod tests {
         let mut app = settings_app(&path);
         app.update();
 
-        // 模拟点一下开关
+        // 模拟点一下开关：拨到与默认相反的那一侧，否则「切了但值没变」什么都不会落盘
+        let toggled = !MovementSettings::default().smoothing_enabled;
         app.world_mut()
             .resource_mut::<MovementSettings>()
-            .smoothing_enabled = false;
+            .smoothing_enabled = toggled;
         app.update();
 
         let saved = read_movement_settings(&path).unwrap().unwrap();
-        assert!(!saved.smoothing_enabled, "开关改动必须立刻落盘");
+        assert_eq!(saved.smoothing_enabled, toggled, "开关改动必须立刻落盘");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
