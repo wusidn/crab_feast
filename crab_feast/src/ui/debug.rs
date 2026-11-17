@@ -1,12 +1,11 @@
-//! 菜单里的「调试」页面：物理可视化、脚部 IK 等开发期工具。
+//! 菜单里的「调试」页面：物理可视化等开发期工具。
 //!
-//! 当前两个控件：物理调试开关（Avian 的 debug gizmos）与脚部 IK 开关。
-//! 物理调试默认关闭；脚部 IK 默认开启，关掉后可以直接对比转身时脚有没有滑。
+//! 当前控件：物理调试开关（Avian 的 debug gizmos），默认关闭。
+//! 脚部 IK 开关已移到「移动设置」页。
 //!
 //! ```text
 //! root
-//! ├─ 开关卡片    物理调试                        [关闭]
-//! └─ 开关卡片    脚部 IK                         [开启]
+//! └─ 开关卡片    物理调试                        [关闭]
 //! ```
 
 use avian3d::prelude::*;
@@ -14,8 +13,6 @@ use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 
 use crate::GameState;
-use crate::anim::{FootIk, FootIkSettings};
-use crate::input::{FacingController, FacingState};
 use crate::ui::menu::{MenuConfig, MenuPageBody, MenuPageDef, MenuSet, widgets};
 
 /// 菜单页面 id
@@ -24,14 +21,6 @@ pub const DEBUG_PAGE: &str = "debug";
 /// 物理调试开关按钮
 #[derive(Component, Clone, Default)]
 pub struct PhysicsDebugToggle;
-
-/// 脚部 IK 开关按钮
-#[derive(Component, Clone, Default)]
-pub struct FootIkToggle;
-
-/// 脚部 IK 实时读数（权重 / 修正量）
-#[derive(Component, Clone, Default)]
-pub struct FootIkStatus;
 
 /// 调试用的时间速度（慢放看单帧）。只改 `Time<Virtual>` 的 relative speed，
 /// 动画、物理、脚部 IK 的 dt 一起缩，看到的就是同一段动作放慢
@@ -81,13 +70,7 @@ impl Plugin for DebugSettingsPlugin {
             )
             .add_systems(
                 Update,
-                (
-                    sync_physics_debug,
-                    update_physics_debug_label,
-                    update_foot_ik_label,
-                    update_foot_ik_status,
-                )
-                    .run_if(in_state(GameState::Game)),
+                (sync_physics_debug, update_physics_debug_label).run_if(in_state(GameState::Game)),
             );
     }
 }
@@ -134,7 +117,6 @@ fn register_menu_page(mut config: ResMut<MenuConfig>) {
 fn fill_menu_page(
     mut commands: Commands,
     settings: Res<PhysicsDebugSettings>,
-    foot_ik: Res<FootIkSettings>,
     bodies: Query<(Entity, &MenuPageBody)>,
 ) {
     let Some((body, _)) = bodies
@@ -145,17 +127,12 @@ fn fill_menu_page(
         return;
     };
 
-    commands.spawn_scene(page_scene(body, &settings, &foot_ik));
+    commands.spawn_scene(page_scene(body, &settings));
 }
 
-/// 整页结构：根 → 物理调试卡片 + 脚部 IK 卡片
-fn page_scene(
-    body: Entity,
-    settings: &PhysicsDebugSettings,
-    foot_ik: &FootIkSettings,
-) -> impl Scene + use<> {
+/// 整页结构：根 → 物理调试卡片
+fn page_scene(body: Entity, settings: &PhysicsDebugSettings) -> impl Scene + use<> {
     let debug_enabled = settings.enabled;
-    let foot_ik_enabled = foot_ik.enabled;
     bsn! {
         Node {
             width: Val::Percent(100.0),
@@ -165,8 +142,6 @@ fn page_scene(
         ChildOf(body)
         Children [
             @{toggle_card(debug_enabled)}
-            --
-            @{foot_ik_card(foot_ik_enabled)}
         ]
     }
 }
@@ -225,181 +200,10 @@ fn sync_physics_debug(settings: Res<PhysicsDebugSettings>, mut store: ResMut<Giz
     }
 }
 
-/// 脚部 IK 卡片：点一下切换全局开关。运行时只是改资源里的布尔值，
-/// 淡出由 `FootIkSettings::blend_secs` 负责，所以可以反复快速切换。
-/// 下面一行是实时读数：混合权重 + 两只脚这一帧被拉动的距离，用来判断锁脚有没有在干活。
-fn foot_ik_card(enabled: bool) -> impl Scene + use<> {
-    let toggle_color = if enabled { TOGGLE_ON } else { TOGGLE_IDLE };
-    let toggle_text = if enabled { "开启" } else { "关闭" };
-
-    bsn! {
-        Node {
-            width: Val::Percent(100.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(4.0),
-            padding: UiRect::axes(Val::Px(12.0), Val::Px(12.0)),
-            border: UiRect::all(Val::Px(1.0)),
-            border_radius: BorderRadius::all(Val::Px(8.0)),
-        }
-        BackgroundColor(CARD_BACKGROUND)
-        BorderColor::all(widgets::BORDER_SOFT)
-        Children [
-            Node {
-                width: Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-            }
-            Children [
-                @{widgets::text("脚部 IK（锁脚防滑步）", 14.0, widgets::TEXT_COLOR)}
-                --
-                Node {
-                    width: Val::Px(52.0),
-                    height: Val::Px(26.0),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    border_radius: BorderRadius::all(Val::Px(13.0)),
-                }
-                Text::new(toggle_text)
-                TextFont { font_size: FontSize::Px(12.0) }
-                TextColor(Color::WHITE)
-                BackgroundColor(toggle_color)
-                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.22))
-                FootIkToggle
-                on(|mut click: On<PointerClick>, mut settings: ResMut<FootIkSettings>| {
-                    if click.button != PointerButton::Primary {
-                        return;
-                    }
-                    click.propagate(false);
-                    settings.enabled = !settings.enabled;
-                })
-            ]
-            --
-            Text::new("")
-            TextFont { font_size: FontSize::Px(11.0) }
-            TextColor(Color::srgba(0.86, 0.86, 0.86, 0.72))
-            FootIkStatus
-        ]
-    }
-}
-
 /// 更新物理调试开关标签显示
 fn update_physics_debug_label(
     settings: Res<PhysicsDebugSettings>,
     mut toggle_labels: Query<(&mut Text, &mut BackgroundColor), With<PhysicsDebugToggle>>,
-) {
-    let (new_text, color) = if settings.enabled {
-        ("开启", widgets::BUTTON_SELECTED)
-    } else {
-        ("关闭", TOGGLE_IDLE)
-    };
-    for (mut text, mut bg_color) in &mut toggle_labels {
-        if text.0 != new_text {
-            text.0 = new_text.to_string();
-        }
-        if bg_color.0 != color {
-            bg_color.0 = color;
-        }
-    }
-}
-
-/// 更新脚部 IK 实时读数：权重、支撑、两只脚这一帧的修正距离
-fn update_foot_ik_status(
-    settings: Res<FootIkSettings>,
-    scale: Res<DebugTimeScale>,
-    ik: Query<&FootIk>,
-    facing: Query<(&FacingState, &FacingController)>,
-    mut labels: Query<&mut Text, With<FootIkStatus>>,
-) {
-    // 转向门控读数：support → 实际顶速。跑动时看这一对数就知道腾空段有没有压住
-    let turn = facing
-        .iter()
-        .next()
-        .map(|(state, controller)| (state.support, controller.turn_speed_at(state.support)));
-    let line = if !settings.enabled {
-        "已关闭".to_string()
-    } else if let Some(ik) = ik.iter().next() {
-        if !ik.is_ready() {
-            "等待角色模型…".to_string()
-        } else {
-            let [left, right] = ik.correction();
-            let [contact_left, contact_right] = ik.contacts;
-            let [planted_left, planted_right] = ik.planted();
-            let [roll_left, roll_right] = ik.roll();
-            let [heel_left, heel_right] = ik.heel_off();
-            let [ankle_left, ankle_right] = ik.ankle_deg();
-            // 前掌骨折角：抬跟时脚趾要留在地上，这个数应该跟着抬跟一起长
-            let [toe_left, toe_right] = ik.toe_bend_deg();
-            // 偏航补偿：踩实期间把脚掌拧回来的角度，顶到 foot_yaw_limit 就是撑不住了
-            let [yaw_left, yaw_right] = ik.yaw_lock_deg();
-            let [strength_left, strength_right] = ik.strength();
-            // 承重点：踩实后期承重点滑到前掌（「掌」），前期钉踝（「踝」）。
-            // 踝角 = 脚掌与小腿的夹角，90 = 站立、蹬地时该到 130~160
-            let pivot = |planted: bool, roll: f32| {
-                if !planted {
-                    "-"
-                } else if roll > 0.5 {
-                    "掌"
-                } else {
-                    "踝"
-                }
-            };
-            // 射线量到的地面：没打中显示「-」，打中显示高度和坡度
-            // （坡度 = 命中法线偏离竖直的角度，爬楼梯/斜坡时看它有没有跳）
-            let ground = |index: usize| match ik.ground(index) {
-                Some(hit) => format!(
-                    "{:.2}/{:.0}°",
-                    hit.height,
-                    hit.normal.dot(Vec3::Y).clamp(-1.0, 1.0).acos().to_degrees()
-                ),
-                None => "-".to_string(),
-            };
-            // 转向门控：前一个数是低通过的「脚在地上」权重，后一个数是它算出来的顶速。
-            // 跑动时应当看到它随跑步节奏在 45~90°/s 之间来回走（腾空 45、支撑 90）
-            let turn = match turn {
-                Some((support, speed)) => format!("{support:.2}→{speed:.0}°/s"),
-                None => "-".to_string(),
-            };
-            format!(
-                "权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 抬跟 {:.0}%/{:.0}% · 踝角 {:.0}°/{:.0}° · 趾 {:.0}°/{:.0}° · 偏航 {:.0}°/{:.0}° · 转向 {} · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
-                ik.blend(),
-                contact_left,
-                contact_right,
-                strength_left,
-                strength_right,
-                pivot(planted_left, roll_left),
-                pivot(planted_right, roll_right),
-                heel_left * 100.0,
-                heel_right * 100.0,
-                ankle_left,
-                ankle_right,
-                toe_left,
-                toe_right,
-                yaw_left,
-                yaw_right,
-                turn,
-                left,
-                right,
-                ground(0),
-                ground(1),
-                scale.speed
-            )
-        }
-    } else {
-        "当前没有角色".to_string()
-    };
-
-    for mut text in &mut labels {
-        if text.0 != line {
-            text.0 = line.clone();
-        }
-    }
-}
-
-/// 更新脚部 IK 开关标签显示
-fn update_foot_ik_label(
-    settings: Res<FootIkSettings>,
-    mut toggle_labels: Query<(&mut Text, &mut BackgroundColor), With<FootIkToggle>>,
 ) {
     let (new_text, color) = if settings.enabled {
         ("开启", widgets::BUTTON_SELECTED)
@@ -431,7 +235,6 @@ mod tests {
             ScenePlugin::default(),
         ));
         app.insert_resource(PhysicsDebugSettings::default());
-        app.insert_resource(FootIkSettings::default());
         // 页面结构由菜单插件生成，这里只挂一个 `MenuPageBody` 模拟填充入口
         let body = app
             .world_mut()
@@ -442,10 +245,8 @@ mod tests {
 
         app.world_mut()
             .run_system_once(
-                move |mut commands: Commands,
-                      settings: Res<PhysicsDebugSettings>,
-                      foot_ik: Res<FootIkSettings>| {
-                    commands.spawn_scene(page_scene(body, &settings, &foot_ik));
+                move |mut commands: Commands, settings: Res<PhysicsDebugSettings>| {
+                    commands.spawn_scene(page_scene(body, &settings));
                 },
             )
             .expect("页面构建系统跑不起来");
@@ -455,7 +256,7 @@ mod tests {
         (app, body)
     }
 
-    /// 页面必须是「根 → 开关卡片 → 卡片内的标签 + 按钮」的嵌套，两张卡片各带一个开关
+    /// 页面必须是「根 → 开关卡片 → 卡片内的标签 + 按钮」的嵌套
     #[test]
     fn page_is_card_with_toggle() {
         let (app, body) = build_test_page();
@@ -465,7 +266,7 @@ mod tests {
         assert_eq!(roots.len(), 1, "页面根应该只有一个");
         let root = roots[0];
         let cards = children_of(world, root);
-        assert_eq!(cards.len(), 2, "应该有两张开关卡片");
+        assert_eq!(cards.len(), 1, "应该只有物理调试一张开关卡片");
 
         let card = cards[0];
         let card_children = children_of(world, card);
@@ -477,23 +278,9 @@ mod tests {
         assert!(world.get::<Text>(toggle).is_some(), "开关按钮本身要有文字");
         assert!(world.get::<BackgroundColor>(toggle).is_some());
 
-        // 第二张卡片是脚部 IK：第一行同样是「标签 + 按钮」，下面一行是实时读数
-        let ik_card = cards[1];
-        let ik_children = children_of(world, ik_card);
-        assert_eq!(ik_children.len(), 2, "脚部 IK 卡片 = 开关行 + 读数行");
-        let ik_row = ik_children[0];
-        let ik_row_children = children_of(world, ik_row);
-        assert_eq!(ik_row_children.len(), 2, "开关行 = 标签 + 按钮");
-        assert!(world.get::<FootIkToggle>(ik_row_children[1]).is_some());
-        assert!(world.get::<FootIkStatus>(ik_children[1]).is_some());
-
-        // 默认状态：物理调试关、脚部 IK 开
+        // 默认状态：物理调试关
         let settings = app.world().resource::<PhysicsDebugSettings>();
         assert!(!settings.enabled, "物理调试默认应该是关闭");
-        assert!(
-            app.world().resource::<FootIkSettings>().enabled,
-            "脚部 IK 默认应该是开启"
-        );
     }
 
     /// 开关的状态必须真正写进 gizmo 配置，否则物理调试线不会消失/出现
