@@ -527,8 +527,11 @@ fn apply_character_when_loaded(
     runtime.reset_transient();
 }
 
-/// 场景异步载入完成后，为角色重建动画图并播放当前剪辑
-fn finish_model_setup(
+/// 场景异步载入完成后，为角色重建动画图并播放当前剪辑。
+///
+/// 这个系统是「骨骼开始被动画改写」的分界点：排它之前的系统（脚部 IK 的骨架标定）
+/// 读到的是场景实例化时的绑定姿态，之后读到的就是某一帧动画了。
+pub(crate) fn finish_model_setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     selection: Res<AnimSelection>,

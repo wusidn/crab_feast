@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy.workspace = true
-crab_feast = {path = "../../crab_feast"}
+crab_feast = {path = "../../crab_feast", features = ["net"]}
+crab_feast_library = {path = "../../crab_feast_library", features = ["net"]}
 crab_feast_launcher = {path = "../shared"}
 bevy-inspector-egui = "0.38.0"

@@ -3,5 +3,18 @@ name = "crab_feast_library"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# 联网协议：client / server 共用的组件、消息、通道定义。
+# 关掉时整个模块与 lightyear 都不参与编译。
+net = ["dep:lightyear", "dep:serde"]
+
 [dependencies]
 bevy.workspace = true
+serde = { workspace = true, optional = true }
+lightyear = { version = "0.31", optional = true, default-features = false, features = [
+    "std",
+    "replication",
+    "client",
+    "server",
+] }

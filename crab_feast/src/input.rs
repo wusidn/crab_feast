@@ -76,9 +76,11 @@ pub struct FacingController {
 impl Default for FacingController {
     fn default() -> Self {
         Self {
-            turn_speed: 90.0,
-            turn_accel: 350.0,
-            tolerance: 2.0,
+            // 数值只写在 crab_feast_library::tuning 一处：服务器做朝向复制要用同一组，
+            // 两边分家就会「本地转 2.2 秒、远端转 0.5 秒」
+            turn_speed: crab_feast_library::tuning::TURN_SPEED_DEG_PER_SEC,
+            turn_accel: crab_feast_library::tuning::TURN_ACCEL_DEG_PER_SEC2,
+            tolerance: crab_feast_library::tuning::TURN_TOLERANCE_DEG,
         }
     }
 }
@@ -172,6 +174,7 @@ pub struct LocomotionIntent {
 /// 打成一个 bundle 是因为 Bevy 的元组 Bundle 实现到 15 个为止，
 /// 玩家实体上的组件已经快把那个名额用完了。
 #[derive(Bundle, Default)]
+#[cfg_attr(feature = "net", allow(dead_code))]
 pub struct Facing {
     pub controller: FacingController,
     pub state: FacingState,
@@ -454,7 +457,7 @@ fn facing_system(
 ///
 /// 这个值只影响**收尾**：前半段的快慢由 [`FacingController::turn_speed`] 决定，
 /// 觉得“转得拖沓”但增大会显得假时，先调它，别去抬最大角速度。
-const FOLLOW_RESPONSE: f32 = 10.0;
+const FOLLOW_RESPONSE: f32 = crab_feast_library::tuning::TURN_RESPONSE;
 
 /// 腾空期还保留多少转向：0 = 空中完全不转，1 = 完全按顶速转（等于关掉门控）。
 ///
@@ -1008,7 +1011,10 @@ mod tests {
             facing_state(&mut app).support
         );
         assert_eq!(foot_support(Some(&empty_driver(3.0)), &idle_intent()), 1.0);
-        assert_eq!(foot_support(Some(&empty_driver(0.0)), &moving_intent()), 1.0);
+        assert_eq!(
+            foot_support(Some(&empty_driver(0.0)), &moving_intent()),
+            1.0
+        );
         // 真有步态时取两只脚里更强的那只
         let mut driver = empty_driver(3.0);
         driver.contacts = [0.2, 0.7];

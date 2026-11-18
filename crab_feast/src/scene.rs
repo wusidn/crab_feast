@@ -5,13 +5,14 @@ use bevy::{
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
+use crab_feast_library::level::{LevelBlock, LevelLook};
 
 use crate::GameState;
 use crate::anim::AnimationSet;
 use crate::camera::{CameraRig, GameCamera};
-use crate::input::{
-    ControlInputPlugin, ControlSet, Facing, LookAxis, LookController, MovementController,
-};
+use crate::input::{ControlInputPlugin, ControlSet, LookAxis, LookController};
+#[cfg(not(feature = "net"))]
+use crate::input::{Facing, MovementController};
 
 pub struct ScenePlugin;
 
@@ -31,35 +32,20 @@ impl Plugin for ScenePlugin {
                     .chain()
                     .before(AnimationSet::Drive),
             )
-            .add_systems(OnEnter(GameState::Game), Self::setup);
+            .add_systems(OnEnter(GameState::Game), Self::setup)
+            // 关卡内容由权威侧（联网 = 服务端）spawn 成实体，这里只负责把
+            // 复制下来的 `LevelBlock` 画出来，不决定「哪里有方块」
+            .add_systems(Update, render_level_blocks);
     }
 }
 impl ScenePlugin {
-    fn setup(
-        mut commands: Commands,
-        game_camera: Res<GameCamera>,
-        mut images: ResMut<Assets<Image>>,
-        mut materials: ResMut<Assets<StandardMaterial>>,
-    ) {
-        let ground_size = 30.0;
-        let ground_height = 0.1;
-        // 地面宽 60 米、烘 60×60 格 → 一格一米
-        let checker_cells = (ground_size * 2.0) as usize;
-        let checker_material = materials.add(StandardMaterial {
-            base_color_texture: Some(checkerboard(&mut images, checker_cells)),
-            ..default()
-        });
-
-        // 用可复用的 scene 函数组合整个场景（纯视觉 + 带物理均可进 BSN）
+    fn setup(mut commands: Commands, game_camera: Res<GameCamera>) {
+        // 与关卡内容无关的装饰与照明
         commands.spawn_scene_list(bsn_list! {
-            Mesh3d(asset_value(Circle::new(4.0)))
-            MeshMaterial3d<StandardMaterial>(asset_value(Color::WHITE))
-            Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
-            --
-            @cube(Vec3::new(0.0, 0.5, 0.0))
-            --
-            @cube(Vec3::new(1.0, 0.5, 1.0))
-            --
+            // Mesh3d(asset_value(Circle::new(4.0)))
+            // MeshMaterial3d<StandardMaterial>(asset_value(Color::WHITE))
+            // Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+            // --
             PointLight {
                 shadow_maps_enabled: true,
             }
@@ -72,12 +58,19 @@ impl ScenePlugin {
                 shadow_maps_enabled: true,
             }
             Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_4))
-            --
-            @ground(ground_size, ground_height, checker_material)
         });
+
+        // 单机模式没有服务器，本地就是权威：关卡实体在这儿 spawn。
+        // 联网模式下一条都不写——关卡由服务端实体复制下来（见 `render_level_blocks`）
+        #[cfg(not(feature = "net"))]
+        spawn_local_level(&mut commands);
 
         // 相机靠 `Avatar` 标记找角色，不再需要这里的实体句柄：一旦挂成子节点，
         // 角色转身就会把相机一起拧走，朝向又耦合回去了
+        //
+        // 联网模式下角色实体由服务器复制下来（见 net.rs），本地不再生成，
+        // 否则会和复制实体重复，且两边都对同一个角色写 Transform
+        #[cfg(not(feature = "net"))]
         commands.spawn((
             Transform::from_xyz(0.0, 2.0, 0.0),
             RigidBody::Dynamic,
@@ -150,32 +143,101 @@ fn checkerboard(images: &mut Assets<Image>, cells: usize) -> Handle<Image> {
     images.add(image)
 }
 
-/// 一个带物理的立方体：视觉 + 碰撞体 + 固定刚体
-fn cube(translation: Vec3) -> impl Scene {
-    // Avian 的 Collider::cuboid 收的是「完整边长」，rapier 收的是半长，数值因此翻倍
-    let debug_color = DebugRender::default().with_collider_color(Color::srgb(0.6, 0.6, 0.6));
-    bsn! {
-        Mesh3d(asset_value(Cuboid::new(1.0, 1.0, 1.0)))
-        MeshMaterial3d<StandardMaterial>(asset_value(Color::srgb_u8(124, 144, 255)))
-        Transform::from_translation(translation)
-        ~Collider::cuboid(1.0, 1.0, 1.0)
-        debug_color
-        ~RigidBody::Static
+/// 把 `LevelBlock` 画出来：**只读实体上写了什么**，不参与决定关卡里有什么。
+///
+/// 联网时这些实体是服务端复制下来的，单机时是本地 spawn 的；两种模式共用这一个
+/// 系统，所以「服务端挪了方块、客户端画面没跟上」这种漂移在结构上不会发生。
+fn render_level_blocks(
+    mut commands: Commands,
+    blocks: Query<(Entity, &LevelBlock), Added<LevelBlock>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut cache: Local<Option<(Handle<StandardMaterial>, Handle<StandardMaterial>)>>,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+
+    let (ground_material, cube_material) = match cache.as_ref() {
+        Some(materials) => materials.clone(),
+        None => {
+            // 一格一米：格数直接按地面的边长算，不另写常量
+            let cells = blocks
+                .iter()
+                .find(|(_, block)| block.look == LevelLook::Ground)
+                .map(|(_, block)| block.size[0].round().max(1.0) as usize)
+                .unwrap_or(60);
+            let pair = (
+                materials.add(StandardMaterial {
+                    base_color_texture: Some(checkerboard(&mut images, cells)),
+                    ..default()
+                }),
+                materials.add(StandardMaterial {
+                    base_color: Color::srgb_u8(124, 144, 255),
+                    ..default()
+                }),
+            );
+            *cache = Some(pair.clone());
+            pair
+        }
+    };
+
+    for (entity, block) in &blocks {
+        let size = Vec3::from_array(block.size);
+        let material = match block.look {
+            LevelLook::Ground => ground_material.clone(),
+            LevelLook::Cube => cube_material.clone(),
+        };
+        // 视觉体就长在 `LevelBlock` 这个实体自己身上：mesh 尺寸与碰撞体是同一份
+        // size，画面和物理不会差出一截
+        let mut block_entity = commands.entity(entity);
+        block_entity.insert((
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            MeshMaterial3d(material),
+            Transform::from_translation(Vec3::from_array(block.center)),
+        ));
+        // 联网模式下客户端不跑物理（角色位置由服务器写），但脚部 IK 每帧要往下打
+        // 一条射线量地面；而 `LevelBlock` 的复制名单里没有 `Collider`，复制下来的
+        // 关卡实体是个纯视觉体 —— 射线一路打空，IK 只能退回「从脚踝推断」。
+        // 这里补一份静态碰撞体，只当射线目标用，不参与任何积分
+        #[cfg(feature = "net")]
+        block_entity.insert((RigidBody::Static, Collider::cuboid(size.x, size.y, size.z)));
     }
 }
 
-/// 地面：渲染 mesh + 碰撞体 + 固定刚体，表面贴黑白格
-fn ground(size: f32, height: f32, material: Handle<StandardMaterial>) -> impl Scene {
-    let debug_color = DebugRender::default().with_collider_color(Color::srgb(0.0, 0.0, 0.0));
-    bsn! {
-        Transform::from_xyz(0.0, -height / 2.0, 0.0)
-        // mesh 尺寸与碰撞体一致：两者重合就不会有 z-fighting，也不用再摆一个偏移的平面
-        Mesh3d(asset_value(Cuboid::new(size * 2.0, height * 2.0, size * 2.0)))
-        MeshMaterial3d<StandardMaterial>(material)
-        ~Collider::cuboid(size * 2.0, height * 2.0, size * 2.0)
-        // Avian 不会把「只有 Collider 没有 RigidBody」的实体当成静态体，
-        // 缺了这行地面就是个纯渲染/纯调试物件，物体会直接穿过去
-        ~RigidBody::Static
-        debug_color
+/// 单机模式的关卡：本地客户端自己就是权威，实体在这儿 spawn。
+///
+/// 联网时同样的东西只存在于 `launcher/server/src/level.rs`，客户端一份都不写。
+#[cfg(not(feature = "net"))]
+fn spawn_local_level(commands: &mut Commands) {
+    spawn_block(
+        commands,
+        Vec3::new(0.0, -0.1, 0.0),
+        Vec3::new(60.0, 0.2, 60.0),
+        LevelLook::Ground,
+    );
+    for center in [Vec3::new(0.0, 0.5, 3.0), Vec3::new(1.0, 0.5, 1.0)] {
+        spawn_block(commands, center, Vec3::splat(1.0), LevelLook::Cube);
     }
+}
+
+#[cfg(not(feature = "net"))]
+fn spawn_block(commands: &mut Commands, center: Vec3, size: Vec3, look: LevelLook) {
+    let debug_color = match look {
+        LevelLook::Ground => Color::srgb(0.0, 0.0, 0.0),
+        LevelLook::Cube => Color::srgb(0.6, 0.6, 0.6),
+    };
+    commands.spawn((
+        RigidBody::Static,
+        Collider::cuboid(size.x, size.y, size.z),
+        Transform::from_translation(center),
+        LevelBlock {
+            center: center.to_array(),
+            size: size.to_array(),
+            look,
+        },
+        // 单机这边是真正在做碰撞的一方，把碰撞体画出来看得到
+        DebugRender::default().with_collider_color(debug_color),
+    ));
 }

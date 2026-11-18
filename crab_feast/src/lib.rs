@@ -9,12 +9,16 @@ mod anim;
 mod assets;
 mod camera;
 mod input;
+#[cfg(feature = "net")]
+mod net;
 mod scene;
 mod settings;
 mod state;
 mod ui;
 
 pub use assets::GameAssets;
+#[cfg(feature = "net")]
+pub use net::{AutoWalk, LocalPlayer, NetConfig, NetPlugin};
 pub use state::GameState;
 
 pub fn build_app(app: &mut App) {

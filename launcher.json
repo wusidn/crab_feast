@@ -1,0 +1,10 @@
+{
+  "server": {
+    "addr": "127.0.0.1:5099"
+  },
+  "default_player": "player1",
+  "players": [
+    { "name": "player1", "client_id": 11, "window": [0, 60] },
+    { "name": "player2", "client_id": 12, "window": [1280, 60] }
+  ]
+}

@@ -1,0 +1,21 @@
+[package]
+name = "crab_feast_server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "crab-feast-server"
+path = "src/main.rs"
+
+[dependencies]
+crab_feast_launcher = { path = "../shared" }
+bevy.workspace = true
+avian3d.workspace = true
+crab_feast_library = { path = "../../crab_feast_library", features = ["net"] }
+lightyear = { version = "0.31", default-features = false, features = [
+    "std",
+    "server",
+    "replication",
+    "udp",
+    "netcode",
+] }

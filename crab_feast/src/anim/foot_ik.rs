@@ -41,6 +41,20 @@ use super::driver::{AnimFocus, PoseDriver, drive_pose};
 
 pub struct FootIkPlugin;
 
+/// 让「非本地动画栈」也参与脚部 IK 的标记。
+///
+/// 本地角色由 [`AnimModelRoot`] 自动纳入（它本来就是动画系统的模型根）；
+/// 联机远端角色走的是 `net.rs` 里的混合空间驱动，没有那个标记，所以由那边显式插这个。
+#[derive(Component, Debug, Default)]
+pub struct FootIkTarget;
+
+/// 脚部 IK 的 `PostUpdate` 执行集合。
+///
+/// 谁往骨骼里写姿态，谁就必须排在它前面（远端的 `drive_remote_pose` 就靠它排序）：
+/// IK 解的是「这一帧最终的动画姿态」，提前一帧算出来的锚点会跟脚对着不上。
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FootIkSet;
+
 /// 全局参数。逐帧读取，所以改这里的值当帧生效；联机时每个角色可以再各自
 /// 用 [`FootIk::enabled`] 做二级开关。
 ///
@@ -224,6 +238,12 @@ pub struct FootIk {
     rig: Option<FootRig>,
     /// 当前生效权重（0..1），用于开关与模式切换的平滑过渡
     blend: f32,
+    /// 动画层每帧写入：这一帧混合输出是不是停在原地。
+    /// [`calibrate_at_rest`] 靠它判断「现在量 `foot_tilt` 可不可信」——
+    /// 本地角色由 [`feed_contacts`] 从 [`PoseDriver`] 写，远端由 `net.rs` 写
+    pub resting: bool,
+    /// 连续静止的帧数（内部状态，见 [`calibrate_at_rest`]）
+    settle: u8,
     /// 两只脚各自的锁脚状态
     locks: [FootLock; 2],
     /// 低通后的膝盖朝向上一次值（世界空间的单位向量）。混合空间换剪辑时
@@ -270,6 +290,10 @@ impl Default for FootIk {
         Self {
             enabled: true,
             contacts: [0.0; 2],
+            // 默认「不在静止」：标定要等动画层明确报告静止（本地读混合输出、
+            // 远端读实测速度）。建骨架那一刻角色可能正在跑，先量就是错的值
+            resting: false,
+            settle: 0,
             rig: None,
             blend: 0.0,
             locks: [FootLock::default(); 2],
@@ -301,6 +325,7 @@ impl FootIk {
     fn forget_skeleton(&mut self) {
         self.rig = None;
         self.blend = 0.0;
+        self.settle = 0;
         self.locks = [FootLock::default(); 2];
         self.poles = [None; 2];
         self.foot_rots = [None; 2];
@@ -426,6 +451,11 @@ struct FootRig {
     scale_leg: f32,
     /// 脚长换算系数（见 [`REFERENCE_FOOT_LENGTH`]），同样夹住
     scale_foot: f32,
+    /// `foot_tilt` 是否已经在「脚掌平放的帧」上量过（见 [`calibrate_at_rest`]）。
+    ///
+    /// 骨架一到位就量的话，联网/自动走路时量到的是摆动中的脚，踝角判据会整体偏掉；
+    /// 没标定之前求解端照旧跑，等第一次静止帧再覆盖
+    tilt_calibrated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -445,13 +475,31 @@ struct Leg {
 impl Plugin for FootIkPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FootIkSettings>()
-            .add_systems(Update, attach_rigs.run_if(in_state(GameState::Game)))
+            .add_systems(
+                Update,
+                // 早建 rig（腿长/骨骼链不受姿态影响），但 `foot_tilt` 交给
+                // `calibrate_at_rest` 在静止帧上覆盖，见那边的注释
+                attach_rigs
+                    .before(super::character::finish_model_setup)
+                    .run_if(in_state(GameState::Game)),
+            )
+            .configure_sets(
+                PostUpdate,
+                FootIkSet
+                    .after(drive_pose)
+                    .before(TransformSystems::Propagate),
+            )
             .add_systems(
                 PostUpdate,
-                (sample_ground, feed_contacts, solve_foot_ik)
+                (
+                    sample_ground,
+                    // 支撑权重/静止判据要先就位：标定端读的是本帧的 `resting`
+                    feed_contacts,
+                    calibrate_at_rest,
+                    solve_foot_ik,
+                )
                     .chain()
-                    .after(drive_pose)
-                    .before(TransformSystems::Propagate)
+                    .in_set(FootIkSet)
                     .run_if(in_state(GameState::Game)),
             );
     }
@@ -463,7 +511,14 @@ impl Plugin for FootIkPlugin {
 /// `rig.is_some()` 直接短路，正常开销只有一次判断。
 fn attach_rigs(
     mut commands: Commands,
-    models: Query<Entity, (With<AnimModelRoot>, Without<FootIk>)>,
+    // 本地角色（`AnimModelRoot`）与联机远端角色（`FootIkTarget`）走同一套求解
+    models: Query<
+        Entity,
+        (
+            Or<(With<AnimModelRoot>, With<FootIkTarget>)>,
+            Without<FootIk>,
+        ),
+    >,
     mut iks: Query<(Entity, &mut FootIk)>,
     children: Query<&Children>,
     names: Query<&Name>,
@@ -630,6 +685,81 @@ fn feed_contacts(
     } else {
         driver.contacts
     };
+    // 「静止」= 等效地速和速度轴都归零。混合空间从 Running 滑回 Idle 的头几帧
+    // 速度轴已经归零、脚却还在收，所以标定端还会多等几帧
+    ik.resting = !focus.preview
+        && driver.evaluated
+        && driver.ground_speed.abs() < 0.05
+        && driver.point[1].abs() < 0.02;
+}
+
+/// 静止帧重标定 `foot_tilt`（踝→前掌骨的俯角，脚掌平放时 ≈ 29.7°）。
+///
+/// 这个值按定义只在脚掌平放时成立，但它是跟着骨架一起量的：假设角色一进场就在跑
+/// （联网时由服务器推着走、或 `--auto-walk`），量到的是摆动中的脚，实测 79.0°/28.6°。
+/// 差 50° 会把「抬跟时的踝角判据」(`90 + 俯角 − 小腿前倾`) 整体推偏，蹬地那一下
+/// 脚踝该抬多高就判错。
+///
+/// 骨架/腿长这类量不受影响，所以不推迟建 rig，只在混合空间连续输出静止时覆盖
+/// 这一对常量，覆盖一次就不再动。
+fn calibrate_at_rest(
+    mut iks: Query<(Entity, &mut FootIk)>,
+    parents: Query<&ChildOf>,
+    transforms: Query<&Transform>,
+) {
+    for (model, mut ik) in iks.iter_mut() {
+        // 判据由各自动画层自己写（本地读混合输出，远端读复制下来的实测速度）：
+        // 每个角色一只脚在动的时机都不一样，用一个全局标志会让远端一直等不到静止帧
+        if !ik.resting {
+            ik.settle = 0;
+            continue;
+        }
+        ik.settle = ik.settle.saturating_add(1);
+        // 混合空间从 Running 滑回 Idle 的头几帧速度轴已经归零、脚却还在收
+        if ik.settle < 3 {
+            continue;
+        }
+
+        let Some(rig) = ik.rig.as_mut() else {
+            continue;
+        };
+        if rig.tilt_calibrated {
+            continue;
+        }
+        let mut tilts = [0.0f32; 2];
+        let mut measured = false;
+        for (index, leg) in rig.legs.iter().enumerate() {
+            let Some(toe) = leg.toe else {
+                continue;
+            };
+            let (Some(foot_pos), Some(toe_pos)) = (
+                world_position(model, leg.foot, &parents, &transforms),
+                world_position(model, toe, &parents, &transforms),
+            ) else {
+                continue;
+            };
+            let tilt = foot_pitch_deg(toe_pos, foot_pos);
+            // 明显不是平放的帧（量到负角 / 太陡）不要，宁可继续等下一帧静止
+            if !(-5.0..85.0).contains(&tilt) {
+                continue;
+            }
+            tilts[index] = tilt;
+            measured = true;
+        }
+        if !measured {
+            continue;
+        }
+        for (index, leg) in rig.legs.iter_mut().enumerate() {
+            leg.foot_tilt = tilts[index];
+        }
+        rig.tilt_calibrated = true;
+        // 抬跟的跨帧基准是按旧俯角累计的，换常量后清零重新累
+        ik.pitch_full = [0.0; 2];
+        info!(
+            "脚部 IK 静止重标定：前掌骨俯角 {:.1}°/{:.1}°",
+            tilts[0], tilts[1]
+        );
+    }
 }
 
 /// 逐角色求解：读本帧姿态 → 锁脚目标 → 两骨 IK → 写回腿部旋转。
@@ -1756,6 +1886,9 @@ fn build_rig(
         legs,
         scale_leg,
         scale_foot,
+        // 这一帧的姿势是「骨架刚能走到这里」的姿势，不一定是脚掌平放：
+        // 交给 `calibrate_at_rest` 在第一次静止帧上覆盖
+        tilt_calibrated: false,
     })
 }
 
@@ -1985,6 +2118,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2208,6 +2342,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2343,6 +2478,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2543,6 +2679,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2751,6 +2888,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -2969,6 +3107,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -3541,6 +3680,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -3677,6 +3817,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -3824,6 +3965,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 
@@ -3983,6 +4125,7 @@ mod tests {
             legs: [left, right],
             scale_leg: 1.0,
             scale_foot: 1.0,
+            tilt_calibrated: true,
         });
         world.entity_mut(model).insert(ik);
 

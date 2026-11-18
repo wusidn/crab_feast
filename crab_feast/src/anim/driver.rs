@@ -82,13 +82,13 @@ pub struct PoseDriver {
     pub active: bool,
 }
 
-pub struct Skeleton {
-    model: Entity,
-    by_id: HashMap<AnimationTargetId, Entity>,
-    rest: HashMap<AnimationTargetId, BonePose>,
-    targets: Vec<AnimationTargetId>,
-    hips: Option<AnimationTargetId>,
-    base_translation: Vec3,
+pub(crate) struct Skeleton {
+    pub(crate) model: Entity,
+    pub(crate) by_id: HashMap<AnimationTargetId, Entity>,
+    pub(crate) rest: HashMap<AnimationTargetId, BonePose>,
+    pub(crate) targets: Vec<AnimationTargetId>,
+    pub(crate) hips: Option<AnimationTargetId>,
+    pub(crate) base_translation: Vec3,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -238,7 +238,7 @@ pub(crate) fn drive_pose(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_skeleton(
+pub(crate) fn build_skeleton(
     model: Entity,
     children: &Query<&Children>,
     targets: &Query<(&AnimationTargetId, Option<&AnimatedBy>)>,

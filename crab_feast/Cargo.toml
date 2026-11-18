@@ -3,6 +3,11 @@ name = "crab_feast"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# 联网：客户端预测/复制的传输层是 native-only（UDP），wasm 与 mobile 不打开
+net = ["crab_feast_library/net", "dep:lightyear"]
+
 [dependencies]
 bevy.workspace                  = true
 avian3d.workspace               = true
@@ -13,3 +18,10 @@ serde.workspace               = true
 bevy_asset_loader.workspace = true
 iyes_progress.workspace = true
 serde_json.workspace = true
+lightyear = { version = "0.31", optional = true, default-features = false, features = [
+    "std",
+    "client",
+    "replication",
+    "udp",
+    "netcode",
+] }

@@ -6,6 +6,8 @@ use bevy::{
     winit::{UpdateMode, WinitSettings},
 };
 
+pub mod config;
+
 const LOG_FILTER: &str = "wgpu=error,bevy_render=info,bevy_ecs=trace";
 
 #[derive(Clone, Copy, Debug)]
@@ -13,6 +15,8 @@ pub struct LaunchConfig {
     pub title: &'static str,
     pub log_level: Level,
     pub log_filter: &'static str,
+    /// 窗口左上角坐标；同机多开客户端时用来错开窗口，正常玩不要设
+    pub window_position: Option<IVec2>,
 }
 
 impl Default for LaunchConfig {
@@ -21,6 +25,7 @@ impl Default for LaunchConfig {
             title: "crab_feast",
             log_level: default_log_level(),
             log_filter: LOG_FILTER,
+            window_position: None,
         }
     }
 }
@@ -106,6 +111,9 @@ fn window_plugin(config: &LaunchConfig) -> WindowPlugin {
         focused: true,
         ..default()
     };
+    if let Some(position) = config.window_position {
+        window.position = WindowPosition::At(position);
+    }
 
     #[cfg(target_arch = "wasm32")]
     {

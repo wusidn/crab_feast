@@ -58,6 +58,19 @@ impl ClipSet {
         self.meta.insert(id.into(), meta);
     }
 
+    /// 这套剪辑属于哪个角色。
+    ///
+    /// `rig` 存的是「角色名|剪辑名…」的指纹（换角色时整表替换），
+    /// 取第一个字段就是角色名。
+    // 只有联机远端的姿态守卫要用它
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub fn character(&self) -> Option<&str> {
+        self.rig
+            .as_deref()
+            .and_then(|key| key.split('|').next())
+            .filter(|name| !name.is_empty())
+    }
+
     pub fn handle(&self, id: &str) -> Option<&Handle<AnimationClip>> {
         self.handles.get(id)
     }
