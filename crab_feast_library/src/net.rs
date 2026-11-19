@@ -153,8 +153,8 @@ impl Plugin for CrabProtocolPlugin {
         app.component::<NetYaw>().replicate();
         app.component::<NetMotion>().replicate();
         app.component::<NetPlayerId>().replicate_once();
-        // 关卡几何**不进协议**：静态场景是设计数据，两端各自从
-        // `crab_feast_library::level::LEVEL` 建实体（见 `spawn_static_level`）。
+        // 关卡几何**不进协议**：静态场景是设计数据，两端各自从同一份关卡
+        // 定义建实体（`crab_feast::level::spawn_static_level`）。
         // 复制一份只读几何除了占握手带宽，还会让客户端出现「复制体 + 本地体」
         // 两份碰撞体，物理里同一个方块被解算两次。
 

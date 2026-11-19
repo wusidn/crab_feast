@@ -165,7 +165,7 @@ fn mark_world_ready(
 /// 相机与输入资源留着，回大厅后重新进场景时由各自插件重建。
 fn cleanup_world(
     mut commands: Commands,
-    level: Query<Entity, With<crab_feast_library::level::LevelBlock>>,
+    level: Query<Entity, With<crate::level::LevelBlock>>,
     avatars: Query<Entity, With<Avatar>>,
     decor: Query<Entity, With<crate::scene::SceneDecor>>,
     mut runtime: ResMut<AnimRuntime>,

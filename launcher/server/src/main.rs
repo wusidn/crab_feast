@@ -14,8 +14,8 @@ use bevy::{
     state::app::StatesPlugin,
     transform::TransformPlugin,
 };
+use crab_feast::level::spawn_static_level;
 use crab_feast_launcher::config::{LauncherConfig, config_path_from_args};
-use crab_feast_library::level::spawn_static_level;
 use crab_feast_library::net::{
     ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR, JoinRequest, MOVE_SPEED_MPS, MoveInput,
     NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId, NetPos, NetYaw, TICK_HZ, Welcome,

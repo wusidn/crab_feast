@@ -11,6 +11,9 @@ path = "src/main.rs"
 crab_feast_launcher = { path = "../shared" }
 bevy.workspace = true
 avian3d.workspace = true
+# 关卡是游戏侧的设计数据（crab_feast::level），服务端只是复用同一份定义建
+# 权威碰撞几何；这里不要开 `net`：服务器只要数据，不要客户端的传输栈
+crab_feast = { path = "../../crab_feast" }
 crab_feast_library = { path = "../../crab_feast_library", features = ["net"] }
 serde_json.workspace = true
 lightyear = { version = "0.31", default-features = false, features = [

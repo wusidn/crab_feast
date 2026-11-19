@@ -1,3 +1,4 @@
+use crate::level::{LevelBlock, LevelLook, spawn_static_level};
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
@@ -5,7 +6,6 @@ use bevy::{
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
-use crab_feast_library::level::{LevelBlock, LevelLook, spawn_static_level};
 
 use crate::GameState;
 use crate::anim::AnimationSet;

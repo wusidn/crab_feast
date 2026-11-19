@@ -11,6 +11,10 @@ mod camera;
 #[cfg(feature = "net")]
 mod discovery;
 mod input;
+/// 关卡：静态场景的设计数据（地面 / 方块尺寸与位置）与本地构建入口。
+///
+/// dedicated server 也会引用这里的数据建自己的权威碰撞几何。
+pub mod level;
 #[cfg(feature = "net")]
 mod net;
 mod scene;
