@@ -14,12 +14,19 @@ use crab_feast_ui_joysticks::{
 use crab_feast_library::platform::PlatformInfo;
 use crab_feast_ui_joysticks::JoystickMarionettePlugin;
 
+use crate::GameState;
 use crate::input::{LookInput, MoveGait, MovementInput};
+use crate::state::SessionReady;
 
 pub struct InputPlugin;
 
 #[derive(Resource, Debug, Default)]
 pub struct LookInputIgnorePointers(HashSet<PointerId>);
+
+/// 输入 UI 的根节点标记：等世界就绪后再生成，退出场景时整棵子树一起收掉，
+/// 这样断线回大厅、重新进游戏还能再建一次。
+#[derive(Component)]
+struct InputUiRoot;
 
 #[derive(Clone)]
 struct BackgroundColorProperty;
@@ -39,8 +46,21 @@ impl Plugin for InputPlugin {
             .init_resource::<LookInputIgnorePointers>()
             .init_resource::<MovementInput>()
             .init_resource::<MoveGait>()
-            .add_systems(OnEnter(crate::GameState::Game), Self::setup)
-            .add_systems(PreUpdate, on_keyboard_event.run_if(is_non_mobile));
+            // 「就绪」才算能操作：角色模型与动画图都在了才生成摇杆与键盘层
+            .add_systems(
+                Update,
+                Self::setup
+                    .run_if(in_state(GameState::Game))
+                    .run_if(session_ready),
+            )
+            .add_systems(OnExit(GameState::Game), Self::cleanup)
+            .add_systems(
+                PreUpdate,
+                on_keyboard_event
+                    .run_if(is_non_mobile)
+                    .run_if(in_state(GameState::Game))
+                    .run_if(session_ready),
+            );
 
         if !PlatformInfo::current().is_mobile() {
             app.add_plugins(JoystickMarionettePlugin);
@@ -52,12 +72,21 @@ fn is_non_mobile(platform: Res<PlatformInfo>) -> bool {
     !platform.is_mobile()
 }
 
+fn session_ready(ready: Res<SessionReady>) -> bool {
+    ready.0
+}
+
 impl InputPlugin {
     fn setup(
         mut commands: Commands,
         mut animation_graphs: ResMut<Assets<AnimationGraph>>,
         mut animation_clips: ResMut<Assets<AnimationClip>>,
+        existing: Query<(), With<InputUiRoot>>,
     ) {
+        // 已经是「就绪」状态但这一局的输入层已经建过：不重复生成
+        if existing.iter().next().is_some() {
+            return;
+        }
         let joystick_idle_color = Color::hsla(160.0, 0.5, 0.6, 0.03);
         let joystick_active_color = Color::hsla(160.0, 0.5, 0.7, 0.08);
 
@@ -120,15 +149,18 @@ impl InputPlugin {
             .id();
 
         let input_layer_entity = commands
-            .spawn(Node {
-                width: Val::Vw(100.0),
-                height: Val::Vh(100.0),
-                padding: UiRect::all(Val::Vw(10.0)),
-                display: Display::Flex,
-                justify_content: JustifyContent::FlexStart,
-                align_items: AlignItems::FlexEnd,
-                ..Default::default()
-            })
+            .spawn((
+                InputUiRoot,
+                Node {
+                    width: Val::Vw(100.0),
+                    height: Val::Vh(100.0),
+                    padding: UiRect::all(Val::Vw(10.0)),
+                    display: Display::Flex,
+                    justify_content: JustifyContent::FlexStart,
+                    align_items: AlignItems::FlexEnd,
+                    ..Default::default()
+                },
+            ))
             .observe(on_rotate_plane_press)
             .observe(on_rotate_plane_release)
             .observe(on_rotate_plane_drag)
@@ -154,6 +186,17 @@ impl InputPlugin {
             })
             .insert(AnimatedBy(animation_player_entity))
             .observe(on_joystick_event);
+
+        // 动画 player 挂到输入层根节点下：退出场景时随根一起回收
+        commands
+            .entity(input_layer_entity)
+            .add_child(animation_player_entity);
+    }
+
+    fn cleanup(mut commands: Commands, roots: Query<Entity, With<InputUiRoot>>) {
+        for entity in &roots {
+            commands.entity(entity).try_despawn();
+        }
     }
 }
 

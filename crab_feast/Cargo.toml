@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = []
 # 联网：客户端预测/复制的传输层是 native-only（UDP），wasm 与 mobile 不打开
-net = ["crab_feast_library/net", "dep:lightyear"]
+net = ["crab_feast_library/net", "dep:lightyear", "dep:socket2"]
 
 [dependencies]
 bevy.workspace                  = true
@@ -18,6 +18,9 @@ serde.workspace               = true
 bevy_asset_loader.workspace = true
 iyes_progress.workspace = true
 serde_json.workspace = true
+# 发现广播的监听端要开 SO_REUSEPORT（同机多开客户端绑同一端口），socket2 的该
+# 接口藏在 "all" feature 后面
+socket2 = { version = "0.6", features = ["all"], optional = true }
 lightyear = { version = "0.31", optional = true, default-features = false, features = [
     "std",
     "client",

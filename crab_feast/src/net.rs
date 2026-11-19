@@ -1,10 +1,10 @@
 //! 客户端联网接入（v1：权威服务器 + 状态复制，不含预测）。
 //!
 //! 登录流程：
-//! 1. `connect` 在进场景时建连接实体（netcode 握手）；
+//! 1. `Lobby` 点「加入」后进 `Login`，`connect` 在这一步建连接实体（netcode 握手）；
 //! 2. 握手成功（`Connected`）才发 `JoinRequest`——**连接 ≠ 玩家**；
 //! 3. 服务端收到 Join 才分配 `player_id`、生成角色实体、回 `Welcome`；
-//! 4. 客户端收到 `Welcome` → [`LocalPlayer`]，复制下来的那个实体被认领成 `Avatar`。
+//! 4. 客户端收到 `Welcome` → 进 `Game` 建场景，复制下来的那个实体被认领成 [`Avatar`]。
 //!
 //! 渲染取舍：
 //! - 角色实体一律由服务端复制，客户端不本地生成，避免"两个人在同一个角色上写 Transform"；
@@ -38,6 +38,7 @@ use crate::anim::{AnimCatalog, ClipSet, FootIk, FootIkSet, MixerCache, Skeleton,
 use crate::camera::CameraFacing;
 use crate::input::{ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, wrap_pi};
 use crate::scene::Avatar;
+use crate::state::{AbortSession, LobbyNotice, SessionMode};
 
 /// 服务器地址，由 launcher 通过 `--server` 写入。
 #[derive(Resource, Debug, Clone, Copy)]
@@ -93,8 +94,12 @@ impl Plugin for NetPlugin {
         // 物理步长与服务器 tick 对齐：两端都是 60Hz，静态场景与角色碰撞在同一
         // 时间粒度上演算；步长不一致时，同一段位移在两侧会解出不同的接触结果
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
+        .init_resource::<NetConfig>()
         .init_resource::<LoginPhase>()
-        .add_systems(OnEnter(GameState::Game), connect)
+        // 登录阶段才建连接；大厅与本地游戏都不该有客户端实体
+        .add_systems(OnEnter(GameState::Login), connect)
+        .add_systems(Update, abort_login)
+        .add_systems(OnExit(GameState::Game), leave_game)
         .add_observer(spawn_remote_visual)
         .add_observer(on_connecting)
         .add_observer(send_join_request)
@@ -135,8 +140,11 @@ impl Plugin for NetPlugin {
                 (attach_player_models, setup_clip_models)
                     .chain()
                     .after(claim_local_avatar),
-                // 输入要在移动系统把摇杆方向折算成世界方向之后采样
-                send_input.after(ControlSet::Move),
+                // 输入要在移动系统把摇杆方向折算成世界方向之后采样；
+                // 出大厅/断线后连接实体已不在，这里也不会再发包
+                send_input
+                    .after(ControlSet::Move)
+                    .run_if(in_state(GameState::Game)),
             ),
         );
     }
@@ -163,12 +171,28 @@ fn setup_visual_assets(
     });
 }
 
-fn connect(mut commands: Commands, config: Res<NetConfig>) {
+fn connect(
+    mut commands: Commands,
+    config: Res<NetConfig>,
+    mode: Res<SessionMode>,
+    existing: Query<Entity, With<Client>>,
+) {
+    // 只有「从大厅点了某台服务器加入」才建连接；本地游戏走的是纯单机路径
+    let SessionMode::Online { server } = *mode else {
+        info!("net: 本地会话，不建立服务器连接");
+        return;
+    };
+
+    // 上一次失败的连接可能还留着实体：先收掉，保证同一时间只有一个 client
+    for entity in &existing {
+        commands.entity(entity).try_despawn();
+    }
+
     // 连接层：lightyear 的"裸 UdpIo"只是链路，握手/加密/Connected 状态由 netcode 负责。
     // 开发期用明文私钥自签 token；上线要换成后端签发的 Authentication::Token
     let netcode = NetcodeClient::new(
         Authentication::Manual {
-            server_addr: config.server,
+            server_addr: server,
             client_id: config.client_id,
             private_key: crab_feast_library::net::NETCODE_DEV_KEY,
             protocol_id: crab_feast_library::net::NETCODE_PROTOCOL_ID,
@@ -183,7 +207,7 @@ fn connect(mut commands: Commands, config: Res<NetConfig>) {
             netcode,
             UdpIo::default(),
             LocalAddr(SocketAddr::from(([0, 0, 0, 0], 0))),
-            PeerAddr(config.server),
+            PeerAddr(server),
             ReplicationReceiver,
             MessageManager::default(),
             // 注册了 ClientToServer 方向后 sender 本应自动插，这里显式写清楚，
@@ -196,8 +220,43 @@ fn connect(mut commands: Commands, config: Res<NetConfig>) {
     commands.trigger(Connect { entity });
     info!(
         "connecting to {} as client {} (entity {entity:?})",
-        config.server, config.client_id
+        server, config.client_id
     );
+}
+
+/// 玩家在登录页点了取消：把正在握手/已连上的客户端断开。
+///
+/// 先把阶段清回 `Idle`，这样随后的 `Disconnected` 不会当成「掉线」再弹一次提示。
+fn abort_login(
+    mut requests: MessageReader<AbortSession>,
+    mut phase: ResMut<LoginPhase>,
+    clients: Query<Entity, With<Client>>,
+    mut commands: Commands,
+) {
+    if requests.read().next().is_none() {
+        return;
+    }
+    info!("net: 登录被取消，断开客户端");
+    *phase = LoginPhase::Idle;
+    for entity in &clients {
+        commands.trigger(Disconnect { entity });
+    }
+}
+
+/// 退出 `Game`：本机的玩家身份与连接状态一起收掉。
+///
+/// 正常断线时 `on_disconnected` 已经处理过；这里兜住「退出场景但连接还在」的情况
+/// （例如调试时直接切状态），避免下次登录复用一个旧连接。
+fn leave_game(
+    mut commands: Commands,
+    mut phase: ResMut<LoginPhase>,
+    clients: Query<Entity, With<Client>>,
+) {
+    *phase = LoginPhase::Idle;
+    commands.remove_resource::<LocalPlayer>();
+    for entity in &clients {
+        commands.trigger(Disconnect { entity });
+    }
 }
 
 /// 远端实体复制下来后补上渲染：服务器只发状态，不发美术。
@@ -249,32 +308,51 @@ fn on_disconnected(
     trigger: On<Add<Disconnected>>,
     mut phase: ResMut<LoginPhase>,
     mut commands: Commands,
+    state: Res<State<GameState>>,
+    mut next: ResMut<NextState<GameState>>,
+    mut notice: ResMut<LobbyNotice>,
 ) {
     // 连接实体刚 spawn 出来时会先带一个 `Disconnected` 再转 `Connecting`，
-    // 那种不算"掉线"，只有已经进房间之后的断开才值得报
+    // 那种不算"掉线"：只有已经处于 Connecting/Handshaking/InGame 的断开才算
     let was_in_game = matches!(*phase, LoginPhase::InGame(_));
+    let was_active = !matches!(*phase, LoginPhase::Idle) || was_in_game;
     *phase = LoginPhase::Idle;
     commands.remove_resource::<LocalPlayer>();
-    if was_in_game {
-        warn!(
-            "net: disconnected {:?}（掉线，登录状态回到 Idle）",
-            trigger.entity
-        );
-    } else {
-        debug!("net: disconnected {:?}（尚未进房间）", trigger.entity);
+
+    if !was_active {
+        debug!("net: disconnected {:?}（尚未开始连接）", trigger.entity);
+        return;
     }
+
+    warn!("net: disconnected {:?}，回到大厅", trigger.entity);
+    notice.0 = Some(if was_in_game {
+        "与服务器断开连接".to_string()
+    } else {
+        "无法连接服务器，请检查地址或稍后重试".to_string()
+    });
+    if matches!(
+        *state.get(),
+        GameState::Login | GameState::Game | GameState::Pause
+    ) {
+        next.set(GameState::Lobby);
+    }
+    // 断开后的连接实体已经没用了，别让它留到下一次登录
+    commands.entity(trigger.entity).try_despawn();
 }
 
 fn on_welcome(
     mut commands: Commands,
     mut phase: ResMut<LoginPhase>,
     mut clients: Query<&mut MessageReceiver<Welcome>>,
+    mut next: ResMut<NextState<GameState>>,
 ) {
     for mut receiver in clients.iter_mut() {
         for welcome in receiver.receive() {
             info!("join: Welcome player_id={} → InGame", welcome.player_id);
             *phase = LoginPhase::InGame(welcome.player_id);
             commands.insert_resource(LocalPlayer(welcome.player_id));
+            // 登录完成：场景/角色/相机在 `Game` 的 `OnEnter` 里建
+            next.set(GameState::Game);
         }
     }
 }
@@ -299,7 +377,7 @@ fn claim_local_avatar(
         if let Some(children) = children {
             for child in children.iter() {
                 if clip_roots.contains(child) {
-                    commands.entity(child).despawn();
+                    commands.entity(child).try_despawn();
                 }
             }
         }

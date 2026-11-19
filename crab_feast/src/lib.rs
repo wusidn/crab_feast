@@ -8,18 +8,23 @@ use crab_feast_library::platform::PlatformInfo;
 mod anim;
 mod assets;
 mod camera;
+#[cfg(feature = "net")]
+mod discovery;
 mod input;
 #[cfg(feature = "net")]
 mod net;
 mod scene;
+mod session;
 mod settings;
 mod state;
 mod ui;
 
 pub use assets::GameAssets;
 #[cfg(feature = "net")]
+pub use discovery::{DiscoveryPlugin, ServerBrowser};
+#[cfg(feature = "net")]
 pub use net::{AutoWalk, LocalPlayer, NetConfig, NetPlugin};
-pub use state::GameState;
+pub use state::{AutoJoin, GameState, LobbyNotice, SessionMode, SessionReady};
 
 pub fn build_app(app: &mut App) {
     app.insert_resource(PlatformInfo::current())
@@ -52,8 +57,13 @@ pub fn build_app(app: &mut App) {
             },
             anim::AnimPlugin,
             assets::AssetLoadingPlugin,
+            session::SessionPlugin,
             settings::SettingsPlugin,
             ui::UiPlugin,
             scene::ScenePlugin,
         ));
+
+    // 大厅的服务器列表靠这条后台监听线程喂数据；没有网络特性的构建没有列表
+    #[cfg(feature = "net")]
+    app.add_plugins(discovery::DiscoveryPlugin);
 }

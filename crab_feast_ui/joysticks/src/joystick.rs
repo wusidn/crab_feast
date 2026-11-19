@@ -199,7 +199,9 @@ fn joystick_on_remove(
     if let Ok(children) = children_query.get(joystick_entity) {
         children.iter().for_each(|child| {
             if joystick_thumb_query.get(child).is_ok() {
-                commands.entity(child).despawn();
+                // 摇杆根被整体销毁（例如退出场景）时，子树级联已经收走了 thumb：
+                // 这里只补「单独移除 Joystick 组件」的情况，重复销毁要静默
+                commands.entity(child).try_despawn();
             }
         });
     }

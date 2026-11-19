@@ -25,7 +25,7 @@ mod spaces;
 
 use bevy::prelude::*;
 
-pub use character::{AnimCatalog, AnimSelection, SPEED_RANGE};
+pub use character::{AnimCatalog, AnimRuntime, AnimSelection, SPEED_RANGE};
 pub use driver::{AnimFocus, PoseDriver};
 // 联机远端姿态驱动要用（`net` 之外没有调用方）
 #[allow(unused_imports)]

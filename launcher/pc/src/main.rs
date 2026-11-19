@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_inspector_egui::{bevy_egui::EguiPlugin, quick::WorldInspectorPlugin};
-use crab_feast::{AutoWalk, NetConfig, NetPlugin};
+use crab_feast::{AutoJoin, AutoWalk, NetConfig, NetPlugin, SessionMode};
 use crab_feast_launcher::{
     LaunchConfig, build_app,
     config::{LauncherConfig, config_path_from_args},
@@ -43,6 +43,8 @@ fn main() {
                 server: args.server,
                 client_id: args.client_id,
             })
+            // `--server` / `--local` 带了明确目标就跳过大厅直接登录；否则停在大厅
+            .insert_resource(AutoJoin(args.auto_join))
             .add_plugins(NetPlugin);
 
         if let Some(secs) = args.auto_walk {
@@ -95,6 +97,8 @@ struct Args {
     profile: String,
     server: SocketAddr,
     client_id: u64,
+    /// 命令行明确指定了「直接进哪一局」：连服务器或本地游戏
+    auto_join: Option<SessionMode>,
     /// 窗口左上角（同机多开时错开用）
     window: Option<(i32, i32)>,
     /// 跑够多少秒自动退出（冒烟测试用，正常玩不要传）
@@ -108,7 +112,19 @@ struct Args {
 fn parse_args() -> Args {
     let config = LauncherConfig::load(config_path_from_args().as_deref());
 
-    let mut args = std::env::args().skip(1);
+    // 支持 `--key=value` 写法：先归一化成 `--key value`，后面只按空格形式解析
+    let mut normalized: Vec<String> = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if let Some(rest) = arg.strip_prefix("--")
+            && let Some((key, value)) = rest.split_once('=')
+        {
+            normalized.push(format!("--{key}"));
+            normalized.push(value.to_string());
+            continue;
+        }
+        normalized.push(arg);
+    }
+    let mut args = normalized.into_iter();
     let mut server: Option<String> = None;
     let mut profile: Option<String> = None;
     // netcode 的 client_id 必须全局唯一，两台客户端都用默认值会互相顶掉。
@@ -118,6 +134,8 @@ fn parse_args() -> Args {
     let mut auto_walk = None;
     let mut window = None;
     let mut screenshot: Option<std::path::PathBuf> = None;
+    let mut explicit_server = false;
+    let mut local_game = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--profile" => {
@@ -131,8 +149,12 @@ fn parse_args() -> Args {
             }
             "--server" => {
                 if let Some(value) = args.next() {
+                    explicit_server = true;
                     server = Some(value);
                 }
+            }
+            "--local" => {
+                local_game = true;
             }
             "--client-id" => {
                 if let Some(value) = args.next() {
@@ -167,19 +189,25 @@ fn parse_args() -> Args {
             "--help" | "-h" => {
                 println!(
                     "crab_feast_pc --launch-all   # 按 launcher.json 起服务器 + 所有玩家\n\
-                     crab_feast_pc [--profile player1] [--server 127.0.0.1:5000] [--client-id <n>] \
-                     [--window x,y] [--config launcher.json] [--screenshot <png>] \
-                     [--exit-after <秒>] [--auto-walk <秒>]\n\
-                     不传参数时读 launcher.json 的 default_player（没有就是第一个玩家位）。"
+                     crab_feast_pc [--profile player1] [--server 127.0.0.1:5000 | --local] \
+                     [--client-id <n>] [--window x,y] [--config launcher.json] \
+                     [--screenshot <png>] [--exit-after <秒>] [--auto-walk <秒>]\n\
+                     不传 --profile 时沿用 launcher.json 的 default_player 作为窗口/地址兜底，\n\
+                     但 client_id 会按时间戳自动生成，保证同机多开不会撞号；\n\
+                     停在大厅的服务器列表；--server 自动加入该服务器，--local 直接本地游戏。"
                 );
                 std::process::exit(0);
             }
             other => eprintln!("未知参数 {other}，已忽略"),
         }
     }
-    // 玩家位名字：命令行 > 环境变量 > launcher.json 的 default_player
+    // 玩家位名字：命令行 > 环境变量 > launcher.json 的 default_player。
+    // 前两者算「明确指定」；default_player 只是单开时的兜底——多开时每个进程
+    // 都会落到 player1，client_id 撞车会被 netcode 服务端静默丢弃（表现为连接超时）。
+    let env_profile = std::env::var("CRAB_PROFILE").ok();
+    let explicit_profile = profile.is_some() || env_profile.is_some();
     let profile_name = profile
-        .or_else(|| std::env::var("CRAB_PROFILE").ok())
+        .or(env_profile)
         .or_else(|| config.default_profile_name().map(str::to_string));
     let profile = profile_name.as_deref().map(|name| config.player(name).clone());
 
@@ -191,15 +219,44 @@ fn parse_args() -> Args {
         eprintln!("服务器地址 {server} 无法解析：{error}");
         std::process::exit(2);
     });
+    // 只有明确点了玩家位才沿用配置里的 id；否则一律生成唯一 id，
+    // 避免第二个实例悄悄复用 player1 的 11 把第一个顶掉。
     let client_id = client_id
-        .or_else(|| profile.as_ref().map(|p| p.client_id))
+        .or_else(|| {
+            if explicit_profile {
+                profile.as_ref().map(|p| p.client_id)
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(unique_client_id);
-    let window = window.or_else(|| profile.as_ref().and_then(|p| p.window.map(|[x, y]| (x, y))));
+    // 没显式指定玩家位时窗口按进程号错开，避免两次默认启动完全叠在一起
+    let window = window
+        .or_else(|| profile.as_ref().and_then(|p| p.window.map(|[x, y]| (x, y))))
+        .map(|(x, y)| {
+            if explicit_profile {
+                (x, y)
+            } else {
+                let step = (std::process::id() % 6) as i32 * 48;
+                (x + step, y + step)
+            }
+        });
     let exit_after = exit_after.or_else(|| profile.as_ref().and_then(|p| p.exit_after));
+    // 明确给了 --server 就自动加入；否则 --local 直接本地游戏；
+    // 都没给就停在大厅，等玩家自己点
+    let auto_join = if explicit_server {
+        Some(SessionMode::Online { server })
+    } else if local_game {
+        Some(SessionMode::Local)
+    } else {
+        None
+    };
+
     Args {
         profile: profile_name.unwrap_or_else(|| "auto".to_string()),
         server,
         client_id,
+        auto_join,
         window,
         exit_after,
         auto_walk,

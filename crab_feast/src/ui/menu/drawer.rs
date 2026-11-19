@@ -589,7 +589,7 @@ fn spawn_menu_item(commands: &mut Commands, body: Entity, page: &MenuPageDef) {
 
 fn cleanup_menu(mut commands: Commands, roots: Query<Entity, With<MenuRoot>>) {
     for entity in &roots {
-        commands.entity(entity).despawn();
+        commands.entity(entity).try_despawn();
     }
 }
 

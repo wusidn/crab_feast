@@ -10,15 +10,18 @@ use crab_feast_library::level::{LevelBlock, LevelLook, spawn_static_level};
 use crate::GameState;
 use crate::anim::AnimationSet;
 use crate::camera::{CameraRig, GameCamera};
-use crate::input::{ControlInputPlugin, ControlSet, LookAxis, LookController};
-#[cfg(not(feature = "net"))]
-use crate::input::{Facing, MovementController};
+use crate::input::{ControlInputPlugin, ControlSet, Facing, LookAxis, LookController, MovementController};
+use crate::state::SessionMode;
 
 pub struct ScenePlugin;
 
 /// 玩家实体（角色模型挂在这个实体下面，动画预览切换模型时只替换子节点）
 #[derive(Component)]
 pub struct Avatar;
+
+/// 与关卡无关的场景装饰（灯光等）：退出 `Game` 时按这个标记统一清掉。
+#[derive(Component, Default, Clone)]
+pub struct SceneDecor;
 
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
@@ -40,26 +43,29 @@ impl Plugin for ScenePlugin {
     }
 }
 impl ScenePlugin {
-    fn setup(mut commands: Commands, game_camera: Res<GameCamera>) {
-        // 与关卡内容无关的装饰与照明
+    fn setup(mut commands: Commands, game_camera: Res<GameCamera>, mode: Res<SessionMode>) {
+        // 与关卡内容无关的装饰与照明。
+        // 退出 `Game` 后按 `SceneDecor` 清理，重进时重新生成
         commands.spawn_scene_list(bsn_list! {
-            // Mesh3d(asset_value(Circle::new(4.0)))
-            // MeshMaterial3d<StandardMaterial>(asset_value(Color::WHITE))
-            // Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
-            // --
-            PointLight {
-                shadow_maps_enabled: true,
-            }
-            Transform::from_xyz(4.0, 8.0, 4.0)
-            --
-            // 全局光照：从右上方照下来，比 Bevy 默认的日光（10_000 lux）暗一级
-            DirectionalLight {
-                color: Color::WHITE,
-                illuminance: 300.0,
-                shadow_maps_enabled: true,
-            }
-            Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_4))
-        });
+                // Mesh3d(asset_value(Circle::new(4.0)))
+                // MeshMaterial3d<StandardMaterial>(asset_value(Color::WHITE))
+                // Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+                // --
+                PointLight {
+                    shadow_maps_enabled: true,
+                }
+                Transform::from_xyz(4.0, 8.0, 4.0)
+                SceneDecor
+                --
+                // 全局光照：从右上方照下来，比 Bevy 默认的日光（10_000 lux）暗一级
+                DirectionalLight {
+                    color: Color::WHITE,
+                    illuminance: 300.0,
+                    shadow_maps_enabled: true,
+                }
+                Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_4))
+                SceneDecor
+            });
 
         // 静态场景：两端各自构建，客户端这里拿到的就是本地物理世界里的真实几何
         // （Static 刚体 + cuboid 碰撞体），不是"只给射线用"的探针
@@ -68,29 +74,33 @@ impl ScenePlugin {
         // 相机靠 `Avatar` 标记找角色，不再需要这里的实体句柄：一旦挂成子节点，
         // 角色转身就会把相机一起拧走，朝向又耦合回去了
         //
-        // 联网模式下角色实体由服务器复制下来（见 net.rs），本地不再生成，
-        // 否则会和复制实体重复，且两边都对同一个角色写 Transform
-        #[cfg(not(feature = "net"))]
-        commands.spawn((
-            Transform::from_xyz(0.0, 2.0, 0.0),
-            RigidBody::Dynamic,
-            // Avian 的 capsule 用「半径 + 不含半球的原柱长度」，
-            // rapier 的 capsule_y(half_height, radius) 等价于 capsule(0.2, 1.0)
-            Collider::capsule(0.2, 1.0),
-            // DebugRender::default().with_collider_color(Color::WHITE),
-            Restitution::new(0.3),
-            LinearDamping(0.3),
-            AngularDamping(0.3),
-            // SweptCcd::default(),
-            LockedAxes::ROTATION_LOCKED,
-            LinearVelocity::ZERO,
-            MovementController::default(),
-            // 角色不再被 look 输入直接拧头：它只拿一个目标朝向，按角速度追
-            Facing::default(),
-            InheritedVisibility::default(),
-            Visibility::Visible,
-            Avatar,
-        ));
+        // 只有**本地**这一局才自己生成角色：联机模式下的角色由服务器复制下来
+        // （见 net.rs），客户端不能再建一个，否则两边都写同一个角色的 Transform。
+        //
+        // 注意这里看的是运行时 `SessionMode`，不看编译特性：pc 二进制带 `net`，
+        // 但它也能从大厅点「本地游戏」进来，那条路必须有自己的角色。
+        if matches!(*mode, SessionMode::Local) {
+            commands.spawn((
+                Transform::from_xyz(0.0, 2.0, 0.0),
+                RigidBody::Dynamic,
+                // Avian 的 capsule 用「半径 + 不含半球的原柱长度」，
+                // rapier 的 capsule_y(half_height, radius) 等价于 capsule(0.2, 1.0)
+                Collider::capsule(0.2, 1.0),
+                // DebugRender::default().with_collider_color(Color::WHITE),
+                Restitution::new(0.3),
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                // SweptCcd::default(),
+                LockedAxes::ROTATION_LOCKED,
+                LinearVelocity::ZERO,
+                MovementController::default(),
+                // 角色不再被 look 输入直接拧头：它只拿一个目标朝向，按角速度追
+                Facing::default(),
+                InheritedVisibility::default(),
+                Visibility::Visible,
+                Avatar,
+            ));
+        }
 
         // 相机不再是角色的子节点：挂着就会被角色的旋转带走，朝向永远耦合。
         // 现在它自己存一份偏航/俯仰（look 输入积分），机位每帧由 orbit_camera 重算；

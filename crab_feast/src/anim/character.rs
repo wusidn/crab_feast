@@ -161,6 +161,38 @@ impl AnimRuntime {
         self.last_delta = Vec3::ZERO;
         self.offset = Vec3::ZERO;
     }
+
+    /// 本地角色的模型与动画图都建好了吗。
+    ///
+    /// 这是「世界就绪」的判据之一：模型实体在、动画 player 在、场景不再等异步加载。
+    /// 远端角色走的是 `RemotePose`，不看这里。
+    pub fn is_ready(&self) -> bool {
+        self.model.is_some() && self.player.is_some() && !self.awaiting_scene
+    }
+
+    /// 退出场景时把「本局世界里的实体句柄」全部丢掉。
+    ///
+    /// 只清句柄，不清 `clips`（资产句柄还指向已加载的剪辑，留着下次直接用）。
+    /// 不重置的话，重新进场景时 `spawned_character` 仍是上一局的索引，
+    /// `request_character` 会判 `up_to_date` 直接返回，角色模型永远不再生成。
+    pub(crate) fn reset_for_new_session(&mut self) {
+        self.model = None;
+        self.player = None;
+        self.spawned_character = None;
+        self.playing_animation = None;
+        self.applied_speed = 0.0;
+        self.awaiting_scene = false;
+        self.nodes.clear();
+        self.hips = None;
+        self.hips_base = None;
+        self.last_delta = Vec3::ZERO;
+        self.offset = Vec3::ZERO;
+        self.clips_for = None;
+        self.pending_character = None;
+        self.pending_rig = None;
+        self.pending_clips.clear();
+        self.pending_clips_for_graph.clear();
+    }
 }
 
 impl Plugin for CharacterPlugin {
@@ -492,7 +524,7 @@ fn apply_character_when_loaded(
     runtime.pending_character = None;
 
     if let Some(old) = runtime.model.take() {
-        commands.entity(old).despawn();
+        commands.entity(old).try_despawn();
     }
 
     let model = commands

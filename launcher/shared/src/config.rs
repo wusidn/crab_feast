@@ -170,6 +170,9 @@ pub fn config_path_from_args() -> Option<PathBuf> {
         if arg == "--config" {
             return args.next().map(PathBuf::from);
         }
+        if let Some(path) = arg.strip_prefix("--config=") {
+            return Some(PathBuf::from(path));
+        }
     }
     None
 }

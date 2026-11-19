@@ -18,7 +18,8 @@ impl Plugin for AssetLoadingPlugin {
             .add_loading_state(
                 LoadingState::new(GameState::AssetLoading)
                     .load_collection::<GameAssets>()
-                    .continue_to_state(GameState::Game),
+                    // 启动资源加载完先进大厅：选服务器或本地游戏，登录成功才建场景
+                    .continue_to_state(GameState::Lobby),
             );
     }
 }

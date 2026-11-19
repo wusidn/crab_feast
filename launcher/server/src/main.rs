@@ -20,6 +20,8 @@ use crab_feast_library::net::{
     ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR, JoinRequest, MOVE_SPEED_MPS, MoveInput,
     NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId, NetPos, NetYaw, TICK_HZ, Welcome,
 };
+mod beacon;
+
 use crab_feast_library::tuning;
 use lightyear::{
     netcode::prelude::server::{NetcodeConfig, NetcodeServer},
@@ -79,6 +81,7 @@ fn main() {
     // 物理与轻年都跑 FixedUpdate，把步长对齐到同一个 tick，避免两边时钟各走各的
     .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
     .add_systems(Startup, setup)
+    .add_systems(Update, beacon::broadcast)
     .add_observer(on_new_link)
     .add_observer(on_disconnect)
     .add_systems(
@@ -222,6 +225,9 @@ fn setup(mut commands: Commands, addr: Res<ServerAddr>) {
     spawn_static_level(&mut commands);
 
     info!("dedicated server listening on {}", addr.0);
+
+    // 定时 UDP 广播自己的地址/端口/人数，客户端大厅直接收，不用手输地址
+    beacon::start(&mut commands, addr.0);
 }
 
 /// 连接建立：只把这条连接需要的收发能力装上，**不建角色**。

@@ -40,6 +40,39 @@ pub const NETCODE_PROTOCOL_ID: u64 = 0x1_0C2B_FEA5;
 /// 客户端只拿到 token。这里的明文私钥只用于本地开发 / 自建测试服。
 pub const NETCODE_DEV_KEY: [u8; 32] = [0x42; 32];
 
+/// 服务器发现广播端口。
+///
+/// 服务端每两秒往这个端口广播一条 [`ServerAnnounce`]；客户端在大厅页监听它，
+/// 把「现在能连的服务器」直接列出来，不需要玩家手输地址。
+/// 同机多开客户端时多个进程会绑同一个端口，所以监听端必须开 `SO_REUSEPORT`。
+pub const DISCOVERY_PORT: u16 = 5098;
+
+/// 广播包的协议标记：只认自己人发的包，避免把同网段的其它 UDP 流量当服务器。
+pub const DISCOVERY_MAGIC: &str = "crab_feast/announce";
+
+/// 服务端广播的自我介绍。
+///
+/// `addr` 是服务端实际监听地址的字符串形式：
+/// - 绑到具体网卡 / `127.0.0.1` 时客户端直接用这个地址；
+/// - 绑到 `0.0.0.0` 时这里是未指定地址，客户端改用「广播包的源 IP + `port`」——
+///   局域网里服务端不知道自己该对外报哪个网卡地址，但收包方能从 IP 头里拿到。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServerAnnounce {
+    pub magic: String,
+    /// 显示名（默认取机器名）
+    pub name: String,
+    /// 监听地址字符串，可能含未指定 IP
+    pub addr: String,
+    /// 监听端口（`addr` 解析失败时用它 + 源 IP 兜底）
+    pub port: u16,
+    /// 当前房间里的玩家数
+    pub players: u8,
+    /// 房间上限
+    pub max_players: u8,
+    /// 服务器 tick 频率，客户端用来核对协议/手感是否匹配
+    pub tick_hz: f32,
+}
+
 /// 复制到客户端的角色位置（米）。
 ///
 /// 用数组而不是 `Vec3`：协议层不希望依赖 glam 的 serde 实现，
