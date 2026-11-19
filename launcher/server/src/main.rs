@@ -15,6 +15,7 @@ use bevy::{
     transform::TransformPlugin,
 };
 use crab_feast_launcher::config::{LauncherConfig, config_path_from_args};
+use crab_feast_library::level::spawn_static_level;
 use crab_feast_library::net::{
     ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR, JoinRequest, MOVE_SPEED_MPS, MoveInput,
     NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId, NetPos, NetYaw, TICK_HZ, Welcome,
@@ -24,9 +25,6 @@ use lightyear::{
     netcode::prelude::server::{NetcodeConfig, NetcodeServer},
     prelude::{server::*, *},
 };
-
-/// 关卡内容（服务端权威）：每块地面/方块都是这个模块里 spawn 的实体。
-mod level;
 
 /// 起跳初速度（米/秒）。
 const JUMP_SPEED: f32 = 5.0;
@@ -219,9 +217,9 @@ fn setup(mut commands: Commands, addr: Res<ServerAddr>) {
         .id();
     commands.trigger(Start { entity: server });
 
-    // 关卡（地面 + 方块）：全部是实体，客户端通过复制拿到它们自己渲染。
-    // 服务端没有渲染层，实体上只挂碰撞体与 `LevelBlock`，见 `level` 模块
-    level::spawn_level(&mut commands);
+    // 关卡（地面 + 方块）：静态场景由两端各自构建，服务端这份就是权威碰撞几何。
+    // 客户端用同一份 `LEVEL` 在本地建实体，所以这里既不需要复制，也不会两边分叉
+    spawn_static_level(&mut commands);
 
     info!("dedicated server listening on {}", addr.0);
 }

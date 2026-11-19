@@ -67,6 +67,13 @@ pub struct FootIkSet;
 pub struct FootIkSettings {
     /// 总开关。关掉时所有角色的 `blend` 都会平滑降到 0，求解整段跳过
     pub enabled: bool,
+    /// 模拟端（联机时复制下来的其他玩家）单独开关。
+    ///
+    /// 远端角色的脚部数据是「服务器给的实测速度 + 混合空间姿态」，没有本地
+    /// 物理兜底，所以有时候会想单独关掉它（例如排查远端滑步、或者远端数量多时
+    /// 省开销），而不想连带把本地角色的锁脚一起停掉。
+    /// 判定「谁是模拟端」看实体上有没有 [`FootIkTarget`]。
+    pub remote_enabled: bool,
     /// 目标权重 0→1 的过渡时长（秒）。0 表示硬切（不推荐：会看到膝盖瞬移）
     pub blend_secs: f32,
     /// 锚点最多允许偏离脚踝多少米（参考骨架口径，见结构体注释的换算约定），
@@ -158,6 +165,7 @@ impl Default for FootIkSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            remote_enabled: true,
             // 80ms 大约是 5 帧：足够盖住膝盖的一次跳变，又快到跟手
             blend_secs: 0.08,
             max_correction: 0.22,
@@ -190,6 +198,16 @@ impl Default for FootIkSettings {
             // 80ms ≈ 5 帧：够把十几度的差价摊平，又不至于落地后脚掌还在飘
             foot_landing_secs: 0.08,
         }
+    }
+}
+
+impl FootIkSettings {
+    /// 这具骨架这一帧该不该解 IK：总开关 + 本角色开关 + （模拟端）模拟端开关。
+    ///
+    /// 射线和求解必须共用这一个判据：只管求解不管射线的话，开关关掉后每帧
+    /// 还在每个角色身上打两条向下的物理射线，一整场都在白发。
+    fn is_active(&self, ik: &FootIk, remote: bool) -> bool {
+        self.enabled && ik.enabled && (!remote || self.remote_enabled)
     }
 }
 
@@ -609,16 +627,17 @@ fn rig_is_stale(
 /// 也能在台阶边缘那几帧量到下一层而不是被自己挡住。
 fn sample_ground(
     settings: Res<FootIkSettings>,
-    mut iks: Query<&mut FootIk>,
+    mut iks: Query<(&mut FootIk, Option<&FootIkTarget>)>,
     transforms: Query<&Transform>,
     spatial: SpatialQuery,
 ) {
-    for mut ik in &mut iks {
+    for (mut ik, remote) in &mut iks {
         let mut ground = [None; 2];
-        if settings.ground_probe
-            && settings.enabled
-            && let Some(rig) = ik.rig.as_ref()
-        {
+        // 这条射线只服务 IK：开关关掉、或者这台角色已经淡出到 0，就不该再打。
+        // `blend` 是上一帧的淡出进度，所以关掉后最多再走完一个 `blend_secs`
+        let probing =
+            settings.ground_probe && settings.is_active(&ik, remote.is_some()) && ik.blend > 0.0;
+        if probing && let Some(rig) = ik.rig.as_ref() {
             // 排除角色自身：射线要穿过的第一个东西否则就是自己的胶囊/脚掌
             let filter =
                 SpatialQueryFilter::from_excluded_entities(rig.spine.iter().copied().chain(
@@ -766,14 +785,15 @@ fn calibrate_at_rest(
 fn solve_foot_ik(
     time: Res<Time>,
     settings: Res<FootIkSettings>,
-    mut iks: Query<&mut FootIk>,
+    mut iks: Query<(&mut FootIk, Option<&FootIkTarget>)>,
     mut transforms: Query<&mut Transform>,
 ) {
     let dt = time.delta_secs();
 
-    'character: for mut ik in &mut iks {
-        // 目标权重：全局开 + 本角色开。关掉时平滑淡出而不是直接跳没
-        let want = if settings.enabled && ik.enabled {
+    for (mut ik, remote) in &mut iks {
+        // 目标权重：全局开 + 本角色开 + （模拟端）模拟端开。
+        // 关掉时平滑淡出而不是直接跳没
+        let want = if settings.is_active(&ik, remote.is_some()) {
             1.0
         } else {
             0.0
@@ -856,13 +876,13 @@ fn solve_foot_ik(
         let mut poses: [Option<LegPose>; 2] = [None; 2];
         for (index, leg) in rig.legs.iter().enumerate() {
             let Some(upper) = transforms.get(leg.upper).ok().map(|transform| *transform) else {
-                continue 'character;
+                continue;
             };
             let Some(lower) = transforms.get(leg.lower).ok().map(|transform| *transform) else {
-                continue 'character;
+                continue;
             };
             let Some(foot) = transforms.get(leg.foot).ok().map(|transform| *transform) else {
-                continue 'character;
+                continue;
             };
 
             let upper_world = spine_world * upper.compute_affine();
@@ -2018,6 +2038,69 @@ mod tests {
         assert!(((foot - joint).length() - (pose.end - pose.joint).length()).abs() < 1e-4);
         // 目标在 +Z 更远处，脚只会落在可达边界，不会跟过去
         assert!(foot.z < 0.6);
+    }
+
+    /// 模拟端开关只关带 `FootIkTarget` 的骨架：本地角色照旧、远端单独停。
+    ///
+    /// 权重是每帧按 `want` 逼近的，所以直接读 `blend` 就能看出门控有没有生效
+    /// （不需要真骨架：`want` 在拿 rig 之前就算完了）。
+    #[test]
+    fn remote_rigs_obey_their_own_switch() {
+        fn blends(settings: FootIkSettings) -> (f32, f32) {
+            let mut app = App::new();
+            app.insert_resource(settings);
+            app.insert_resource(Time::<()>::default());
+            let world = app.world_mut();
+            let local = world
+                .spawn(FootIk {
+                    blend: 1.0,
+                    ..FootIk::default()
+                })
+                .id();
+            let remote = world
+                .spawn((
+                    FootIk {
+                        blend: 1.0,
+                        ..FootIk::default()
+                    },
+                    FootIkTarget,
+                ))
+                .id();
+            for _ in 0..10 {
+                app.world_mut()
+                    .resource_mut::<Time>()
+                    .advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
+                app.world_mut()
+                    .run_system_once(solve_foot_ik)
+                    .expect("脚部 IK 系统跑不起来");
+            }
+            let world = app.world();
+            (
+                world.get::<FootIk>(local).expect("本地").blend,
+                world.get::<FootIk>(remote).expect("远端").blend,
+            )
+        }
+
+        // 远端关：远端淡到 0，本地不动
+        let (local, remote) = blends(FootIkSettings {
+            remote_enabled: false,
+            ..FootIkSettings::default()
+        });
+        assert!(remote < 1e-3, "远端应该淡出到 0，实际 {remote}");
+        assert!(local > 0.99, "本地不该受影响，实际 {local}");
+
+        // 远端开：两边都保持
+        let (local, remote) = blends(FootIkSettings::default());
+        assert!(remote > 0.99, "远端开着就该保持，实际 {remote}");
+        assert!(local > 0.99, "本地开着就该保持，实际 {local}");
+
+        // 总开关关：两边都掉
+        let (local, remote) = blends(FootIkSettings {
+            enabled: false,
+            ..FootIkSettings::default()
+        });
+        assert!(remote < 1e-3, "总开关关掉远端也该停，实际 {remote}");
+        assert!(local < 1e-3, "总开关关掉本地也该停，实际 {local}");
     }
 
     /// 系统级验证：身体持续转动时，支撑脚应当钉在原地不动。

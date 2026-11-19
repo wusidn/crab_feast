@@ -11,6 +11,8 @@ net = ["dep:lightyear", "dep:serde"]
 
 [dependencies]
 bevy.workspace = true
+# 共享关卡定义直接建静态刚体 + 碰撞体：两端调同一个函数，几何不可能分叉
+avian3d.workspace = true
 serde = { workspace = true, optional = true }
 lightyear = { version = "0.31", optional = true, default-features = false, features = [
     "std",

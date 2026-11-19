@@ -120,11 +120,10 @@ impl Plugin for CrabProtocolPlugin {
         app.component::<NetYaw>().replicate();
         app.component::<NetMotion>().replicate();
         app.component::<NetPlayerId>().replicate_once();
-        // 关卡方块：**服务端权威**。服务端 spawn 实体（碰撞体 + LevelBlock），
-        // 客户端收到后自己补 mesh。以前客户端按共享常量摆方块，等于在客户端
-        // 编造关卡内容——服务端改了它不知道，还会出现「地板挡得住、方块挡不住」
-        // 这种一半有一半没有的局面。静态物体只发一次，不占后续带宽。
-        app.component::<crate::level::LevelBlock>().replicate_once();
+        // 关卡几何**不进协议**：静态场景是设计数据，两端各自从
+        // `crab_feast_library::level::LEVEL` 建实体（见 `spawn_static_level`）。
+        // 复制一份只读几何除了占握手带宽，还会让客户端出现「复制体 + 本地体」
+        // 两份碰撞体，物理里同一个方块被解算两次。
 
         // 通道：输入要低延迟，控制要可靠。
         //

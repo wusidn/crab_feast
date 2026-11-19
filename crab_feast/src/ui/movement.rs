@@ -7,8 +7,10 @@
 //! ├─ 开关卡片    输入平滑                        [开启]
 //! ├─ 系数卡片    平滑系数                0.50
 //! │              轨道 ──────────────●──────────
-//! └─ 开关卡片    脚部 IK（锁脚防滑步）           [开启]
-//!                权重 …·修正 … m（实时读数）
+//! ├─ 开关卡片    脚部 IK（锁脚防滑步）           [开启]
+//! │              权重 …·修正 … m（实时读数）
+//! └─ 开关卡片    模拟端脚部 IK（远端角色）          [开启]
+//!                远端 N 具·本帧最大修正 … m
 //! ```
 //!
 //! 交互是闭环的：控件改动写回对应资源，同步系统再把资源状态刷回界面。
@@ -46,6 +48,14 @@ pub struct FootIkToggle;
 #[derive(Component, Clone, Default)]
 pub struct FootIkStatus;
 
+/// 模拟端（联机远端角色）脚部 IK 开关按钮
+#[derive(Component, Clone, Default)]
+pub struct RemoteFootIkToggle;
+
+/// 模拟端脚部 IK 实时读数（远端具数 / 本帧最大修正）
+#[derive(Component, Clone, Default)]
+pub struct RemoteFootIkStatus;
+
 /// 卡片底色（比面板稍亮一点，用来分隔区块）
 const CARD_BACKGROUND: Color = Color::srgba(0.16, 0.18, 0.24, 0.55);
 /// 开关「关」时的底色
@@ -74,6 +84,8 @@ impl Plugin for MovementSettingsPlugin {
                 update_smoothing_factor_label.run_if(in_state(GameState::Game)),
                 update_foot_ik_label.run_if(in_state(GameState::Game)),
                 update_foot_ik_status.run_if(in_state(GameState::Game)),
+                update_remote_foot_ik_label.run_if(in_state(GameState::Game)),
+                update_remote_foot_ik_status.run_if(in_state(GameState::Game)),
             ),
         );
     }
@@ -122,6 +134,7 @@ fn page_scene(
     foot_ik: &FootIkSettings,
 ) -> impl Scene + use<> {
     let foot_ik_enabled = foot_ik.enabled;
+    let remote_foot_ik_enabled = foot_ik.remote_enabled;
     bsn! {
         Node {
             width: Val::Percent(100.0),
@@ -135,6 +148,8 @@ fn page_scene(
             @{factor_card(settings)}
             --
             @{foot_ik_card(foot_ik_enabled)}
+            --
+            @{remote_foot_ik_card(remote_foot_ik_enabled)}
         ]
     }
 }
@@ -340,6 +355,120 @@ fn foot_ik_card(enabled: bool) -> impl Scene + use<> {
     }
 }
 
+/// 模拟端脚部 IK 卡片：只关远端角色（`FootIkTarget` 标记的那些），本地角色照旧。
+///
+/// 远端没有本地物理兜底，脚部数据全靠服务器实测速度 + 混合空间姿态，排查远端
+/// 滑步/髋锁时常常需要单独停掉它；和总开关分开，免得连带把本地锁脚也关了。
+/// 下面一行是实时读数：当前有几具远端骨架在解、这一帧最大修正多少米。
+fn remote_foot_ik_card(enabled: bool) -> impl Scene + use<> {
+    let toggle_color = if enabled { TOGGLE_ON } else { TOGGLE_IDLE };
+    let toggle_text = if enabled { "开启" } else { "关闭" };
+
+    bsn! {
+        Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(4.0),
+            padding: UiRect::axes(Val::Px(12.0), Val::Px(12.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(8.0)),
+        }
+        BackgroundColor(CARD_BACKGROUND)
+        BorderColor::all(widgets::BORDER_SOFT)
+        Children [
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+            }
+            Children [
+                @{widgets::text("模拟端脚部 IK（远端角色）", 14.0, widgets::TEXT_COLOR)}
+                --
+                Node {
+                    width: Val::Px(52.0),
+                    height: Val::Px(26.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border_radius: BorderRadius::all(Val::Px(13.0)),
+                }
+                Text::new(toggle_text)
+                TextFont { font_size: FontSize::Px(12.0) }
+                TextColor(Color::WHITE)
+                BackgroundColor(toggle_color)
+                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.22))
+                RemoteFootIkToggle
+                on(|mut click: On<PointerClick>, mut settings: ResMut<FootIkSettings>| {
+                    if click.button != PointerButton::Primary {
+                        return;
+                    }
+                    click.propagate(false);
+                    settings.remote_enabled = !settings.remote_enabled;
+                })
+            ]
+            --
+            Text::new("")
+            TextFont { font_size: FontSize::Px(11.0) }
+            TextColor(Color::srgba(0.86, 0.86, 0.86, 0.72))
+            RemoteFootIkStatus
+        ]
+    }
+}
+
+/// 更新模拟端脚部 IK 开关标签显示
+fn update_remote_foot_ik_label(
+    settings: Res<FootIkSettings>,
+    mut toggle_labels: Query<(&mut Text, &mut BackgroundColor), With<RemoteFootIkToggle>>,
+) {
+    let (new_text, color) = if settings.remote_enabled {
+        ("开启", widgets::BUTTON_SELECTED)
+    } else {
+        ("关闭", TOGGLE_IDLE)
+    };
+    for (mut text, mut bg_color) in &mut toggle_labels {
+        if text.0 != new_text {
+            text.0 = new_text.to_string();
+        }
+        if bg_color.0 != color {
+            bg_color.0 = color;
+        }
+    }
+}
+
+/// 更新模拟端实时读数：远端具数 + 本帧最大修正距离
+fn update_remote_foot_ik_status(
+    settings: Res<FootIkSettings>,
+    iks: Query<(&FootIk, &crate::anim::FootIkTarget)>,
+    mut labels: Query<&mut Text, With<RemoteFootIkStatus>>,
+) {
+    let line = if !settings.enabled {
+        "总开关已关闭".to_string()
+    } else if !settings.remote_enabled {
+        "已关闭（远端角色按动画姿态落地）".to_string()
+    } else {
+        let mut ready = 0usize;
+        let mut worst = 0.0f32;
+        for (ik, _) in &iks {
+            if !ik.is_ready() {
+                continue;
+            }
+            ready += 1;
+            let [left, right] = ik.correction();
+            worst = worst.max(left.max(right));
+        }
+        if ready == 0 {
+            "当前没有远端角色".to_string()
+        } else {
+            format!("远端 {ready} 具 · 本帧最大修正 {worst:.3} m")
+        }
+    };
+    for mut text in &mut labels {
+        if text.0 != line {
+            text.0 = line.clone();
+        }
+    }
+}
+
 /// 更新脚部 IK 开关标签显示
 fn update_foot_ik_label(
     settings: Res<FootIkSettings>,
@@ -364,7 +493,8 @@ fn update_foot_ik_label(
 fn update_foot_ik_status(
     settings: Res<FootIkSettings>,
     scale: Res<DebugTimeScale>,
-    ik: Query<&FootIk>,
+    // 只看本地角色：远端骨架也带 `FootIk`，混在一起读数会随机挑到远端
+    ik: Query<&FootIk, Without<crate::anim::FootIkTarget>>,
     facing: Query<(&FacingState, &FacingController)>,
     mut labels: Query<&mut Text, With<FootIkStatus>>,
 ) {
@@ -513,9 +643,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// 页面必须是「根 → 三张卡片 → 卡片内的行/控件」的嵌套，而不是一列扁平兄弟
+    /// 页面必须是「根 → 四张卡片 → 卡片内的行/控件」的嵌套，而不是一列扁平兄弟
     #[test]
-    fn page_is_three_cards_with_nested_controls() {
+    fn page_is_four_cards_with_nested_controls() {
         let (app, body) = build_test_page();
         let world = app.world();
 
@@ -523,7 +653,11 @@ mod tests {
         assert_eq!(roots.len(), 1, "页面根应该只有一个");
         let root = roots[0];
         let cards = children_of(world, root);
-        assert_eq!(cards.len(), 3, "应该是输入平滑开关卡片 + 系数卡片 + 脚部 IK 卡片");
+        assert_eq!(
+            cards.len(),
+            4,
+            "应该是输入平滑开关卡片 + 系数卡片 + 脚部 IK 卡片 + 模拟端脚部 IK 卡片"
+        );
 
         // 开关卡片：标签和按钮都得在卡片里
         let toggle_card = cards[0];
@@ -579,10 +713,40 @@ mod tests {
         assert!(world.get::<FootIkToggle>(ik_row_children[1]).is_some());
         assert!(world.get::<FootIkStatus>(ik_children[1]).is_some());
 
-        // 默认状态：脚部 IK 开
+        // 模拟端脚部 IK 卡片：同样的「开关行 + 读数行」结构，标记必须是独立的那一对，
+        // 否则两个开关会互相改写对方的状态
+        let remote_card = cards[3];
+        let remote_children = children_of(world, remote_card);
+        assert_eq!(remote_children.len(), 2, "模拟端卡片 = 开关行 + 读数行");
+        let remote_row = children_of(world, remote_children[0]);
+        assert_eq!(remote_row.len(), 2, "开关行 = 标签 + 按钮");
+        assert!(
+            world.get::<RemoteFootIkToggle>(remote_row[1]).is_some(),
+            "模拟端开关按钮要有自己的标记"
+        );
+        assert!(
+            world.get::<FootIkToggle>(remote_row[1]).is_none(),
+            "模拟端按钮不能复用本地脚部 IK 的标记"
+        );
+        assert!(
+            world
+                .get::<RemoteFootIkStatus>(remote_children[1])
+                .is_some(),
+            "模拟端读数行要有自己的标记"
+        );
+        assert!(
+            world.get::<FootIkStatus>(remote_children[1]).is_none(),
+            "模拟端读数不能复用本地读数标记"
+        );
+
+        // 默认状态：总开关关、模拟端开
         assert!(
             app.world().resource::<FootIkSettings>().enabled,
             "脚部 IK 默认应该是开启"
+        );
+        assert!(
+            app.world().resource::<FootIkSettings>().remote_enabled,
+            "模拟端脚部 IK 默认应该是开启"
         );
     }
 }

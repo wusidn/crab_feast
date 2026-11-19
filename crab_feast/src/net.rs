@@ -17,6 +17,7 @@
 
 use std::net::SocketAddr;
 
+use avian3d::prelude::*;
 use bevy::{
     animation::{AnimatedBy, AnimationTargetId},
     prelude::*,
@@ -89,6 +90,9 @@ impl Plugin for NetPlugin {
             CrabProtocolPlugin,
         ))
         .add_systems(Startup, setup_visual_assets)
+        // 物理步长与服务器 tick 对齐：两端都是 60Hz，静态场景与角色碰撞在同一
+        // 时间粒度上演算；步长不一致时，同一段位移在两侧会解出不同的接触结果
+        .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .init_resource::<LoginPhase>()
         .add_systems(OnEnter(GameState::Game), connect)
         .add_observer(spawn_remote_visual)
@@ -197,6 +201,14 @@ fn connect(mut commands: Commands, config: Res<NetConfig>) {
 }
 
 /// 远端实体复制下来后补上渲染：服务器只发状态，不发美术。
+///
+/// 同时把角色放进客户端物理世界：静态场景两端各自构建（见
+/// [`crab_feast_library::level::spawn_static_level`]），所以这里挂的碰撞体有真实
+/// 几何可解 —— 射线、接触查询、将来的本地预测都靠它。
+///
+/// 刚体是**运动学**的：位移仍由服务器的 `NetPos` 写，物理只负责扫掠与查询，
+/// 不反过来积分位置。要变成"客户端自己跑角色物理"，把这里换成 `Dynamic` +
+/// lightyear 的预测/回滚即可，静态场景这一层已经就位。
 fn spawn_remote_visual(
     trigger: On<Add<NetPos>>,
     mut commands: Commands,
@@ -207,6 +219,11 @@ fn spawn_remote_visual(
         Mesh3d(visuals.mesh.clone()),
         MeshMaterial3d(visuals.material.clone()),
         Visibility::Visible,
+        // 与服务器同参数：半径 0.2、圆柱段 1.0
+        Collider::capsule(0.2, 1.0),
+        // Avian 0.8 的刚体只有 Dynamic / Static / Kinematic 三档：
+        // Kinematic 不参与积分，组件由我们自己写，正好匹配"位置由服务器给"
+        RigidBody::Kinematic,
     ));
 }
 
