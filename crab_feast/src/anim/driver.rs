@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 
 use super::character::{AnimCatalog, AnimRuntime, AnimSelection};
-use super::core::pose::BonePose;
+use super::core::pose::{BonePose, Pose};
 use super::core::{ClipSet, SpaceEvalContext, evaluate_space};
-use super::mixers::MixerCache;
+use super::jump::JumpAction;
+use super::mixers::{LocomotionMixer, MixerCache, RegisteredMixer};
 use bevy::{
     animation::{AnimatedBy, AnimationClip, AnimationTargetId},
     prelude::*,
@@ -101,6 +102,7 @@ pub(crate) fn drive_pose(
     runtime: Res<AnimRuntime>,
     clips: Res<ClipSet>,
     clip_assets: Res<Assets<AnimationClip>>,
+    jump: Res<JumpAction>,
     time: Res<Time>,
     children: Query<&Children>,
     targets: Query<(&AnimationTargetId, Option<&AnimatedBy>)>,
@@ -154,6 +156,8 @@ pub(crate) fn drive_pose(
     let mut last_root_delta = Vec3::ZERO;
     let mut last_ground_speed = 0.0;
     let mut last_contacts = [0.0; 2];
+    // 最后一个生效者的姿态：动作层要在它之上叠加，最后统一写一次骨骼
+    let mut last_pose: Option<Pose> = None;
     let mut any = false;
 
     // 预览聚焦时只驱动那一个；关闭编辑器后按「启用」顺序驱动当前角色的混合器
@@ -173,6 +177,15 @@ pub(crate) fn drive_pose(
     for mixer in selected {
         any = true;
         let phase = phases.entry(mixer.key.clone()).or_insert(0.0);
+        // 动作层接管期间移动相位必须由动作层说话，不能让混合器自己走：蓄力 /
+        // 滞空段一脚都没着地，相位爱怎么走都无所谓，但落地恢复段要是放它自走
+        // 0.24s 就走掉 0.343 个周期（比整段支撑期 0.208 还长），交接时支撑会换到
+        // 另一只脚，看上去就是「步频少了一拍」。
+        //
+        // 恢复段的相位由 jump.rs 每帧写（`follow_landing_phase`）：起点退到
+        // 动作末帧那只着地脚的支撑位置之前一个恢复段，再按移动剪辑的原生速度
+        // 往前推，交回那一刻正好落在着地脚的支撑位置上。这里只负责别让它偷跑。
+        let hold = jump.is_active() && mixer.key == LocomotionMixer::ID;
         let mut context = SpaceEvalContext {
             params: &mixer.params,
             clips: &clips,
@@ -181,41 +194,65 @@ pub(crate) fn drive_pose(
             rest: &skeleton.rest,
             phase,
             dt: time.delta_secs(),
-            speed_scale: 1.0,
+            speed_scale: if hold { 0.0 } else { 1.0 },
             hips: skeleton.hips,
         };
 
         let output = evaluate_space(&mixer.space, &mut context);
 
-        if !preview {
-            for (id, bone) in output.pose.iter() {
-                if let Some(entity) = skeleton.by_id.get(id)
-                    && let Ok(mut transform) = transforms.get_mut(*entity)
-                {
-                    bone.apply_to(&mut transform);
-                }
-            }
-        }
-        last_weights = output.clip_weights.clone();
-        last_issues = output.issues.clone();
+        last_weights = output.clip_weights;
+        last_issues = output.issues;
         last_point = output.point;
         last_root_delta = output.root_delta;
         last_contacts = output.contacts;
         // 多个混合器叠加时取最后一个求值者的地速：真正带动位移的总是它
         last_ground_speed = output.ground_speed;
+        last_pose = Some(output.pose);
     }
 
     *weights = last_weights;
     *issues = last_issues;
     *point = last_point;
     *ground_speed = if any { last_ground_speed } else { 0.0 };
-    *contacts = if any { last_contacts } else { [0.0; 2] };
+    // 动作层接管期间两只脚都不该钉地：脚 IK 的落锁判据来自这里，
+    // 否则蓄力和落地时会「钉住一只、放开另一只」
+    *contacts = if any && !jump.is_active() {
+        last_contacts
+    } else {
+        [0.0; 2]
+    };
     *evaluated = any;
     // 没写骨骼就不能声称自己拥有姿态，否则单条剪辑的根运动补偿会一直让位
     *active = any && !preview;
 
     if !any || preview {
         return;
+    }
+
+    if let Some(mut pose) = last_pose {
+        super::jump::apply_action(
+            &jump,
+            &clips,
+            &clip_assets,
+            &skeleton.targets,
+            &skeleton.rest,
+            &mut pose,
+        );
+        for (id, bone) in pose.iter() {
+            if let Some(entity) = skeleton.by_id.get(id)
+                && let Ok(mut transform) = transforms.get_mut(*entity)
+            {
+                bone.apply_to(&mut transform);
+            }
+        }
+        // 空中把髋的竖直平移钉在起跳高度：角色升高由胶囊根承担（见 jump.rs）
+        if jump.is_airborne()
+            && let Some(hips) = skeleton.hips
+            && let Some(entity) = skeleton.by_id.get(&hips)
+            && let Ok(mut transform) = transforms.get_mut(*entity)
+        {
+            transform.translation.y = jump.hips_freeze;
+        }
     }
     if !selection.root_motion {
         // 关闭根运动时把 hips 的水平位移锁回静息位置，避免人物离开展台

@@ -238,6 +238,7 @@ impl FootLock {
         self.residual = Vec3::ZERO;
         self.strength = 0.0;
         self.progress = 0.0;
+        self.release_airborne();
         self.roll = 0.0;
         self.heel = 0.0;
         self.heel_dir = Vec3::ZERO;
@@ -251,6 +252,19 @@ impl FootLock {
         self.anim_speed = 0.0;
         self.toe_floor = None;
         self.toe_floor_probed = false;
+        self.presence = 0.0;
+    }
+
+    /// 腾空（跳跃离空）时立刻放下支撑期攒下的位置残差：这一段脚完全交给
+    /// 动画剪辑，旧地面锚点不能再把踝往起跳点拉，否则身体升起来、脚被留在
+    /// 原地，腿被绷成垂直一条。
+    ///
+    /// 只清位置债与强度，保留 `planted`/`anchor` 与挪脚测速记忆：腾空时它们
+    /// 本就该是松开/空值，测速记忆留着供落地瞬间判断还残差的节奏。
+    pub fn release_airborne(&mut self) {
+        self.residual = Vec3::ZERO;
+        self.strength = 0.0;
+        self.progress = 0.0;
         self.presence = 0.0;
     }
 
@@ -786,6 +800,28 @@ mod tests {
             target = next;
         }
         assert_eq!(lock.residual(), Vec3::ZERO);
+    }
+
+    /// 腾空（跳跃离空）时位置债必须当帧放下：不能再按 release_secs 慢放，
+    /// 否则身体升起来、旧锚点把踝留在起跳点，腿被绷成垂直一条。
+    #[test]
+    fn release_airborne_drops_residual_and_strength() {
+        let cfg = config();
+        let mut lock = FootLock::default();
+        plant(&mut lock, Vec3::ZERO, 40, &cfg);
+        // 身体走开 10cm，支撑期攒下横向残差
+        let ankle = Vec3::new(0.10, 0.0, 0.0);
+        lock.update(FootContact::ankle_only(ankle), 1.0, true, DT, &cfg);
+        assert!(lock.strength() > 0.9);
+        assert!(lock.residual().length() > 0.05);
+
+        lock.release_airborne();
+        assert_eq!(lock.strength(), 0.0);
+        assert_eq!(lock.progress, 0.0);
+        assert_eq!(lock.residual(), Vec3::ZERO);
+        // 本方法只清位置债：支撑标记与锚点不动（腾空调用前它们已被松脚清掉）
+        assert!(lock.is_planted());
+        assert!(lock.anchor().is_some());
     }
 
     #[test]

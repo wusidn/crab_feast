@@ -2,7 +2,7 @@ use avian3d::prelude::LinearVelocity;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::anim::PoseDriver;
+use crate::anim::{JumpAction, PoseDriver};
 use crate::camera::CameraFacing;
 
 /// 控制链的执行顺序。
@@ -292,10 +292,7 @@ impl Plugin for ControlInputPlugin {
             // 整条链还要接着排到动画驱动之前，放在接线处比在这里声明一半清楚
             .add_systems(Update, movement_system.in_set(ControlSet::Move))
             .add_systems(Update, facing_system.in_set(ControlSet::Facing))
-            .add_systems(
-                Update,
-                jump_system.run_if(resource_changed::<MovementInput>),
-            )
+            .add_systems(Update, jump_keyboard.in_set(ControlSet::Move))
             .add_observer(look_system);
     }
 }
@@ -322,8 +319,14 @@ fn movement_system(
     camera: Res<CameraFacing>,
     settings: Res<MovementSettings>,
     time: Res<Time>,
+    jump: Option<Res<JumpAction>>,
     mut smoothing: ResMut<InputSmoothing>,
 ) {
+    // 滞空期不接管水平速度：没有地面反力，起跳瞬间的速度原样保留到落地。
+    // 落地那一帧状态已经回到 Land，下一帧就由输入重新决定档位。
+    if jump.as_ref().is_some_and(|jump| jump.is_airborne()) {
+        return;
+    }
     let local = match input.as_ref() {
         MovementInput::Activated { direction, force } => {
             Some((*direction, *force)).filter(|(local, _)| local.length_squared() > 1e-6)
@@ -574,9 +577,13 @@ fn look_system(
         });
 }
 
-fn jump_system(input: Res<JumpInput>) {
-    if let JumpInput::Activated = input.as_ref() {
-        // 跳跃逻辑
+/// 空格 → 跳跃请求。这里只维护「按下/松开」的状态，边沿锁存在动作层。
+fn jump_keyboard(keys: Res<ButtonInput<KeyCode>>, mut jump: ResMut<JumpInput>) {
+    if keys.just_pressed(KeyCode::Space) {
+        eprintln!("client: 空格键按下（JumpInput → Activated）");
+        *jump = JumpInput::Activated;
+    } else if keys.just_released(KeyCode::Space) {
+        *jump = JumpInput::Idle;
     }
 }
 

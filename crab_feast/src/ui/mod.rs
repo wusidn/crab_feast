@@ -1,7 +1,7 @@
 use bevy::app::{App, Plugin};
 
 mod blendspace;
-mod debug;
+pub(crate) mod debug;
 mod font;
 mod game_settings;
 mod input_layer;

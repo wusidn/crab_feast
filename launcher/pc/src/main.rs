@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_inspector_egui::{bevy_egui::EguiPlugin, quick::WorldInspectorPlugin};
-use crab_feast::{AutoJoin, AutoWalk, NetConfig, NetPlugin, SessionMode};
+use crab_feast::{AutoJoin, AutoJump, AutoWalk, NetConfig, NetPlugin, SessionMode};
 use crab_feast_launcher::{
     LaunchConfig, build_app,
     config::{LauncherConfig, config_path_from_args},
@@ -51,10 +51,24 @@ fn main() {
             app.insert_resource(AutoWalk(Timer::from_seconds(secs, TimerMode::Once)));
         }
 
+        if let Some(period) = args.auto_jump {
+            app.insert_resource(AutoJump::new(period));
+        }
+
         if let Some(path) = args.screenshot.clone() {
+            // TEMP: CRAB_SHOT_EVERY=0.0335 时从 8s 起连拍，用于看跑跳过程
+            let every = std::env::var("CRAB_SHOT_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok());
             app.insert_resource(ScreenshotPlan {
                 path,
                 timer: Timer::from_seconds(8.0, TimerMode::Once),
+                every,
+                next: std::env::var("CRAB_SHOT_AT")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(8.0),
+                index: 0,
             })
             .add_systems(Update, take_screenshot);
         }
@@ -75,6 +89,9 @@ fn main() {
 struct ScreenshotPlan {
     path: std::path::PathBuf,
     timer: Timer,
+    every: Option<f32>,
+    next: f32,
+    index: u32,
 }
 
 fn take_screenshot(
@@ -82,11 +99,31 @@ fn take_screenshot(
     mut plan: ResMut<ScreenshotPlan>,
     mut commands: Commands,
 ) {
-    if !plan.timer.tick(time.delta()).just_finished() {
+    let now = time.elapsed_secs();
+    let Some(every) = plan.every else {
+        if !plan.timer.tick(time.delta()).just_finished() {
+            return;
+        }
+        let path = plan.path.clone();
+        info!("screenshot: 保存到 {:?}", path);
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+        return;
+    };
+    if now < plan.next {
         return;
     }
-    let path = plan.path.clone();
-    info!("screenshot: 保存到 {:?}", path);
+    plan.next += every;
+    let stem = plan
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "shot".into());
+    let path = plan
+        .path
+        .with_file_name(format!("{stem}-{:03}.png", plan.index));
+    plan.index += 1;
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path));
@@ -105,6 +142,8 @@ struct Args {
     exit_after: Option<f32>,
     /// 自动前进多少秒（冒烟测试用，模拟一直推摇杆向前）
     auto_walk: Option<f32>,
+    /// 自动跳的周期秒数（冒烟测试用，模拟点按跳跃）
+    auto_jump: Option<f32>,
     /// 8 秒时把窗口画面存成 png（冒烟测试用）
     screenshot: Option<std::path::PathBuf>,
 }
@@ -132,6 +171,7 @@ fn parse_args() -> Args {
     let mut client_id: Option<u64> = None;
     let mut exit_after = None;
     let mut auto_walk = None;
+    let mut auto_jump = None;
     let mut window = None;
     let mut screenshot: Option<std::path::PathBuf> = None;
     let mut explicit_server = false;
@@ -184,6 +224,11 @@ fn parse_args() -> Args {
             "--auto-walk" => {
                 if let Some(value) = args.next() {
                     auto_walk = value.parse().ok();
+                }
+            }
+            "--auto-jump" => {
+                if let Some(value) = args.next() {
+                    auto_jump = value.parse().ok();
                 }
             }
             "--help" | "-h" => {
@@ -260,6 +305,7 @@ fn parse_args() -> Args {
         window,
         exit_after,
         auto_walk,
+        auto_jump,
         screenshot,
     }
 }

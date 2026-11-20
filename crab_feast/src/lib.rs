@@ -5,11 +5,14 @@ use bevy::{
 };
 use crab_feast_library::platform::PlatformInfo;
 
-mod anim;
+/// 动画层：跳跃档位与调参表要暴露给 dedicated server（蓄力/离地速度两端同源）。
+pub mod anim;
 mod assets;
 mod camera;
 #[cfg(feature = "net")]
 mod discovery;
+/// 脚下接地探测：客户端动画层与服务端物理共用（任意台面高度都成立）。
+pub mod ground;
 mod input;
 /// 关卡：静态场景的设计数据（地面 / 方块尺寸与位置）与本地构建入口。
 ///
@@ -27,7 +30,7 @@ pub use assets::GameAssets;
 #[cfg(feature = "net")]
 pub use discovery::{DiscoveryPlugin, ServerBrowser};
 #[cfg(feature = "net")]
-pub use net::{AutoWalk, LocalPlayer, NetConfig, NetPlugin};
+pub use net::{AutoJump, AutoWalk, LocalPlayer, NetConfig, NetPlugin};
 pub use state::{AutoJoin, GameState, LobbyNotice, SessionMode, SessionReady};
 
 pub fn build_app(app: &mut App) {

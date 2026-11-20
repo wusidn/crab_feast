@@ -16,6 +16,7 @@
 pub mod character;
 /// 与具体作品无关的混合空间层（文档 / 采样权重 / 姿态求值），只给本作用。
 pub mod core;
+pub mod jump;
 pub mod locomotion;
 pub mod mixers;
 
@@ -27,6 +28,9 @@ use bevy::prelude::*;
 
 pub use character::{AnimCatalog, AnimRuntime, AnimSelection, SPEED_RANGE};
 pub use driver::{AnimFocus, PoseDriver};
+pub use jump::JumpAction;
+/// 跳跃档位与调参表：服务端复用同一份（蓄力时长 / 离地速度两端必须同源）。
+pub use jump::{JumpKind, JumpProfile, JumpTuning, JumpTunings};
 // 联机远端姿态驱动要用（`net` 之外没有调用方）
 #[allow(unused_imports)]
 pub(crate) use driver::{Skeleton, build_skeleton};
@@ -63,6 +67,7 @@ impl Plugin for AnimPlugin {
             character::CharacterPlugin,
             mixers::MixerPlugin,
             locomotion::LocomotionPlugin,
+            jump::JumpPlugin,
             foot_ik::FootIkPlugin,
         ))
         .init_resource::<PoseDriver>()

@@ -14,11 +14,14 @@ use bevy::{
     state::app::StatesPlugin,
     transform::TransformPlugin,
 };
+use crab_feast::anim::jump::{JumpKind, JumpProfile, JumpTunings};
+use crab_feast::ground;
 use crab_feast::level::spawn_static_level;
 use crab_feast_launcher::config::{LauncherConfig, config_path_from_args};
 use crab_feast_library::net::{
     ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR, JoinRequest, MOVE_SPEED_MPS, MoveInput,
-    NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId, NetPos, NetYaw, TICK_HZ, Welcome,
+    NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId, NetPos, NetTimeScale, NetYaw,
+    TICK_HZ, TimeScaleRequest, Welcome,
 };
 mod beacon;
 
@@ -28,10 +31,18 @@ use lightyear::{
     prelude::{server::*, *},
 };
 
-/// 起跳初速度（米/秒）。
-const JUMP_SPEED: f32 = 5.0;
-/// 认为「站在地上」的高度阈值（胶囊半高 1.0 + 半径 0.2，地面在 y≈0）。
-const GROUND_EPSILON: f32 = 1.15;
+/// 跳跃的蓄力时长 / 离地速度由 `crab_feast::anim::jump::JumpTunings` 统一定义
+/// （跑跳 / 站跳 / 上跳 / 下跳各一档）。服务端不再自己写死一份数字：客户端调哪一档，
+/// 这里跟着一起变，两端不会再有「本地 2.6 / 服务端 5.0」的分叉。
+///
+/// 站 / 跑蓄力分档的地速分界（米/秒），与客户端 `RUN_JUMP_SPEED` 对齐。
+/// 只给测试断言用：正式分档走 `JumpProfile::for_jump`。
+#[cfg(test)]
+const RUN_JUMP_SPEED: f32 = 1.5;
+/// 贴地接触噪声允许的竖直速度（米/秒）。avian 的接触求解会留下 ±0.2 m/s
+/// 量级的残余速度（实测 0.192 反复出现），拿 0.1 当界线会把贴地当成「在蹬升」，
+/// 蓄力每 tick 被清掉、跳跃永远不触发。界线要拉开噪声一个量级。
+const GROUND_NOISE_VY: f32 = 0.5;
 /// 一个房间最多多少个玩家位。
 ///
 /// `player_id` 是 u8，但真正的上限是「复制带宽 ÷ 每人下行」，
@@ -77,6 +88,8 @@ fn main() {
         CrabProtocolPlugin,
     ))
     .insert_resource(Room::default())
+    // 四档跳跃调参：站 / 跑 / 上 / 下。与客户端默认值同源，调一处两端一致。
+    .init_resource::<JumpTunings>()
     .insert_resource(ServerAddr(addr))
     // 物理与轻年都跑 FixedUpdate，把步长对齐到同一个 tick，避免两边时钟各走各的
     .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
@@ -94,6 +107,11 @@ fn main() {
     .add_systems(
         Update,
         collect_inputs.after(lightyear::prelude::MessageSystems::ReceiveMessages),
+    )
+    // 世界时间速度：客户端拖滑杆只是"提议"，真正的值在这里改写并复制下去
+    .add_systems(
+        Update,
+        apply_time_scale_requests.after(lightyear::prelude::MessageSystems::ReceiveMessages),
     )
     .add_systems(FixedUpdate, drive_avatars)
     .add_systems(
@@ -124,6 +142,44 @@ fn every_second(mut counter: Local<u32>) -> bool {
 
 #[derive(Resource)]
 struct ServerAddr(SocketAddr);
+
+/// 世界时钟实体（`NetTimeScale` 的持有者，见 [`setup`]）。
+#[derive(Component)]
+struct WorldClock;
+
+/// 把客户端的世界时间速度请求落成权威值。
+///
+/// 三件事一起做：夹区间 → 写 `NetTimeScale`（复制给所有端） → 改本地 `Time<Virtual>`。
+/// 服务器自己也得慢下来，否则客户端慢放时服务器照旧 60Hz 推进，复制下来的位置依旧
+/// 是"实时"的，慢放看到的就是"动画在原地抖腿"。
+///
+/// 只认最新一条：拖动时客户端每个节流窗口发一条，中间的旧值没有意义。
+fn apply_time_scale_requests(
+    mut links: Query<&mut MessageReceiver<TimeScaleRequest>>,
+    mut clock: Query<&mut NetTimeScale, With<WorldClock>>,
+    mut time: ResMut<Time<Virtual>>,
+) {
+    for mut receiver in links.iter_mut() {
+        let mut newest = None;
+        for request in receiver.receive() {
+            newest = Some(request);
+        }
+        let Some(request) = newest else {
+            continue;
+        };
+        let value = NetTimeScale::clamp_speed(request.value);
+        let Some(mut scale) = clock.iter_mut().next() else {
+            warn!("世界时钟实体不在，忽略时间速度请求");
+            continue;
+        };
+        if (scale.0 - value).abs() < 1e-4 {
+            continue;
+        }
+        scale.0 = value;
+        time.set_relative_speed(value);
+        info!("world time scale → ×{value:.2}");
+    }
+}
 
 /// `--exit-after <秒>`：跑够时间自动退出。给 CI / 冒烟测试用，
 /// 也免得手工起服务器时还得找进程杀。
@@ -224,6 +280,17 @@ fn setup(mut commands: Commands, addr: Res<ServerAddr>) {
     // 客户端用同一份 `LEVEL` 在本地建实体，所以这里既不需要复制，也不会两边分叉
     spawn_static_level(&mut commands);
 
+    // 世界时钟：整局唯一一个「世界时间速度」的权威持有者。
+    //
+    // 它必须是一个**实体**而不是资源：lightyear 的复制只能挂在实体组件上。
+    // 客户端不需要知道它是谁，只按「谁身上有 `NetTimeScale`」读值。
+    commands.spawn((
+        WorldClock,
+        Replicate::default(),
+        NetTimeScale::default(),
+        Name::new("world-clock"),
+    ));
+
     info!("dedicated server listening on {}", addr.0);
 
     // 定时 UDP 广播自己的地址/端口/人数，客户端大厅直接收，不用手输地址
@@ -304,8 +371,7 @@ fn handle_join(
                     speed: 0.0,
                     intent: 0.0,
                 },
-                FacingRate::default(),
-                AvatarIntent::default(),
+                AvatarLocal::default(),
                 Name::new(format!("player-{player_id}")),
             ))
             .id();
@@ -318,13 +384,32 @@ fn handle_join(
 }
 
 /// 连接断开：把它的角色实体一起收掉，并释放映射。
-fn on_disconnect(trigger: On<Add<Disconnected>>, mut commands: Commands, mut room: ResMut<Room>) {
+///
+/// 房间清空时顺手把世界时间速度还给 1.0：调试用的慢放不该留给下一批进来的人
+/// （客户端那边 `DebugSettingsPlugin` 在退出对局时同样会复位）。
+fn on_disconnect(
+    trigger: On<Add<Disconnected>>,
+    mut commands: Commands,
+    mut room: ResMut<Room>,
+    mut clock: Query<&mut NetTimeScale, With<WorldClock>>,
+    mut time: ResMut<Time<Virtual>>,
+) {
     let link = trigger.entity;
     let Some(avatar) = room.avatar_of_link.remove(&link) else {
         return;
     };
     commands.entity(avatar).despawn();
     info!("leave: link {link:?} 断开，角色实体 {avatar:?} 已回收");
+
+    if room.avatar_of_link.is_empty()
+        && let Some(mut scale) = clock.iter_mut().next()
+    {
+        if (scale.0 - 1.0).abs() > 1e-4 {
+            scale.0 = 1.0;
+            time.set_relative_speed(1.0);
+            info!("房间清空，世界时间速度复位为 ×1.00");
+        }
+    }
 }
 
 /// 输入断流后多久把水平速度归零（秒）。
@@ -344,6 +429,22 @@ struct LatestInput(MoveInput);
 #[derive(Component)]
 struct InputGrace(f32);
 
+/// 跳跃蓄力状态（服务端本地，不进复制协议）。
+///
+/// 收到起跳上升沿后先贴地蓄力一段，蓄满才给离地速度；`prev_jump` 记录
+/// 上一 tick 的按键电平，用来检测上升沿——按住不放落地后不会连跳。
+#[derive(Component, Default)]
+struct JumpCharge {
+    /// 是否正在蓄力
+    charging: bool,
+    /// 已蓄力秒数
+    elapsed: f32,
+    /// 上一 tick 的起跳按键电平
+    prev_jump: bool,
+    /// 这一跳的大类（由客户端上行 `jump_kind` 带上来）：决定取哪一档调参。
+    kind: JumpKind,
+}
+
 /// 消费消息，只把最新一条存到 link 上。
 ///
 /// 必须排在 `MessageSystems::ReceiveMessages` 之后，否则读到的永远是空队列。
@@ -361,6 +462,9 @@ fn collect_inputs(
             newest = Some(message);
         }
         if let Some(input) = newest {
+            if input.jump && !latest.0.jump {
+                info!("server: 收到跳跃上升沿");
+            }
             latest.0 = input;
             grace.0 = INPUT_GRACE_SECS;
         }
@@ -370,16 +474,19 @@ fn collect_inputs(
 /// 每个逻辑帧把最新输入写成速度，并推进宽限期。
 fn drive_avatars(
     time: Res<Time<Fixed>>,
+    tunings: Res<JumpTunings>,
     mut links: Query<(Entity, &LatestInput, &mut InputGrace)>,
-    mut avatars: Query<(&mut LinearVelocity, &mut AvatarIntent, &Transform)>,
+    mut avatars: Query<(Entity, &mut LinearVelocity, &mut AvatarIntent, &mut JumpCharge, &Transform)>,
     room: Res<Room>,
+    spatial: SpatialQuery,
 ) {
     let dt = time.delta_secs();
     for (link, latest, mut grace) in links.iter_mut() {
         let Some(&avatar) = room.avatar_of_link.get(&link) else {
             continue;
         };
-        let Ok((mut velocity, mut intent, transform)) = avatars.get_mut(avatar) else {
+        let Ok((entity, mut velocity, mut intent, mut charge, transform)) = avatars.get_mut(avatar)
+        else {
             continue;
         };
 
@@ -391,6 +498,9 @@ fn drive_avatars(
             velocity.0.z = 0.0;
             intent.dir = [0.0; 2];
             intent.speed = 0.0;
+            charge.charging = false;
+            charge.elapsed = 0.0;
+            charge.prev_jump = false;
             continue;
         }
         grace.0 -= dt;
@@ -408,10 +518,80 @@ fn drive_avatars(
         velocity.0.x = direction.x * MOVE_SPEED_MPS;
         velocity.0.z = direction.y * MOVE_SPEED_MPS;
 
-        // 跳跃：只在地面附近接受，避免空中连跳
-        if latest.0.jump && transform.translation.y <= GROUND_EPSILON {
-            velocity.0.y = JUMP_SPEED;
+        // 跳跃：先贴地蓄力，蓄满才给离地速度（见 [`advance_charge`]）
+        // 接地用脚下射线而不是绝对高度：站在 1m 方块上（胶囊中心 y≈1.7）也要能跳
+        let grounded = ground::grounded(
+            &spatial,
+            entity,
+            transform,
+            velocity.0.y,
+            GROUND_NOISE_VY,
+        );
+        // 这一跳走哪一档由客户端在起跳帧带上来；蓄力期间每 tick 更新一次，
+        // 客户端的消息比上升沿晚一帧也不会用错档。
+        charge.kind = JumpKind::from_code(latest.0.jump_kind);
+        let launched = advance_charge(
+            &mut charge,
+            latest.0.jump,
+            grounded,
+            velocity.0.y,
+            intent.measured,
+            &tunings,
+            dt,
+        );
+        if let Some(vy) = launched {
+            velocity.0.y = vy;
         }
+    }
+}
+
+/// 推进跳跃蓄力状态。返回本 tick 要写进 `LinearVelocity.y` 的离地速度（`None` = 还没起跳）。
+///
+/// - 起跳必须是按键**上升沿**：按住不放落地后不会二次起跳，对齐单机的边沿锁存；
+/// - 蓄力期间被推离地面（走出平台边缘）取消蓄力；
+/// - 蓄力时长与离地速度都按**这一跳的档位**取（站 / 跑 / 上 / 下），
+///   与客户端起跳剪辑用的是同一份表，两端离地帧和高度才对得上。
+fn advance_charge(
+    charge: &mut JumpCharge,
+    jump: bool,
+    grounded: bool,
+    upward_speed: f32,
+    ground_speed: f32,
+    tunings: &JumpTunings,
+    dt: f32,
+) -> Option<f32> {
+    // 已经离地（明显向上速度）就清掉残留计时，别把上一跳的蓄力带进落地。
+    // 低于 `GROUND_NOISE_VY` 的接触补偿噪声不算离地，别误清蓄力。
+    if upward_speed > GROUND_NOISE_VY {
+        charge.charging = false;
+        charge.elapsed = 0.0;
+    }
+    let pressed = jump && !charge.prev_jump;
+    charge.prev_jump = jump;
+
+    if !charge.charging {
+        if pressed && grounded && upward_speed <= GROUND_NOISE_VY {
+            charge.charging = true;
+            charge.elapsed = 0.0;
+        }
+        return None;
+    }
+
+    // 蓄力中被推离地面（走出平台边缘）→ 取消
+    if !grounded {
+        charge.charging = false;
+        charge.elapsed = 0.0;
+        return None;
+    }
+    charge.elapsed += dt;
+    let profile = JumpProfile::for_jump(charge.kind, ground_speed);
+    let tuning = tunings.get(profile);
+    if charge.elapsed >= tuning.charge_secs {
+        charge.charging = false;
+        charge.elapsed = 0.0;
+        Some(tuning.net_launch_vy)
+    } else {
+        None
     }
 }
 
@@ -503,6 +683,17 @@ fn face_movement(
 #[derive(Component, Default)]
 struct FacingRate(f32);
 
+/// 服务端本地表现 / 蓄力状态打包成一个 Bundle。
+///
+/// 这些组件都不进复制协议；打包是为了把 spawn 元组压到 Bevy 元组 Bundle
+/// 上限（15 个元素）以内——直接平铺会多出一个元素。
+#[derive(Bundle, Default)]
+struct AvatarLocal {
+    facing: FacingRate,
+    intent: AvatarIntent,
+    jump_charge: JumpCharge,
+}
+
 /// 把物理结果写成协议组件，交给复制层。
 /// 把服务端状态写成协议组件，交给复制层。
 ///
@@ -524,5 +715,341 @@ fn publish_state(mut avatars: Query<(&Transform, &mut NetPos, &mut NetMotion, &A
         } else {
             0.0
         };
+    }
+}
+
+#[cfg(test)]
+mod jump_charge_tests {
+    use super::*;
+
+    const DT: f32 = 1.0 / TICK_HZ as f32;
+
+    fn tunings() -> JumpTunings {
+        JumpTunings::default()
+    }
+
+    /// 服务端写入的离地速度（站立档，也是物理探针用的那一档）
+    fn stand_launch() -> f32 {
+        tunings().get(JumpProfile::Stand).net_launch_vy
+    }
+
+    fn charge() -> JumpCharge {
+        JumpCharge::default()
+    }
+
+    #[test]
+    fn rising_edge_begins_but_does_not_launch_immediately() {
+        let mut c = charge();
+        // 上升沿当帧进入蓄力，不给离地速度
+        assert!(advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_none());
+        assert!(c.charging);
+        // 只攒了一帧，远没到站立蓄力时长
+        assert!(advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_none());
+    }
+
+    #[test]
+    fn stand_charge_full_launches_once() {
+        let mut c = charge();
+        let mut launched = false;
+        let mut ticks = 0;
+        while !launched && ticks < 120 {
+            launched = advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_some();
+            ticks += 1;
+        }
+        assert!(launched, "站立档蓄满应给一次离地速度");
+        assert!(!c.charging);
+        // 已经离地，按住也不会二次起跳
+        assert!(advance_charge(&mut c, true, false, stand_launch(), 0.0, &tunings(), DT).is_none());
+    }
+
+    #[test]
+    fn held_jump_does_not_double_jump_after_landing() {
+        let mut c = charge();
+        // 先蓄满跳起来
+        for _ in 0..60 {
+            advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT);
+        }
+        // 空中：向上速度清掉残留蓄力
+        advance_charge(&mut c, true, false, stand_launch(), 0.0, &tunings(), DT);
+        // 落地但按键仍按住：上升沿已过，不重新蓄力、不连跳
+        assert!(advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_none());
+        assert!(!c.charging);
+    }
+
+    #[test]
+    fn charge_cancelled_when_walking_off_edge() {
+        let mut c = charge();
+        advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT);
+        assert!(c.charging);
+        // 走出平台边缘 → 取消蓄力，自由下落
+        advance_charge(&mut c, true, false, 0.0, 0.0, &tunings(), DT);
+        assert!(!c.charging);
+    }
+
+    #[test]
+    fn run_charge_is_shorter_than_stand() {
+        let mut c = charge();
+        let mut launched = false;
+        let mut ticks = 0;
+        while !launched && ticks < 120 {
+            launched = advance_charge(&mut c, true, true, 0.0, RUN_JUMP_SPEED, &tunings(), DT).is_some();
+            ticks += 1;
+        }
+        assert!(launched);
+        // 奔跑档 0.05s ≈ 3 帧；站立档 0.45s ≈ 27 帧
+        assert!(ticks <= 4, "奔跑蓄力应在几帧内完成，实际 {ticks} 帧");
+    }
+
+    #[test]
+    fn air_jump_is_ignored() {
+        let mut c = charge();
+        assert!(advance_charge(&mut c, true, false, 1.0, 0.0, &tunings(), DT).is_none());
+        assert!(!c.charging);
+    }
+
+    #[test]
+    fn micro_upward_contact_velocity_does_not_clear_charge() {
+        let mut c = charge();
+        // 贴地静止时 avian 接触补偿留下的微小正速度（实测 ~5e-10 m/s），不是真离地。
+        // 早期用严格 `> 0` 判定离地，会被这个噪声每帧清掉蓄力，原地跳永远蓄不满、
+        // 根位置不抬升。这里锁定：低于容差的接触噪声不得打断蓄力。
+        let noise: f32 = 5.3e-10;
+        let mut launched = false;
+        let mut ticks = 0;
+        while !launched && ticks < 120 {
+            launched = advance_charge(&mut c, true, true, noise, 0.0, &tunings(), DT).is_some();
+            ticks += 1;
+        }
+        assert!(launched, "接触补偿的微小正速度不应打断蓄力");
+    }
+
+    #[test]
+    fn solver_contact_noise_does_not_clear_charge() {
+        // 实测贴地时接触求解会留下 0.192 m/s 量级的残余正速度（客户端日志反复出现）。
+        // 旧的 0.1 界线把它当成「已经在蹬升」，蓄力每 tick 被清掉 → 按了跳没反应。
+        let mut c = charge();
+        let mut launched = false;
+        let mut ticks = 0;
+        while !launched && ticks < 120 {
+            launched = advance_charge(&mut c, true, true, 0.192_409_41, 0.0, &tunings(), DT).is_some();
+            ticks += 1;
+        }
+        assert!(launched, "0.19 m/s 的贴地噪声不应打断蓄力");
+    }
+}
+
+/// 物理基准探针：复刻服务端角色的刚体/碰撞体/阻尼参数，给定站立档离地速度
+/// 初速度后跑物理积分，断言能明显抬升。用来回归排除「avian 速度→位移积分
+/// 链路本身不升空」这类物理层问题；联网跳不起来时先看这里是否通过。
+#[cfg(test)]
+mod physics_probe {
+    use super::*;
+    use bevy::time::TimeUpdateStrategy;
+
+    #[test]
+    fn capsule_peak_height() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default()).init_asset::<Mesh>();
+        app.add_message::<AssetEvent<Mesh>>();
+        app.add_plugins((MinimalPlugins, TransformPlugin, PhysicsPlugins::default()))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                1.0 / 60.0,
+            )));
+        app.finish();
+
+        app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::cuboid(20.0, 1.0, 20.0),
+            Transform::from_xyz(0.0, -0.5, 0.0),
+        ));
+        let body = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::capsule(0.2, 1.0),
+                LockedAxes::ROTATION_LOCKED,
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                LinearVelocity::ZERO,
+                Transform::from_xyz(0.0, 1.0, 0.0),
+            ))
+            .id();
+        app.update();
+
+        app.world_mut()
+            .entity_mut(body)
+            .insert(LinearVelocity::from(Vec3::new(
+                0.0,
+                JumpTunings::default().get(JumpProfile::Stand).net_launch_vy,
+                0.0,
+            )));
+
+        let mut peak = 1.0f32;
+        for _ in 0..180 {
+            app.update();
+            let tr = app.world().entity(body).get::<Transform>().unwrap();
+            peak = peak.max(tr.translation.y);
+        }
+        let end: f32 = app.world().entity(body).get::<Transform>().unwrap().translation.y;
+        println!("PROBE peak_y={peak} end_y={end}");
+        assert!(peak > 1.5, "峰值应明显高于初始 1.0，实际 {peak}");
+    }
+
+    /// 走真实 `FixedUpdate` 调度驱动 `drive_avatars`：先让胶囊在地面平衡贴地，
+    /// 再喂一条按住的 jump 输入，蓄力满后由系统写出离地速度，读根位置峰值。
+    /// 验证「状态机触发 → velocity.y 写出 → avian 积分抬升根」整条链路通畅；
+    /// 回归早期「贴地接触噪声被误判离地、蓄力反复清零、根不抬升」的问题。
+    #[test]
+    fn drive_avatar_jump_lifts_root() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default()).init_asset::<Mesh>();
+        app.add_message::<AssetEvent<Mesh>>();
+        app.add_plugins((MinimalPlugins, TransformPlugin, PhysicsPlugins::default()))
+            .init_resource::<JumpTunings>()
+            .add_systems(FixedUpdate, drive_avatars)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                1.0 / 60.0,
+            )));
+        app.finish();
+
+        app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::cuboid(20.0, 1.0, 20.0),
+            Transform::from_xyz(0.0, -0.5, 0.0),
+        ));
+
+        let link = app
+            .world_mut()
+            .spawn((LatestInput(MoveInput::default()), InputGrace(INPUT_GRACE_SECS)))
+            .id();
+        let avatar = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::capsule(0.2, 1.0),
+                LockedAxes::ROTATION_LOCKED,
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                LinearVelocity::ZERO,
+                JumpCharge::default(),
+                AvatarIntent::default(),
+                Transform::from_xyz(0.0, 1.0, 0.0),
+            ))
+            .id();
+
+        app.world_mut().insert_resource(Room {
+            next_player_id: 0,
+            avatar_of_link: HashMap::from([(link, avatar)]),
+        });
+
+        let room = app.world().resource::<Room>();
+        assert_eq!(room.avatar_of_link.len(), 1);
+        let av = app.world().entity(avatar);
+        assert!(av.get::<LinearVelocity>().is_some());
+        assert!(av.get::<AvatarIntent>().is_some());
+        assert!(av.get::<JumpCharge>().is_some());
+
+        // 先空跑若干帧让胶囊在地面平衡贴地，复现真实「站定后再起跳」的状态，
+        // 避免出生下坠撞地的反弹速度误清蓄力。
+        for _ in 0..30 {
+            app.update();
+        }
+        if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
+            li.0.jump = true;
+        }
+
+        let mut peak = 1.0f32;
+        for _ in 0..200 {
+            // 模拟客户端每帧都在发包：持续刷新宽限期，避免断流分支掐断蓄力
+            if let Some(mut gr) = app.world_mut().get_mut::<InputGrace>(link) {
+                gr.0 = INPUT_GRACE_SECS;
+            }
+            app.update();
+            let tr = app.world().entity(avatar).get::<Transform>().unwrap();
+            peak = peak.max(tr.translation.y);
+        }
+        let end: f32 = app.world().entity(avatar).get::<Transform>().unwrap().translation.y;
+        let vel = app.world().entity(avatar).get::<LinearVelocity>().unwrap();
+        let ch = app.world().entity(avatar).get::<JumpCharge>().unwrap();
+        println!(
+            "DRIVE peak={peak} end={end} vy={:.3} charging={} elapsed={:.3} prev_jump={}",
+            vel.0.y, ch.charging, ch.elapsed, ch.prev_jump
+        );
+        assert!(peak > 1.5, "驱动链路应把根明显抬升，峰值 {peak}");
+    }
+
+    /// 站在 1m 方块顶上（胶囊中心 y≈1.7）也必须能起跳。
+    ///
+    /// 旧实现用绝对高度 `y <= 1.15` 判接地，一上方块就永远「不在地上」，
+    /// 蓄力起跳直接取消——站在方块上怎么按都不跳。改成脚下射线后与台面高度无关。
+    #[test]
+    fn drive_avatar_jump_lifts_root_on_raised_ground() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default()).init_asset::<Mesh>();
+        app.add_message::<AssetEvent<Mesh>>();
+        app.add_plugins((MinimalPlugins, TransformPlugin, PhysicsPlugins::default()))
+            .init_resource::<JumpTunings>()
+            .add_systems(FixedUpdate, drive_avatars)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                1.0 / 60.0,
+            )));
+        app.finish();
+
+        // 1m 高的台子，顶面 y = 1.0
+        app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::cuboid(4.0, 1.0, 4.0),
+            Transform::from_xyz(0.0, 0.5, 0.0),
+        ));
+
+        let link = app
+            .world_mut()
+            .spawn((LatestInput(MoveInput::default()), InputGrace(INPUT_GRACE_SECS)))
+            .id();
+        let avatar = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::capsule(0.2, 1.0),
+                LockedAxes::ROTATION_LOCKED,
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                LinearVelocity::ZERO,
+                JumpCharge::default(),
+                AvatarIntent::default(),
+                Transform::from_xyz(0.0, 2.0, 0.0),
+            ))
+            .id();
+
+        app.world_mut().insert_resource(Room {
+            next_player_id: 0,
+            avatar_of_link: HashMap::from([(link, avatar)]),
+        });
+
+        for _ in 0..40 {
+            app.update();
+        }
+        let rest_y = app.world().entity(avatar).get::<Transform>().unwrap().translation.y;
+        assert!(
+            (rest_y - 1.7).abs() < 0.1,
+            "应落在方块顶上（y≈1.7），实际 {rest_y}"
+        );
+
+        if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
+            li.0.jump = true;
+        }
+        let mut peak = rest_y;
+        for _ in 0..200 {
+            if let Some(mut gr) = app.world_mut().get_mut::<InputGrace>(link) {
+                gr.0 = INPUT_GRACE_SECS;
+            }
+            app.update();
+            let tr = app.world().entity(avatar).get::<Transform>().unwrap();
+            peak = peak.max(tr.translation.y);
+        }
+        assert!(
+            peak > rest_y + 0.4,
+            "方块顶上应能起跳，静止 {rest_y} 峰值 {peak}"
+        );
     }
 }

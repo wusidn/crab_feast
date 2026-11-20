@@ -20,11 +20,12 @@ use std::net::SocketAddr;
 use avian3d::prelude::*;
 use bevy::{
     animation::{AnimatedBy, AnimationTargetId},
+    ecs::system::SystemParam,
     prelude::*,
 };
 use crab_feast_library::net::{
     ControlChannel, CrabProtocolPlugin, JoinRequest, MOVE_SPEED_MPS, MoveInput, NetMotion,
-    NetPlayerId, NetPos, NetYaw, TICK_HZ, Welcome,
+    NetPlayerId, NetPos, NetTimeScale, NetYaw, TICK_HZ, TimeScaleRequest, Welcome,
 };
 use lightyear::netcode::prelude::{
     Authentication,
@@ -34,11 +35,19 @@ use lightyear::prelude::{client::*, *};
 
 use crate::GameState;
 use crate::anim::core::{SpaceEvalContext, evaluate_space};
-use crate::anim::{AnimCatalog, ClipSet, FootIk, FootIkSet, MixerCache, Skeleton, build_skeleton};
+use crate::anim::jump::{
+    JumpTunings, RemoteJump, blend_clip_pose, remote_jump_setup, uplink_jump_level,
+};
+use crate::anim::{
+    AnimCatalog, AnimSelection, AnimationSet, ClipSet, FootIk, FootIkSet, JumpAction, MixerCache,
+    Skeleton, build_skeleton,
+};
 use crate::camera::CameraFacing;
+use crate::ground::foot_ground_dist;
 use crate::input::{ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, wrap_pi};
 use crate::scene::Avatar;
 use crate::state::{AbortSession, LobbyNotice, SessionMode};
+use crate::ui::debug::{DebugTimeScale, TimeScaleChanged};
 
 /// 服务器地址，由 launcher 通过 `--server` 写入。
 #[derive(Resource, Debug, Clone, Copy)]
@@ -96,6 +105,28 @@ impl Plugin for NetPlugin {
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .init_resource::<NetConfig>()
         .init_resource::<LoginPhase>()
+        // 世界时间速度上行：拖动滑杆 → 节流发包；服务端复制回来的值 → 写回资源
+        .init_resource::<TimeScaleUplink>()
+        // 只在 `Game` 里跑：调试面板本身也只在对局中出现，退出对局后残留的复制值
+        // 不该把大厅的时间又拽回慢放
+        // lightyear 的客户端时钟同步在 `Last` 里绝对写 `Time<Virtual>` 的速度，会把
+        // 调试滑杆的倍数擦掉（表现为「资源 ×0.20、世界还是 1×」）。本帧的 delta 在
+        // `First`/`TimeSystems` 里算，所以在那里按「同步基准 × 调试倍数」重写一次。
+        .add_systems(
+            First,
+            apply_effective_time_scale.before(bevy::time::TimeSystems),
+        )
+        .add_systems(
+            Update,
+            (
+                // 顺序要紧：先读本地改动（进静默窗），再拿复制值对齐。
+                // 反过来的话，拖动第一帧服务端上一版的值会先把本地拽回旧值。
+                send_time_scale_request,
+                apply_replicated_time_scale,
+            )
+                .chain()
+                .run_if(in_state(GameState::Game)),
+        )
         // 登录阶段才建连接；大厅与本地游戏都不该有客户端实体
         .add_systems(OnEnter(GameState::Login), connect)
         .add_systems(Update, abort_login)
@@ -140,10 +171,17 @@ impl Plugin for NetPlugin {
                 (attach_player_models, setup_clip_models)
                     .chain()
                     .after(claim_local_avatar),
+                // 自动跳覆盖 JumpInput，要排在键盘跳采样之后、上行发包之前
+                auto_jump_input
+                    .after(ControlSet::Move)
+                    .before(AnimationSet::Publish)
+                    .run_if(in_state(GameState::Game)),
                 // 输入要在移动系统把摇杆方向折算成世界方向之后采样；
+                // 排在动画 Drive 之后，才能读到本帧动作层是否已放行起跳窗口；
                 // 出大厅/断线后连接实体已不在，这里也不会再发包
                 send_input
-                    .after(ControlSet::Move)
+                    .after(auto_jump_input)
+                    .after(AnimationSet::Drive)
                     .run_if(in_state(GameState::Game)),
             ),
         );
@@ -213,6 +251,9 @@ fn connect(
             // 注册了 ClientToServer 方向后 sender 本应自动插，这里显式写清楚，
             // 免得协议改动时静默丢输入
             MessageSender::<MoveInput>::default(),
+            // 世界时间速度的上行也走同一套：拖动滑杆时偶尔发一条，不能让协议改动
+            // 把这条请求悄悄丢掉（丢了表现为"滑杆动了，别的端没动"）
+            MessageSender::<TimeScaleRequest>::default(),
             Name::new("net-client"),
         ))
         .id();
@@ -250,9 +291,13 @@ fn abort_login(
 fn leave_game(
     mut commands: Commands,
     mut phase: ResMut<LoginPhase>,
+    mut uplink: ResMut<TimeScaleUplink>,
     clients: Query<Entity, With<Client>>,
 ) {
     *phase = LoginPhase::Idle;
+    // 退出对局时清掉还没发完的时间速度提议：不然下一局连上新服务器时，
+    // 那条陈旧的 pending 会被发出去，把**别人**那台服务器的世界也拖慢
+    *uplink = TimeScaleUplink::default();
     commands.remove_resource::<LocalPlayer>();
     for entity in &clients {
         commands.trigger(Disconnect { entity });
@@ -529,6 +574,8 @@ fn setup_clip_models(
                 active: 0.0,
                 natural_speed: 0.0,
             },
+            // 远端也要播跳跃：没有输入可猜，只能观察复制下来的轨迹（见 `RemoteJump`）
+            RemoteJump::default(),
             ClipReady,
             // 远端也要脚部 IK：`attach_rigs` 只认 `AnimModelRoot`，这具模型根没有那个标记
             crate::anim::FootIkTarget,
@@ -691,20 +738,32 @@ fn drive_net_animation(
 ///
 /// 每具骨架各有一份映射与相位，求值函数和本地角色完全相同，所以「斜着走」「倒退」
 /// 「转身时先侧步再正走」这些本地看得见的效果，远端也会有。
+#[allow(clippy::too_many_arguments)]
+/// `drive_remote_pose` 的参数已经顶到 Bevy 的单系统参数上限，把「档位表 + 诊断去重标记」
+/// 裹成一个参数：跳跃档位跟着 `JumpTunings` 走，远端与本地用同一张表。
+#[derive(SystemParam)]
+struct RemotePoseJump<'w, 's> {
+    tunings: Res<'w, JumpTunings>,
+    mismatched: Local<'s, bool>,
+}
+
 fn drive_remote_pose(
     time: Res<Time>,
     assets: Res<PlayerModelAssets>,
     cache: Res<MixerCache>,
     clips: Res<ClipSet>,
+    catalog: Res<AnimCatalog>,
+    selection: Res<AnimSelection>,
     clip_assets: Res<Assets<AnimationClip>>,
-    mut rigs: Query<(Entity, &mut RemotePose, &ModelOwner)>,
+    mut rigs: Query<(Entity, &mut RemotePose, &mut RemoteJump, &ModelOwner)>,
     mut foot_iks: Query<&mut FootIk>,
     motions: Query<(&NetMotion, &NetYaw)>,
+    spatial: SpatialQuery,
+    mut jump_cfg: RemotePoseJump,
     children: Query<&Children>,
     targets: Query<(&AnimationTargetId, Option<&AnimatedBy>)>,
     names: Query<&Name>,
     mut transforms: Query<&mut Transform>,
-    mut mismatched: Local<bool>,
 ) {
     // 混合空间定义与本地共用同一份「移动混合」文档；没有就什么都不做
     let Some(space) = cache
@@ -717,21 +776,23 @@ fn drive_remote_pose(
     };
     // 剪辑与骨骼的 target 必须来自同一个角色，否则求出来的姿态对不上这具骨架
     if clips.character() != Some(assets.character.as_str()) {
-        if !*mismatched {
+        if !*jump_cfg.mismatched {
             warn!(
                 "net: 当前剪辑表属于 {:?}，远端模型是 {}，远端姿态先不驱动",
                 clips.character(),
                 assets.character
             );
-            *mismatched = true;
+            *jump_cfg.mismatched = true;
         }
         return;
     }
-    *mismatched = false;
+    *jump_cfg.mismatched = false;
     let axes = space.params.clone();
-    let dt = time.delta_secs().min(0.05);
+    // 混合空间用的 dt 截顶（防掉帧时相位一次跳太远）；跳跃层要用真实帧间距
+    let raw_dt = time.delta_secs();
+    let dt = raw_dt.min(0.05);
 
-    for (root, mut rig, owner) in rigs.iter_mut() {
+    for (root, mut rig, mut jump, owner) in rigs.iter_mut() {
         let RemotePose {
             skeleton,
             phase,
@@ -755,6 +816,11 @@ fn drive_remote_pose(
             continue;
         };
 
+        let phase_now = *phase;
+        // 跳跃层要用的实测速度与方向（远端没有输入，只能拿这两个量去挑剪辑）
+        let mut jump_speed = 0.0f32;
+        let mut jump_dir = Vec3::ZERO;
+
         // 参数：方向差取「意图方向 − 当前脸向」，速度量级取实测
         let [yaw, speed] = match motions.get(owner.0) {
             Ok((motion, facing)) => {
@@ -765,6 +831,8 @@ fn drive_remote_pose(
                 let want = if motion.intent > 1e-3 { 1.0 } else { 0.0 };
                 *active += (want - *active) * (dt / ACTIVE_TAU).min(1.0);
                 let measured = (motion.speed / MOVE_SPEED_MPS).clamp(0.0, 1.0) * *active;
+                jump_speed = motion.speed;
+                jump_dir = Vec3::new(motion.dir[0], 0.0, motion.dir[1]);
                 if planar.length_squared() <= 1e-6 {
                     [0.0, measured]
                 } else {
@@ -793,6 +861,42 @@ fn drive_remote_pose(
             1.0
         };
 
+        // 远端跳跃层：不猜按键，只看这具身体什么时候离地、什么时候触地。
+        // 复制位置是阶跃到达的，用**真实帧间距**差分竖直速度（不能用混合空间那个
+        // 截到 50ms 的 dt，否则低帧时速度被系统性放大）
+        let player_transform = transforms.get(owner.0).ok().map(|t| *t);
+        let jump_height = player_transform.and_then(|t| {
+            let filter = SpatialQueryFilter::from_excluded_entities([owner.0]);
+            foot_ground_dist(&spatial, &filter, &t)
+        });
+        let hips_id = rig_skeleton.hips;
+        let gait = catalog
+            .character(selection.character)
+            .and_then(|def| def.gaits.get("Running"));
+        let filter = SpatialQueryFilter::from_excluded_entities([owner.0]);
+        jump.observe(
+            raw_dt,
+            player_transform.map(|t| t.translation.y).unwrap_or(0.0),
+            jump_height,
+            || {
+                let transform = player_transform?;
+                let hips = hips_id?;
+                remote_jump_setup(
+                    &spatial,
+                    &filter,
+                    &transform,
+                    jump_speed,
+                    jump_dir,
+                    Some(phase_now),
+                    gait,
+                    hips,
+                    &clips,
+                    &clip_assets,
+                    &jump_cfg.tunings,
+                )
+            },
+        );
+
         let mut context = SpaceEvalContext {
             params,
             clips: &clips,
@@ -804,7 +908,35 @@ fn drive_remote_pose(
             speed_scale,
             hips: rig_skeleton.hips,
         };
-        let output = evaluate_space(&space, &mut context);
+        let mut output = evaluate_space(&space, &mut context);
+
+        // 起跳 / 滞空 / 落地期间按权重叠上跳跃剪辑。髋在滞空段钉在「剪辑离地帧的髋高」
+        // 上并按权重与走路姿态插值：物理那边抬根，动画这边不能再抬，否则人会浮起来
+        let jump_weight = jump.weight();
+        let base_hips_y = rig_skeleton
+            .hips
+            .and_then(|h| output.pose.get(h))
+            .map(|bone| bone.translation.y);
+        if jump_weight > 0.0 {
+            blend_clip_pose(
+                jump.clip(),
+                jump.clip_time(),
+                jump_weight,
+                &clips,
+                &clip_assets,
+                &rig_skeleton.targets,
+                &rig_skeleton.rest,
+                &mut output.pose,
+            );
+        }
+        if jump.is_airborne()
+            && let (Some(hips), Some(base)) = (rig_skeleton.hips, base_hips_y)
+        {
+            output
+                .pose
+                .set_translation_y(hips, base.lerp(jump.takeoff_hips(), jump_weight));
+        }
+
         for (id, bone) in output.pose.iter() {
             if let Some(entity) = rig_skeleton.by_id.get(id)
                 && let Ok(mut transform) = transforms.get_mut(*entity)
@@ -818,7 +950,8 @@ fn drive_remote_pose(
         // 「静止」用实测速度判 —— 本地那边读的是混合输出的地速，等价
         if let Ok(mut ik) = foot_iks.get_mut(root) {
             ik.contacts = output.contacts;
-            ik.resting = measured_mps < 0.05 && speed.abs() < 0.02;
+            // 滞空时不能算「静止」：落地淡出的最后几帧会被拿去标定脚掌俯角
+            ik.resting = measured_mps < 0.05 && speed.abs() < 0.02 && jump_weight == 0.0;
         }
     }
 }
@@ -827,14 +960,66 @@ fn drive_remote_pose(
 #[derive(Resource, Debug)]
 pub struct AutoWalk(pub Timer);
 
+/// 调试用：`--auto-jump <周期秒>` 时自动点按跳跃（先按住一段再松开，产生上升沿）。
+#[derive(Resource, Debug)]
+pub struct AutoJump {
+    /// 两次起跳的间隔（秒）
+    period: f32,
+    /// 距下次起跳剩余（秒）
+    timer: f32,
+    /// 当前是否处于按住段
+    held: bool,
+    /// 已按住秒数
+    hold: f32,
+}
+
+impl AutoJump {
+    pub fn new(period: f32) -> Self {
+        Self {
+            period,
+            timer: 0.6,
+            held: false,
+            hold: 0.0,
+        }
+    }
+}
+
+/// 自动跳：把 [`JumpInput`] 在 Activated / Idle 间翻转，模拟真实点按的上升沿。
+fn auto_jump_input(time: Res<Time>, auto: Option<ResMut<AutoJump>>, mut jump: ResMut<JumpInput>) {
+    let Some(mut auto) = auto else {
+        return;
+    };
+    let dt = time.delta_secs();
+    if auto.held {
+        auto.hold += dt;
+        if auto.hold > 0.5 {
+            auto.held = false;
+            auto.timer = auto.period;
+        }
+    } else {
+        auto.timer -= dt;
+        if auto.timer <= 0.0 {
+            auto.held = true;
+            auto.hold = 0.0;
+        }
+    }
+    *jump = if auto.held {
+        JumpInput::Activated
+    } else {
+        JumpInput::Idle
+    };
+}
+
 /// 每帧上传本帧输入。
 fn send_input(
     mut senders: Query<&mut MessageSender<MoveInput>, With<Client>>,
+    mut last_level: Local<bool>,
     input: Res<MovementInput>,
     jump: Res<JumpInput>,
     facing: Res<CameraFacing>,
     time: Res<Time>,
     auto_walk: Option<ResMut<AutoWalk>>,
+    action: Option<Res<JumpAction>>,
 ) {
     let mut auto_walk = auto_walk;
     if let Some(walk) = auto_walk.as_mut()
@@ -855,7 +1040,31 @@ fn send_input(
             MovementInput::Activated { direction, force } => (direction, force),
         }
     };
-    let jump = matches!(*jump, JumpInput::Activated);
+    let jump_pressed = matches!(*jump, JumpInput::Activated);
+    // 上行电平分三种：
+    // - 等窗口（Queued）：先压住电平，窗口打开、动作层真正起跳那一帧再发上升沿；
+    //   服务端就在接地状态下开始蓄力，不会在跨步相把角色蹬离地面。
+    // - 动作执行中：电平保持为真。玩家早松手（点按起跳）也不会漏掉这一跳，
+    //   落地回到地面后电平才回落，不会误触发第二跳。
+    // - 地面：跟随按键，和单机的边沿锁存一致。
+    // 关键：**相位窗口只推迟上升沿，绝不吞掉请求**——等窗口超时后动作层照样起跳，
+    // 这里照样把上升沿发出去。
+    let jump = action
+        .as_ref()
+        .map(|action| uplink_jump_level(action.state, action.is_queued(), jump_pressed))
+        .unwrap_or(jump_pressed);
+    // 现场排查用：`CRAB_LOG_JUMP=1` 看上行电平什么时候翻起来、当时动作层在哪个状态。
+    if std::env::var("CRAB_LOG_JUMP").is_ok() && jump != *last_level {
+        let state = action
+            .as_ref()
+            .map(|action| format!("{:?}", action.state))
+            .unwrap_or_else(|| "-".to_string());
+        info!(
+            "uplink jump level -> {} state={} pressed={}",
+            jump, state, jump_pressed
+        );
+        *last_level = jump;
+    }
 
     // 摇杆是相对相机的：往上推 = 屏幕深处 = 视线水平朝向
     let forward = facing.view_forward();
@@ -865,8 +1074,225 @@ fn send_input(
         dir: [world.x, world.z],
         force,
         jump,
+        // 起跳大类跟着上行一起发：服务端据此取**同一档**的蓄力时长与离地速度。
+        // 动作层在地面时保留上一跳的 kind，但上升沿只会在 `begin` 那一帧出现，
+        // 那一帧的 kind 已经是新的一跳。
+        jump_kind: action
+            .as_ref()
+            .map(|action| action.kind.code())
+            .unwrap_or(0),
     };
     for mut sender in senders.iter_mut() {
         sender.send::<ControlChannel>(message);
+    }
+}
+
+// ==== 世界时间速度（调试面板滑杆）的联网部分 ====
+//
+// 权威在服务端：客户端拖动只发一条请求，服务端夹好区间、写 `NetTimeScale`（复制给
+// 所有端）、同时改它自己的 `Time<Virtual>`。客户端收到复制值后写回本地
+// `DebugTimeScale`，再由 `ui::debug::apply_time_scale` 落到本机时间系统。
+// 单机模式没有这些系统（也没开 `net` feature），滑杆直接生效。
+
+/// 拖动滑杆时的上行节流（秒，真实时间）。
+///
+/// 拖一次会产生几十条 `ValueChange`，每条都发包会把可靠控制通道塞满，而服务端只认
+/// 最后一条。0.1s 一条在拖动时是 10 次/秒，滑杆看着跟手，也不至于让服务端每帧
+/// 改一次时间比例。
+const TIME_SCALE_SEND_INTERVAL: f32 = 0.1;
+
+/// 自己刚改过速度之后，这段时间内不采纳服务器的复制值（秒，真实时间）。
+///
+/// 上行到回执有几十毫秒的来回，拖动中如果每条回执都照单全收，滑块会被拽回上一个
+/// 位置闪一下。留一个短窗口，松手后最终值照样会落下来（含服务端夹取后的值）。
+const TIME_SCALE_ECHO_GRACE: f32 = 0.25;
+
+/// 世界时间速度的上行状态（只在客户端用）。
+#[derive(Resource, Default, Debug)]
+struct TimeScaleUplink {
+    /// 还没发出去的最新值
+    pending: Option<f32>,
+    /// 距离上次发包过了多久（真实秒）
+    since_send: f32,
+    /// 还需要忽略服务端回执多久（真实秒）
+    grace: f32,
+}
+
+/// 把「用户拖了滑杆」翻译成节流后的上行请求。
+fn send_time_scale_request(
+    time: Res<Time<Real>>,
+    mut requests: MessageReader<TimeScaleChanged>,
+    mut uplink: ResMut<TimeScaleUplink>,
+    mut senders: Query<&mut MessageSender<TimeScaleRequest>, With<Client>>,
+) {
+    for request in requests.read() {
+        uplink.pending = Some(request.speed);
+        // 本地一动手就进「回执静默窗」，而不是等第一条请求真正发出去才进：
+        // 拖动的最初 0.1s 里还没有请求上行，服务端上一版的值会顺着复制回来，
+        // 把滑杆和 `Time<Virtual>` 一起拽回旧值（实测 ×1.00 亮一下再回到 ×0.20）
+        uplink.grace = TIME_SCALE_ECHO_GRACE;
+    }
+    uplink.since_send += time.delta_secs();
+    let Some(value) = uplink.pending else {
+        return;
+    };
+    if uplink.since_send < TIME_SCALE_SEND_INTERVAL {
+        return;
+    }
+    let mut sent = false;
+    for mut sender in senders.iter_mut() {
+        sender.send::<ControlChannel>(TimeScaleRequest { value });
+        sent = true;
+    }
+    if sent {
+        uplink.pending = None;
+        uplink.since_send = 0.0;
+        uplink.grace = TIME_SCALE_ECHO_GRACE;
+    }
+}
+
+/// 把「调试倍数」和「lightyear 的时钟同步基准」合成为本帧的虚拟时间速度。
+///
+/// `LocalTimelineSyncPlugin::update_virtual_time` 跑在 `Last`，每帧**绝对**写一次
+/// `Time<Virtual>`：同步成功时写 `sync.relative_speed()`，否则写 `1.0`。所以
+/// `ui::debug::apply_time_scale` 在 `Update` 写的 0.2 到下一帧就被擦回 1.0，
+/// 帧 delta 依旧是实时——这就是「服务端慢了、客户端没慢」的原因。
+///
+/// 这里不读上一帧的 `relative_speed()`（否则会和自己的乘积自我累积），只读同步基准，
+/// 所以每帧结果都是 `基准 × 倍数`，稳定不漂。
+fn apply_effective_time_scale(
+    sync: Option<Res<LocalTimelineSync>>,
+    scale: Res<DebugTimeScale>,
+    mut time: ResMut<Time<Virtual>>,
+) {
+    let base = sync
+        .filter(|sync| sync.is_synced())
+        .map(|sync| sync.relative_speed())
+        // 预测窗口把速度压到 0 时别把它抬起来
+        .filter(|speed| *speed > 0.0)
+        .unwrap_or(1.0);
+    let speed = base * crab_feast_library::world_time::clamp_scale(scale.speed);
+    if (time.relative_speed() - speed).abs() > 1e-4 {
+        time.set_relative_speed(speed);
+    }
+}
+
+/// 把服务端复制下来的世界时间速度写回本地资源。
+///
+/// 不直接写 `Time<Virtual>`：写资源就行，`ui::debug::apply_time_scale` 每帧对齐，
+/// 这样「单机滑杆 / 服务器复制值」两条来源共用同一段落地的代码，不会出现
+/// "客户端时间改了但滑杆还停在旧位置"。
+fn apply_replicated_time_scale(
+    time: Res<Time<Real>>,
+    mut uplink: ResMut<TimeScaleUplink>,
+    replicas: Query<&NetTimeScale>,
+    mut scale: ResMut<DebugTimeScale>,
+) {
+    uplink.grace = (uplink.grace - time.delta_secs()).max(0.0);
+    let Some(replicated) = replicas.iter().next() else {
+        return;
+    };
+    // 自己刚动过：这条回执多半是自己那个旧值，别把滑杆拽回去
+    if uplink.grace > 0.0 {
+        if (scale.speed - replicated.0).abs() > 1e-4 {
+            debug!("net: 忽略回执 ×{:.2}（自己刚改过）", replicated.0);
+        }
+        return;
+    }
+    let value = replicated.0;
+    if (scale.speed - value).abs() > 1e-4 {
+        info!("net: 世界时间速度同步为 ×{value:.2}");
+        scale.speed = value;
+    }
+}
+
+#[cfg(test)]
+mod time_scale_tests {
+    use super::*;
+
+    /// 客户端收到复制值后必须真的把 `Time<Virtual>` 改掉，不然「滑杆同步了但世界没变」
+    #[test]
+    fn replicated_value_reaches_virtual_time() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<DebugTimeScale>();
+        app.init_resource::<TimeScaleUplink>();
+        app.add_systems(
+            Update,
+            (
+                apply_replicated_time_scale,
+                crate::ui::debug::apply_time_scale,
+            ),
+        );
+        app.world_mut().spawn(NetTimeScale(0.2));
+        // 资源与「资源→虚拟时间」两段在不同插件里，帧内顺序不保证：最多慢一帧
+        app.update();
+        app.update();
+        let speed = app.world().resource::<Time<Virtual>>().relative_speed();
+        assert!(
+            (speed - 0.2).abs() < 1e-4,
+            "复制值应落到虚拟时间，实际 {speed}"
+        );
+    }
+
+    /// lightyear 的客户端同步在 `Last` 每帧把虚拟时间速度绝对写回 1.0：
+    /// 调试倍数必须压得住它，否则会出现「资源 ×0.20、世界还是 1×」
+    #[test]
+    fn last_schedule_overwrite_does_not_undo_the_scale() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<DebugTimeScale>();
+        app.world_mut().resource_mut::<DebugTimeScale>().speed = 0.2;
+        // 模拟 `LocalTimelineSyncPlugin::update_virtual_time` 的绝对覆盖
+        app.add_systems(Last, |mut time: ResMut<Time<Virtual>>| {
+            time.set_relative_speed(1.0);
+        });
+        app.add_systems(
+            First,
+            apply_effective_time_scale.before(bevy::time::TimeSystems),
+        );
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            core::time::Duration::from_millis(16),
+        ));
+        app.update();
+        app.update();
+        let delta = app.world().resource::<Time<Virtual>>().delta_secs();
+        assert!(
+            (delta - 0.0032).abs() < 5e-4,
+            "虚拟时间 delta 应该约 3.2ms（16ms × 0.2），实际 {delta}"
+        );
+    }
+
+    /// 刚拖动、请求还没发出去的那几帧，服务端上一版的复制值不能把本地拽回去
+    #[test]
+    fn local_change_is_not_pulled_back_by_stale_echo() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<DebugTimeScale>();
+        app.init_resource::<TimeScaleUplink>();
+        app.add_message::<TimeScaleChanged>();
+        app.add_systems(
+            Update,
+            (
+                send_time_scale_request,
+                apply_replicated_time_scale,
+                crate::ui::debug::apply_time_scale,
+            )
+                .chain(),
+        );
+        app.world_mut().spawn(NetTimeScale(1.0));
+        // 拖动（观察者）把资源写成 ×0.20，同时发出消息
+        app.world_mut().resource_mut::<DebugTimeScale>().speed = 0.2;
+        app.world_mut()
+            .write_message(TimeScaleChanged { speed: 0.2 });
+        app.update();
+        app.update();
+        let scale = app.world().resource::<DebugTimeScale>().speed;
+        let speed = app.world().resource::<Time<Virtual>>().relative_speed();
+        assert!(
+            (scale - 0.2).abs() < 1e-4,
+            "本地拖动值被回执拽回去了：{scale}"
+        );
+        assert!((speed - 0.2).abs() < 1e-4, "虚拟时间没跟上拖动：{speed}");
     }
 }

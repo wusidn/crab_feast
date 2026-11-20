@@ -32,12 +32,12 @@ use bevy::transform::TransformSystems;
 use crab_feast_library::ik::{
     FootContact, FootLock, FootLockConfig, ROLL_SPAN, aim_world_rotation, solve_two_bone,
 };
-
 use crate::GameState;
 use crate::input::wrap_pi;
 
 use super::character::{AnimModelRoot, AnimRuntime};
 use super::driver::{AnimFocus, PoseDriver, drive_pose};
+use super::jump::JumpAction;
 
 pub struct FootIkPlugin;
 
@@ -562,7 +562,7 @@ fn attach_rigs(
             continue;
         }
         if let Some(rig) = build_rig(model, &children, &names, &parents, &transforms) {
-            info!(
+            debug!(
                 "脚部 IK 骨架就绪：{model:?}，{} 节脊椎链，前掌骨静止俯角 {:.1}°/{:.1}°",
                 rig.spine.len(),
                 rig.legs[0].foot_tilt,
@@ -774,7 +774,7 @@ fn calibrate_at_rest(
         rig.tilt_calibrated = true;
         // 抬跟的跨帧基准是按旧俯角累计的，换常量后清零重新累
         ik.pitch_full = [0.0; 2];
-        info!(
+        debug!(
             "脚部 IK 静止重标定：前掌骨俯角 {:.1}°/{:.1}°",
             tilts[0], tilts[1]
         );
@@ -785,10 +785,12 @@ fn calibrate_at_rest(
 fn solve_foot_ik(
     time: Res<Time>,
     settings: Res<FootIkSettings>,
+    jump: Option<Res<JumpAction>>,
     mut iks: Query<(&mut FootIk, Option<&FootIkTarget>)>,
     mut transforms: Query<&mut Transform>,
 ) {
     let dt = time.delta_secs();
+    let airborne = jump.as_ref().is_some_and(|action| action.is_airborne());
 
     for (mut ik, remote) in &mut iks {
         // 目标权重：全局开 + 本角色开 + （模拟端）模拟端开。
@@ -830,6 +832,14 @@ fn solve_foot_ik(
             ..
         } = &mut *ik;
         let ground = *ground;
+
+        // 腾空：立刻放下支撑期攒下的位置残差，这一段脚完全交给跳剪辑。
+        // 旧地面锚点若还留着慢放，身体被抛起来、脚被留在起跳点，腿会被绷成
+        // 垂直一条。蓄力蹬地（Takeoff）和落地缓冲（Land）不在此列，仍按锁脚走。
+        if airborne {
+            locks[0].release_airborne();
+            locks[1].release_airborne();
+        }
 
         // 骨架还没就绪：这一帧什么都不做（模型加载完会自己重试）
         let Some(rig) = rig.as_ref() else {
@@ -1265,6 +1275,7 @@ fn solve_foot_ik(
                 transform.rotation = solved.foot_local;
             }
         }
+
     }
 }
 
@@ -1895,7 +1906,7 @@ fn build_rig(
 
     let scale_leg = ratio(leg_sum, leg_count, REFERENCE_LEG_LENGTH);
     let scale_foot = ratio(foot_sum, foot_count, REFERENCE_FOOT_LENGTH);
-    info!(
+    debug!(
         "骨骼尺寸：腿长 {:.3} m（×{scale_leg:.2}）、踝→前掌 {:.3} m（×{scale_foot:.2}）",
         leg_sum / leg_count.max(1) as f32,
         foot_sum / foot_count.max(1) as f32

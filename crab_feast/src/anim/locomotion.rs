@@ -13,6 +13,7 @@ use crate::state::GameState;
 use super::AnimationSet;
 use super::core::{BlendMixer, MixerCore};
 use super::driver::{AnimFocus, PoseDriver, drive_pose};
+use super::jump::JumpAction;
 use super::mixers::{LocomotionMixer, LookMixer, RegisteredMixer};
 
 pub struct LocomotionPlugin;
@@ -69,11 +70,17 @@ fn sync_move_speed(driver: Res<PoseDriver>, mut controllers: Query<&mut Movement
 /// 而不是转身。
 fn drive_locomotion(
     focus: Res<AnimFocus>,
+    jump: Res<JumpAction>,
     time: Res<Time>,
     avatars: Query<(&FacingState, &LocomotionIntent)>,
     mut mixer: ResMut<LocomotionMixer>,
 ) {
     if focus.is_focused(LocomotionMixer::ID) || !mixer.core().enabled {
+        return;
+    }
+    // 滞空期参数冻结在起跳那一刻：松手也不该在空中把地速抽走。
+    // 相位照常推进（混合空间每帧都在求值），落地时再把相位写成着地脚。
+    if jump.is_airborne() {
         return;
     }
 

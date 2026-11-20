@@ -10,7 +10,9 @@ use bevy::{
 use crate::GameState;
 use crate::anim::AnimationSet;
 use crate::camera::{CameraRig, GameCamera};
-use crate::input::{ControlInputPlugin, ControlSet, Facing, LookAxis, LookController, MovementController};
+use crate::input::{
+    ControlInputPlugin, ControlSet, Facing, LookAxis, LookController, MovementController,
+};
 use crate::state::SessionMode;
 
 pub struct ScenePlugin;
@@ -33,7 +35,11 @@ impl Plugin for ScenePlugin {
                 // 动画系统拿本帧的朝向误差去选姿态，否则转向权重会慢一帧
                 (ControlSet::Camera, ControlSet::Move, ControlSet::Facing)
                     .chain()
-                    .before(AnimationSet::Drive),
+                    // 采键必须早于动画的 Publish：跳跃锁存在 Publish 里读 `JumpInput`，
+                    // 排在 Drive 之前是不够的——那样「按下那一帧」锁存和状态机都还没看见，
+                    // 联网上行却已经按 `pressed && state == Ground` 合成了电平边沿，
+                    // 服务端当场开始蓄力，客户端随后还在等本地窗口。
+                    .before(AnimationSet::Publish),
             )
             .add_systems(OnEnter(GameState::Game), Self::setup)
             // 关卡是**静态场景**：两端各自按同一份 `LEVEL` 建实体，客户端不再等复制。

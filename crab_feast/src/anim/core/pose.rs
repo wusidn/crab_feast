@@ -98,6 +98,13 @@ impl Pose {
         Self { bones }
     }
 
+    /// 改某根骨骼的局部位移 Y（空中把髋钉在起跳高度时用）。
+    pub fn set_translation_y(&mut self, id: AnimationTargetId, y: f32) {
+        if let Some(bone) = self.bones.get_mut(&id) {
+            bone.translation.y = y;
+        }
+    }
+
     /// 以 `weight` 的比例把 `other` 混进自己（不分配新表）
     pub fn blend_in_place(&mut self, other: &Pose, weight: f32) {
         if weight <= 0.0 {

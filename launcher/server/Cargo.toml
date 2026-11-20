@@ -23,3 +23,14 @@ lightyear = { version = "0.31", default-features = false, features = [
     "udp",
     "netcode",
 ] }
+
+[dev-dependencies]
+# 探针测试要能起一个客户端 App：正式依赖里服务器不需要 client 特性
+lightyear = { version = "0.31", default-features = false, features = [
+    "std",
+    "client",
+    "server",
+    "replication",
+    "udp",
+    "netcode",
+] }

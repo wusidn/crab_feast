@@ -2,6 +2,8 @@ pub mod ik;
 pub mod platform;
 /// 角色运动调参常量（转身限速等），客户端与服务器共用。
 pub mod tuning;
+/// 世界时间速度（慢放/快放）的取值区间，客户端滑杆与服务端夹取共用。
+pub mod world_time;
 
 /// 联网协议（组件 / 消息 / 通道）。
 ///

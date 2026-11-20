@@ -119,6 +119,12 @@ pub struct MoveInput {
     pub dir: [f32; 2],
     pub force: f32,
     pub jump: bool,
+    /// 客户端判出来的起跳大类：0 = 平地，1 = 跳上，2 = 跳下。
+    ///
+    /// 服务端不自己再探一遍：它的 `Transform` 朝向恒等，站定起跳时探不出「前方
+    /// 有没有高台」。客户端在起跳那一帧把结果带上来，两端就取同一档调参
+    /// （蓄力时长 / 离地速度），不会出现「客户端按上跳编排、服务端按平地抬升」。
+    pub jump_kind: u8,
 }
 
 /// client → server：请求加入房间（登录的第一步）。
@@ -132,6 +138,36 @@ pub struct JoinRequest {}
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct Welcome {
     pub player_id: u8,
+}
+
+/// **服务端权威**的世界时间速度，复制给所有客户端。
+///
+/// 挂在服务器上的一个旁观实体（世界时钟）上，客户端只读不写：任意一端拖动调试面板的
+/// 滑杆都会变成一条 [`TimeScaleRequest`]，由服务器改写这里的值再复制下来，
+/// 于是「谁拖的」不重要，所有端看到的世界速度永远是同一个。
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetTimeScale(pub f32);
+
+impl Default for NetTimeScale {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl NetTimeScale {
+    /// 把任意输入夹到合法区间（规则见 [`crate::world_time::clamp_scale`]）。
+    pub fn clamp_speed(value: f32) -> f32 {
+        crate::world_time::clamp_scale(value)
+    }
+}
+
+/// client → server：请求把世界时间速度改成 `value`。
+///
+/// 只是「请求」：服务端会夹到合法区间，改完再复制给所有人。拖动时客户端会节流上行，
+/// 所以服务端收到的永远是最新那一条的近似值，不需要序号。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct TimeScaleRequest {
+    pub value: f32,
 }
 
 /// 输入通道：不可靠 + 只接受最新序号。
@@ -153,6 +189,9 @@ impl Plugin for CrabProtocolPlugin {
         app.component::<NetYaw>().replicate();
         app.component::<NetMotion>().replicate();
         app.component::<NetPlayerId>().replicate_once();
+        // 世界时间速度：整局只有一个值，挂在服务器的「世界时钟」实体上复制下来。
+        // 用 `replicate()`（不是 `replicate_once`）：滑杆每动一次都要同步下去。
+        app.component::<NetTimeScale>().replicate();
         // 关卡几何**不进协议**：静态场景是设计数据，两端各自从同一份关卡
         // 定义建实体（`crab_feast::level::spawn_static_level`）。
         // 复制一份只读几何除了占握手带宽，还会让客户端出现「复制体 + 本地体」
@@ -185,5 +224,8 @@ impl Plugin for CrabProtocolPlugin {
             .add_direction(NetworkDirection::ClientToServer);
         app.register_message::<Welcome>()
             .add_direction(NetworkDirection::ServerToClient);
+        // 世界时间速度：客户端请求、服务端改权威值，结果走 `NetTimeScale` 复制回来
+        app.register_message::<TimeScaleRequest>()
+            .add_direction(NetworkDirection::ClientToServer);
     }
 }
