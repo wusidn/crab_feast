@@ -1033,7 +1033,9 @@ fn send_input(
         .unwrap_or(false);
 
     let (local, force) = if auto {
-        (Vec2::new(0.0, -1.0), 1.0)
+        // 朝 -Z 的开放地面跑：关卡里的方块在 +Z，正着跑会一路顶着方块面摩擦，
+        // 人卡在墙面就走不出步态、也跳不起来（起跳速度被接触吃掉）。
+        (Vec2::new(0.0, 1.0), 1.0)
     } else {
         match *input {
             MovementInput::Idle => (Vec2::ZERO, 0.0),
@@ -1081,6 +1083,7 @@ fn send_input(
             .as_ref()
             .map(|action| action.kind.code())
             .unwrap_or(0),
+        jump_seq: action.as_ref().map(|action| action.jump_seq()).unwrap_or(0),
     };
     for mut sender in senders.iter_mut() {
         sender.send::<ControlChannel>(message);

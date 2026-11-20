@@ -30,6 +30,19 @@
 //! 滞空段是否结束看物理接地（脚下射线 + 残余上升速度归零），不按剪辑固定时长提前退出：
 //! 整段腾空弧线按预测滞空慢放拉伸，播完钉在落地帧等接地，接地后才播放压缩的落地恢复段并淡出。
 //!
+//! # 起跳失败（表现层兜底）
+//!
+//! 写进物理的离地速度不等于人真的离地：顶棚、贴过来的其他刚体、贴墙的摩擦都会在
+//! 接触求解里把它当场吃掉。这种情况下人还站在原处，动作层不能继续锁在滞空姿态上
+//! 等 [`MAX_AIR_HOLD_SECS`] 的兜底超时——那两秒玩家看到的是「按了跳，人卡在半空」。
+//! 判定条件见 [`takeoff_failed`]：根没抬起来、脚底也没离地、人仍然贴地，窗口一到就进
+//! [`JumpState::Abort`]：姿态定格在剪辑的离地帧（不跳到落地恢复段），在
+//! [`ABORT_BLEND_SECS`] 内把权重淡到零交回移动混合，不演一次假的落地缓冲。
+//!
+//! 联网时位置由服务端复制，客户端只用复制下来的权威轨迹做同一个判定——服务端自己
+//! 也会在写速后的验证窗口里退出跳跃状态（见 `launcher/server`），客户端这里负责的是
+//! 表现层：动画必须跟着服务端的结果一起收，不能各演各的。
+//!
 //! # 垂直位移
 //!
 //! 进入滞空那一帧写入一次起跳初速度，之后垂直轨迹交回重力自然抛物，不再用被慢放
@@ -140,12 +153,29 @@ const AIR_GRACE_SECS: f32 = 0.08;
 const AIR_LIFT_DIST: f32 = 0.18;
 /// 空中姿态保持的兜底上限：射线失效 / 落在高台边缘探测不到地面时，超时强制结束滞空段。
 const MAX_AIR_HOLD_SECS: f32 = 2.0;
+/// 起跳失败判定窗口（单机 Dynamic，秒）：进入滞空段这么久，根没抬起来、脚底也没离地，
+/// 就说明这一跳被物理吃回去了（顶棚 / 贴身的别的刚体 / 摩擦卡住）。
+///
+/// 不能等 [`MAX_AIR_HOLD_SECS`] 兜底：那两秒里人明明站在地上，动画却一直锁在
+/// 滞空姿态上，玩家看到的是「按了跳，人卡在半空不动」。
+const TAKEOFF_FAIL_SECS: f32 = 0.15;
+/// 起跳失败判定窗口（联网 Kinematic，秒）：根位置由服务端复制、比按键晚半个 RTT 才到，
+/// 窗口要留够，别把一次真起跳错判成失败。
+const NET_TAKEOFF_FAIL_SECS: f32 = 0.25;
+/// 「根真的升起来了」的位移阈值（米）：与 [`AIR_LIFT_DIST`] 同口径。
+///
+/// 不能用「抬了一点点」当成功：顶棚只差几厘米时，离散求解器在起跳那一 tick 里
+/// 仍能让人穿进去几厘米再被推回来，那不是一次起跳，是撞顶。真要算成功，
+/// 根得抬到脚离地那一步——低于它，玩家看到的就是「蹲一下、跳一下、人还在原地」。
+const TAKEOFF_RISE_EPS: f32 = AIR_LIFT_DIST;
+/// 起跳失败后动作层的淡出时长（秒）：这一跳没有落地冲击可演，不走完整的落地恢复段。
+const ABORT_BLEND_SECS: f32 = 0.08;
 /// 本地 Dynamic 角色的起跳初速度（m/s）。
 ///
 /// 这是**下限**而不是兜底：实测速度只有在明显高于它（真的被别的力弹起来）
 /// 时才采用，噪声级的小正值一律按这个速度起跳。低于它的起跳会变成几厘米的
 /// 抽搐——「按了跳，人只抬了一下」。
-const LOCAL_LAUNCH_VY: f32 = 2.6;
+const LOCAL_LAUNCH_VY: f32 = 5.0;
 /// 远端 Kinematic 复制体无速度组件，按服务端高跳速度预测滞空（m/s）。
 const REMOTE_LAUNCH_VY: f32 = 5.0;
 /// 滞空预测系数：对称抛物线 `2·vy/g` 再乘这个缓冲。
@@ -480,7 +510,9 @@ impl Timeline {
     /// - `Takeoff`：蓄力段 `entry → takeoff`；
     /// - `Air`：整段腾空弧线 `takeoff → land` 按 `slow` 慢放拉伸；滞空比剪辑
     ///   长时钉在落地帧，等接地信号，不回绕、不循环；
-    /// - `Land`：接地后恢复段 `land → end`。
+    /// - `Land`：接地后恢复段 `land → end`；
+    /// - `Abort`：起跳失败，定格在离地帧 `takeoff`（**不**取 `land`），权重由动作层
+    ///   在 [`ABORT_BLEND_SECS`] 内淡出，姿态不回弹、也不假装落地。
     fn clip_time(
         self,
         state: JumpState,
@@ -514,11 +546,17 @@ impl Timeline {
                     self.end
                 }
             }
+            // 起跳失败：定格在离地那一帧的姿态。取 `land` 会让人在半空摆出踩地
+            // 的恢复姿势，再在这上面淡出——玩家看到的是一次凭空的「落地回弹」。
+            JumpState::Abort => self.takeoff,
             JumpState::Queued => self.entry,
         }
     }
 
     /// 按状态求动作层权重：蓄力 / 滞空保持淡入后的权重，落地恢复段淡出交回移动混合。
+    ///
+    /// `Abort` 的权重不在这里算：失败那一帧要从**上一帧**的权重开始往下淡，这里返回
+    /// 0 会把淡出起点直接抹掉，所以由动作层用 [`ABORT_BLEND_SECS`] 逐帧递减。
     fn weight(self, state: JumpState, elapsed: f32, land_time: f32) -> f32 {
         let fade_in = (elapsed / self.blend_secs.max(f32::EPSILON)).clamp(0.0, 1.0);
         match state {
@@ -527,7 +565,7 @@ impl Timeline {
                 let k = (land_time / self.recover_secs.max(f32::EPSILON)).clamp(0.0, 1.0);
                 (fade_in * (1.0 - k)).clamp(0.0, 1.0)
             }
-            JumpState::Ground | JumpState::Queued => 0.0,
+            JumpState::Abort | JumpState::Ground | JumpState::Queued => 0.0,
         }
     }
 }
@@ -606,6 +644,11 @@ pub enum JumpState {
     Air,
     /// 落地冲击 + 融回移动
     Land,
+    /// 起跳被物理吃掉：姿态冻在离地帧，快速淡出交回移动混合。
+    ///
+    /// 这一跳没有落地冲击可演，所以**不走** [`JumpState::Land`] 的恢复段——那一段是
+    /// 按真实触地设计的，硬播一次就是凭空多出来的一个落地缓冲。
+    Abort,
 }
 
 /// 跳跃动作层的全部状态。资源是单实例的：本作的动画栈本来就只有一个本地角色。
@@ -655,6 +698,10 @@ pub struct JumpAction {
     land_time: f32,
     /// 滞空段累计时长（含姿态保持），用于宽限判定和兜底超时。
     air_hold: f32,
+    /// 起跳那一帧的根高度（世界 Y）：判断这一跳有没有真的把根抬起来。
+    takeoff_y: f32,
+    /// 根是否已经明显升离 [`JumpAction::takeoff_y`]：起跳成功的直接证据。
+    climbed: bool,
     /// 滞空期间是否已经确认离开地面（脚底距地 > [`AIR_LIFT_DIST`]）。
     /// 没抬起来过就不判落地：小速度起跳时人还贴着地面，射线会立刻判「接地」。
     air_lifted: bool,
@@ -662,6 +709,12 @@ pub struct JumpAction {
     launch_vy: f32,
     /// 空中姿态慢放系数（≤1）：预测滞空比剪辑空中段越长，放得越慢。
     slow: f32,
+    /// 起跳请求序号：每 `begin` 一次自增，随上行快照发给服务端。
+    ///
+    /// 线上传的是状态快照，只靠 `jump` 电平推上升沿会丢（两帧之间的回落可能被
+    /// 合包压平，落地恢复段里的第二跳还会跟上一跳共用一个电平）。把序号放进每条
+    /// 快照，服务端比较 `prev_seq != seq` 就认得出新的一跳。
+    jump_seq: u8,
     /// 落地恢复段的相位对齐基准，**进入 Land 那一帧算一次**，之后整段不变。
     ///
     /// 每帧按「当前权重最大的移动剪辑」现算会让目标相位跟着权重跳：跑着落地
@@ -698,9 +751,12 @@ impl Default for JumpAction {
             air_time: 0.0,
             land_time: 0.0,
             air_hold: 0.0,
+            takeoff_y: 0.0,
+            climbed: false,
             air_lifted: false,
             launch_vy: 0.0,
             slow: 1.0,
+            jump_seq: 0,
             land_phase_target: 0.0,
             land_phase_advance: 0.0,
             land_aligned: false,
@@ -733,6 +789,12 @@ impl JumpAction {
         } else {
             self.clip
         }
+    }
+
+    /// 起跳请求序号：客户端每起跳一次自增，服务端用它认「新的一跳」。
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub fn jump_seq(&self) -> u8 {
+        self.jump_seq
     }
 
     /// 请求是否还挂着（已锁存、尚未起跳）。联网上行用它决定是否先让出电平。
@@ -773,6 +835,7 @@ impl Plugin for JumpPlugin {
 ///
 /// 落地恢复段（[`JumpState::Land`]）里按下也算数：那 0.2 秒里人看着已经站稳了，
 /// 这一下若被丢掉，玩家只会觉得「按了没反应」。请求先挂起，回到地面就起跳。
+/// 起跳失败后的 [`JumpState::Abort`] 同理：人本来就还站在地上，只差几十毫秒淡出。
 fn latch_jump_request(input: Res<JumpInput>, mut action: ResMut<JumpAction>) {
     match *input {
         JumpInput::Activated => {
@@ -780,7 +843,7 @@ fn latch_jump_request(input: Res<JumpInput>, mut action: ResMut<JumpAction>) {
                 action.hold_latched = true;
                 if matches!(
                     action.state,
-                    JumpState::Ground | JumpState::Queued | JumpState::Land
+                    JumpState::Ground | JumpState::Queued | JumpState::Land | JumpState::Abort
                 ) {
                     action.queued = true;
                     action.queued_for = 0.0;
@@ -873,6 +936,8 @@ fn drive_jump(
             .flatten();
         let tuning = tunings.get(profile);
         let clip = resolve_clip(kind, &driver, &clips);
+        // 起跳基线：这一跳有没有真的把根抬起来，从起跳这一帧的根高度开始量
+        let takeoff_y = transform.map_or(0.0, |t| t.translation.y);
 
         // 联网：这具身体的位置由服务端抬升，蓄力段按服务端的蓄力时长对齐，
         // 让动画的离地帧落在根位置真正开始上升的那一刻。
@@ -889,6 +954,7 @@ fn drive_jump(
             clip,
             tuning,
             take_secs,
+            takeoff_y,
         ) {
             action.queued = false;
             action.state = JumpState::Ground;
@@ -949,6 +1015,14 @@ fn drive_jump(
     if ground_dist.is_some_and(|d| d > AIR_LIFT_DIST) {
         action.air_lifted = true;
     }
+    // 确认上升：根比起身跳那一帧高了 TAKEOFF_RISE_EPS 才算物理真的把人抬起来。
+    // 联网时读的是复制下来的服务端位置，是权威轨迹；单机读的是本地物理结果。
+    if !action.climbed
+        && let Some(t) = transform
+        && t.translation.y > action.takeoff_y + TAKEOFF_RISE_EPS
+    {
+        action.climbed = true;
+    }
 
     // 各段内进度累计：空中段播完后冻结在落地预备姿态，落地后才走恢复段。
     match action.state {
@@ -974,7 +1048,29 @@ fn drive_jump(
             // 没抬起来过就不判落地：小速度起跳时人还贴着地面，射线会立刻判「接地」
             let landed = past_grace && action.air_lifted && grounded;
             let timed_out = action.air_hold >= action.tuning.max_air_hold;
-            if landed || timed_out {
+            // 起跳失败：物理把这一跳顶回去了。顶棚、贴身压过来的刚体、贴墙的摩擦
+            // 都会把写入的离地速度当场吃掉——根不升、脚不离地，人还站在原处。
+            // 不等 `max_air_hold` 兜底（2 秒），窗口一到就进 Abort 定格淡出。
+            let fail_after = if kinematic {
+                NET_TAKEOFF_FAIL_SECS
+            } else {
+                TAKEOFF_FAIL_SECS
+            };
+            let failed = takeoff_failed(
+                action.air_hold,
+                fail_after,
+                action.climbed,
+                action.air_lifted,
+                grounded,
+            );
+            if failed {
+                debug!(
+                    "jump: 起跳失败（根未抬升、脚未离地），{:.2}s 退出跳跃状态、定格离地帧淡出：{}",
+                    action.air_hold,
+                    action.clip_name()
+                );
+                JumpState::Abort
+            } else if landed || timed_out {
                 JumpState::Land
             } else {
                 JumpState::Air
@@ -987,6 +1083,14 @@ fn drive_jump(
                 JumpState::Ground
             }
         }
+        // 起跳失败：权重淡到零就回地面。这一跳没有落地冲击，不等恢复段。
+        JumpState::Abort => {
+            if action.weight <= 0.0 {
+                JumpState::Ground
+            } else {
+                JumpState::Abort
+            }
+        }
         _ => JumpState::Ground,
     };
 
@@ -997,7 +1101,14 @@ fn drive_jump(
         action.land_time,
         action.slow,
     );
-    action.weight = timeline.weight(action.state, elapsed, action.land_time);
+    action.weight = if action.state == JumpState::Abort {
+        // 起跳被物理吃掉的那一跳：从上一帧的权重开始，在 ABORT_BLEND_SECS 内淡出
+        // 交回移动混合。时间轴那套「落地恢复段随 land_time 淡出」是按真实触地冲击
+        // 设计的，这里人根本没离开地面，按它走会多演一次落地缓冲。
+        (action.weight - dt / ABORT_BLEND_SECS).max(0.0)
+    } else {
+        timeline.weight(action.state, elapsed, action.land_time)
+    };
     action.root_y = root_y_at(&action, action.clip_time);
     // 现场调参用：`CRAB_LOG_JUMP=1` 逐帧打出状态机（状态 / 权重 / 剪辑时间 / 接地距离 /
     // 移动相位 / 支撑权重），用来看空中是不是还在跑、落地交接有没有跳。
@@ -1104,6 +1215,22 @@ fn drive_jump(
 /// 窗口没开时是否也该放行：等满一个步幅周期就强制起跳。
 fn takeoff_allowed(window_open: bool, queued_for: f32) -> bool {
     window_open || queued_for >= QUEUE_MAX_WAIT
+}
+
+/// 滞空段是否该判「起跳失败」。
+///
+/// 三个条件必须同时成立：根没升起来（`climbed == false`）、脚底也没抬离地面过
+/// （`air_lifted == false`）、而且人还贴在地上（`grounded`）。任一不成立就说明
+/// 这具身体真的飞起来了，按正常滞空走完，绝不提前收尾——宁可晚退，也不能把
+/// 一次真起跳的动画剪掉。
+fn takeoff_failed(
+    air_hold: f32,
+    fail_after: f32,
+    climbed: bool,
+    air_lifted: bool,
+    grounded: bool,
+) -> bool {
+    air_hold >= fail_after && !climbed && !air_lifted && grounded
 }
 
 /// 起跳初速度：取实测与**本档**标定值的较大者。
@@ -1217,23 +1344,27 @@ fn running_window(contacts: [f32; 2], phase: Option<f32>, gait: Option<&ClipGait
 ///
 /// 上行是「空口上的按键电平 + 服务端查上升沿」，所以只推迟边沿、不吞请求：
 ///
-/// - 请求已锁存但还在等窗口（`queued`）：发 `false`，让出电平；
-/// - 动作执行中（Takeoff / Air / Land）：一直发 `true`。玩家点一下就松手时，
-///   起跳那一帧依然会把上升沿送出去；整个动作期间保持为真，落地后也不会
-///   冒出一个多余的边沿触发二段跳；
-/// - 站在地上：跟随按键。
+/// - 动作执行中（Takeoff / Air / Land）：**永远发 `true`**，按键抬起也不改。
+///   电平跟的是动作状态、不是按键：一次跳跃一旦触发就要演完，提前回落会让
+///   服务端以为这一跳已经结束；
+/// - 已锁存但还没起跳（Queued / 地面等待）：发 `false`，让出电平，起跳那一帧
+///   再发上升沿（相位锁定只推迟边沿、不吞请求）；
+/// - 回到地面：跟随按键，但**挂着的下一次请求**要先让出电平——否则连跳时
+///   两跳共用同一个上升沿，服务端第二跳不会被触发。
 ///
 /// 等窗口超时后动作层会强制起跳，这里自然就把边沿发出去了——**相位锁定
 /// 延后跳跃，不禁止跳跃**。
 #[cfg_attr(not(feature = "net"), allow(dead_code))]
 pub fn uplink_jump_level(state: JumpState, queued: bool, jump_pressed: bool) -> bool {
-    if queued {
-        return false;
-    }
     match state {
+        // 跳跃执行中：锁电平，直到 Land / Abort 演完回到地面才允许变化。
+        // Abort 也锁住：这一跳的收尾还挂在客户端，提前回落会让服务端把
+        // 「上一跳的余波」和「下一次按键」混成同一个电平。
+        JumpState::Takeoff | JumpState::Air | JumpState::Land | JumpState::Abort => true,
+        // 还没起跳：让出电平，边沿留到真正起跳那一帧
         JumpState::Queued => false,
-        JumpState::Takeoff | JumpState::Air | JumpState::Land => true,
-        JumpState::Ground => jump_pressed,
+        // 地面：跟随按键；锁存着的请求要先让出电平，下一跳才有干净的上升沿
+        JumpState::Ground => jump_pressed && !queued,
     }
 }
 
@@ -1375,6 +1506,7 @@ fn begin(
     clip: &'static str,
     tuning: JumpTuning,
     take_secs: Option<f32>,
+    takeoff_y: f32,
 ) -> bool {
     let Some(skeleton) = driver.skeleton.as_ref() else {
         warn!("[jump-begin] 失败：骨架未就绪");
@@ -1428,8 +1560,12 @@ fn begin(
     action.land_time = 0.0;
     action.air_hold = 0.0;
     action.air_lifted = false;
+    // 起跳基线：这一跳到底有没有把根抬起来，就从这里开始量
+    action.takeoff_y = takeoff_y;
+    action.climbed = false;
     action.launch_vy = 0.0;
     action.slow = 1.0;
+    action.jump_seq = action.jump_seq.wrapping_add(1);
     action.state = JumpState::Takeoff;
     action.queued = false;
     action.queued_for = 0.0;
@@ -2433,11 +2569,15 @@ mod tests {
         assert!(uplink_jump_level(JumpState::Takeoff, false, false));
         assert!(uplink_jump_level(JumpState::Air, false, false));
         assert!(uplink_jump_level(JumpState::Land, false, false));
+        assert!(uplink_jump_level(JumpState::Abort, false, false));
         // 地面跟随按键
         assert!(uplink_jump_level(JumpState::Ground, false, true));
         assert!(!uplink_jump_level(JumpState::Ground, false, false));
-        // 落地恢复段里新锁存了一条请求：先让出电平，下一跳才有干净的上升沿
-        assert!(!uplink_jump_level(JumpState::Land, true, true));
+        // 跳跃执行中锁电平：落地恢复段里按下的下一跳不能把电平提前拉下来，
+        // 否则服务端会认为这一跳已经结束
+        assert!(uplink_jump_level(JumpState::Land, true, true));
+        // 但回到地面时，锁存中的请求必须先让出电平，下一跳才有干净的上升沿
+        assert!(!uplink_jump_level(JumpState::Ground, true, true));
     }
 
     /// 动作层接管判定：地面与排队都不算接管，避免排队期间接触权重被清零卡死窗口
@@ -2451,6 +2591,30 @@ mod tests {
         for state in [JumpState::Takeoff, JumpState::Air, JumpState::Land] {
             action.state = state;
             assert!(action.is_active(), "{:?} 应算接管", state);
+        }
+        // 起跳失败的淡出段也算接管：姿态还挂在动作层上，这时放开脚 IK 会把
+        // 半蹬出去的腿当场钉回地面，看着就是一顿抽。
+        action.state = JumpState::Abort;
+        assert!(action.is_active());
+    }
+
+    /// 起跳失败：姿态定格在离地帧，而不是跳到落地恢复段。
+    ///
+    /// 失败时人还站在原处，没有落地冲击可演。若按 `Land` 取剪辑时间，动作层会在
+    /// 权重还是 1.0 的那一帧摆出「落地踩实」的恢复姿势，再在这上面淡出——玩家看到
+    /// 的是一次凭空的落地回弹。定格在 `takeoff` 则只是把蹬伸姿态收回移动混合。
+    #[test]
+    fn failed_jump_freezes_the_takeoff_frame() {
+        for spec in [SPEC_STATIC, SPEC_RUN, SPEC_UP, SPEC_DOWN] {
+            let tl = build_timeline(&spec);
+            assert!((tl.clip_time(JumpState::Abort, 0.0, 0.0, 0.0, 1.0) - tl.takeoff).abs() < 1e-4);
+            // 滞空段无论已经飞了多久，失败后都定格在离地帧，不再往前推
+            for air in [0.0, 0.05, 0.3, tl.air_secs] {
+                let frozen = tl.clip_time(JumpState::Abort, 0.0, air, 0.0, 0.5);
+                assert!((frozen - tl.takeoff).abs() < 1e-4, "{air}s: {frozen}");
+            }
+            // 落地恢复段的起点是另一帧，绝不能被拿来冒充格
+            assert!((tl.takeoff - tl.land).abs() > 1e-3);
         }
     }
 
@@ -2514,6 +2678,44 @@ mod tests {
             timeline,
             ..RemoteJump::default()
         }
+    }
+
+    #[test]
+    fn failed_takeoff_only_when_blocked() {
+        // 窗口到、根没升、脚没离地、人还贴地 → 这一跳被物理吃掉了
+        assert!(takeoff_failed(
+            TAKEOFF_FAIL_SECS,
+            TAKEOFF_FAIL_SECS,
+            false,
+            false,
+            true
+        ));
+        // 窗口没到：先别认输，可能只是物理还没把它抬起来
+        assert!(!takeoff_failed(0.02, TAKEOFF_FAIL_SECS, false, false, true));
+        // 根升起来了 → 真起跳，绝不能提前收尾
+        assert!(!takeoff_failed(
+            MAX_AIR_HOLD_SECS,
+            TAKEOFF_FAIL_SECS,
+            true,
+            false,
+            true
+        ));
+        // 脚底抬离过地面 → 真起跳
+        assert!(!takeoff_failed(
+            MAX_AIR_HOLD_SECS,
+            TAKEOFF_FAIL_SECS,
+            false,
+            true,
+            true
+        ));
+        // 人已经不在接地状态（掉下高台 / 还在上升）→ 不算失败
+        assert!(!takeoff_failed(
+            MAX_AIR_HOLD_SECS,
+            TAKEOFF_FAIL_SECS,
+            false,
+            false,
+            false
+        ));
     }
 
     /// 远端观察：起跳剪辑从离地帧起播、滞空钉在落地帧、触地即进落地段

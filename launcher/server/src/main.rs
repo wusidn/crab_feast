@@ -43,6 +43,17 @@ const RUN_JUMP_SPEED: f32 = 1.5;
 /// 量级的残余速度（实测 0.192 反复出现），拿 0.1 当界线会把贴地当成「在蹬升」，
 /// 蓄力每 tick 被清掉、跳跃永远不触发。界线要拉开噪声一个量级。
 const GROUND_NOISE_VY: f32 = 0.5;
+/// 起跳请求到达时服务端还没判接地，保留多久重试窗口（秒）。
+const REQUEST_RETRY_SECS: f32 = 0.1;
+/// 起跳写速后的验证窗口（秒）。物理每 tick 都在解算，0.12s 足够看出根有没有被抬起来；
+/// 再长就成了「人已经飞出去半米，服务端才回头认账」。
+const LAUNCH_VERIFY_SECS: f32 = 0.12;
+/// 验证时判定「根真的抬起来了」的最小位移（米）。
+///
+/// 顶着 5 m/s 的离地速度，0.12s 里正常起跳至少能抬 0.5m；被顶棚挡住时离散求解器
+/// 也只来得及穿进去几厘米（随后被推回来）。取 0.15m：只认「像一次起跳」的抬升，
+/// 被顶棚削成几厘米的那一下照样判失败。
+const LAUNCH_MIN_RISE: f32 = 0.15;
 /// 一个房间最多多少个玩家位。
 ///
 /// `player_id` 是 u8，但真正的上限是「复制带宽 ÷ 每人下行」，
@@ -439,10 +450,28 @@ struct JumpCharge {
     charging: bool,
     /// 已蓄力秒数
     elapsed: f32,
-    /// 上一 tick 的起跳按键电平
+    /// 上一 tick 的起跳按键电平（只用来打日志）
     prev_jump: bool,
+    /// 上一次见到过的起跳请求序号：`seq` 变化就是新的一跳。
+    ///
+    /// 不用「电平上升沿」判：输入是状态快照、通道不可靠，一次回落可能根本
+    /// 没被观察到（被合包压平或那一帧丢包），那样这一跳只会被客户端演。
+    prev_seq: u8,
+    /// 已经收到、但到达时服务端判定「没接地」的新请求，还能重试多久。
+    ///
+    /// 客户端只在**它自己**判定的接地帧才开始起跳，服务端晚一两拍认同就会有
+    /// 一次「请求已到、人却没接地」，当场丢掉的话这一跳只有客户端在演。
+    retry_secs: f32,
     /// 这一跳的大类（由客户端上行 `jump_kind` 带上来）：决定取哪一档调参。
     kind: JumpKind,
+    /// 起跳写速后还剩多久验证（秒）。`>0` 表示「已经写了离地速度，等物理交结果」。
+    ///
+    /// 写进 `LinearVelocity` 不等于人真的离地：顶棚、贴过来的别的刚体、
+    /// 贴墙的摩擦都会在接触求解里把竖直速度吃掉。根没抬起来就必须及时退出
+    /// 跳跃状态，不能留着一个「已经起跳」的假状态。
+    verify_secs: f32,
+    /// 写离地速度那一 tick 的根高度，跟当前高度比出「到底抬没抬」。
+    launch_y: f32,
 }
 
 /// 消费消息，只把最新一条存到 link 上。
@@ -463,7 +492,10 @@ fn collect_inputs(
         }
         if let Some(input) = newest {
             if input.jump && !latest.0.jump {
-                info!("server: 收到跳跃上升沿");
+                info!(
+                    "server: 收到跳跃请求 seq={} kind={}",
+                    input.jump_seq, input.jump_kind
+                );
             }
             latest.0 = input;
             grace.0 = INPUT_GRACE_SECS;
@@ -501,6 +533,7 @@ fn drive_avatars(
             charge.charging = false;
             charge.elapsed = 0.0;
             charge.prev_jump = false;
+            charge.verify_secs = 0.0;
             continue;
         }
         grace.0 -= dt;
@@ -530,9 +563,31 @@ fn drive_avatars(
         // 这一跳走哪一档由客户端在起跳帧带上来；蓄力期间每 tick 更新一次，
         // 客户端的消息比上升沿晚一帧也不会用错档。
         charge.kind = JumpKind::from_code(latest.0.jump_kind);
+
+        // 上一 tick 刚写过离地速度：拿这一 tick 的物理结果验证到底起没起跳。
+        // 写进 `LinearVelocity` 只是「请求」，物理会照样把它压回去。
+        if charge.verify_secs > 0.0 {
+            charge.verify_secs -= dt;
+            if transform.translation.y - charge.launch_y > LAUNCH_MIN_RISE {
+                // 根真的抬起来了：起跳成立，结束验证
+                charge.verify_secs = 0.0;
+            } else if charge.verify_secs <= 0.0 {
+                // 根一直没抬起来：顶棚 / 贴身的别的刚体 / 摩擦把起跳吃掉了。
+                // 及时退出跳跃状态，别留一个「已经在飞」的假状态。
+                charge.verify_secs = 0.0;
+                charge.charging = false;
+                charge.elapsed = 0.0;
+                charge.retry_secs = 0.0;
+                info!(
+                    "server: 起跳失败（根未抬升），退出跳跃状态 y={:.3} vy={:.3} grounded={grounded}",
+                    transform.translation.y, velocity.0.y
+                );
+            }
+        }
         let launched = advance_charge(
             &mut charge,
             latest.0.jump,
+            latest.0.jump_seq,
             grounded,
             velocity.0.y,
             intent.measured,
@@ -541,6 +596,34 @@ fn drive_avatars(
         );
         if let Some(vy) = launched {
             velocity.0.y = vy;
+            // 写速只是请求：从下一 tick 起拿根高度验证物理有没有真的把人抬起来
+            charge.verify_secs = LAUNCH_VERIFY_SECS;
+            charge.launch_y = transform.translation.y;
+            // 现场排查用：`CRAB_LOG_SRV=1` 看服务端到底给了多少离地速度、从哪个高度给的。
+            if std::env::var("CRAB_LOG_SRV").is_ok() {
+                info!(
+                    "srv launch vy={vy:.2} y={:.3} xz={:.2},{:.2} grounded={grounded} measured={:.2} kind={:?}",
+                    transform.translation.y,
+                    transform.translation.x,
+                    transform.translation.z,
+                    intent.measured,
+                    charge.kind
+                );
+            }
+        }
+        // 逐帧：起跳后把竖直速度与高度打出来，用来区分「初速度不够」和「人被卡住」
+        if std::env::var("CRAB_LOG_SRV").is_ok()
+            && (charge.charging || velocity.0.y.abs() > 0.02)
+        {
+            info!(
+                "srv av y={:.3} vy={:.3} xz={:.2},{:.2} grounded={grounded} charging={} el={:.3}",
+                transform.translation.y,
+                velocity.0.y,
+                transform.translation.x,
+                transform.translation.z,
+                charge.charging,
+                charge.elapsed
+            );
         }
     }
 }
@@ -554,6 +637,7 @@ fn drive_avatars(
 fn advance_charge(
     charge: &mut JumpCharge,
     jump: bool,
+    jump_seq: u8,
     grounded: bool,
     upward_speed: f32,
     ground_speed: f32,
@@ -566,13 +650,26 @@ fn advance_charge(
         charge.charging = false;
         charge.elapsed = 0.0;
     }
-    let pressed = jump && !charge.prev_jump;
+    // 新的一跳 = 序号变了（不依赖电平回落被观察到）；电平仍要压住，
+    // 客户端在等窗口/落地期间会把电平让出来，那段时间不该被认成请求。
+    let pressed = jump && jump_seq != charge.prev_seq;
+    if pressed {
+        charge.prev_seq = jump_seq;
+        // 新请求覆盖旧的验证：上一跳的「抬没抬」跟这一跳无关
+        charge.verify_secs = 0.0;
+        // 到达时没接地：留着 0.1s 重试窗口，别把请求当场判死
+        charge.retry_secs = if grounded { 0.0 } else { REQUEST_RETRY_SECS };
+    }
     charge.prev_jump = jump;
 
     if !charge.charging {
-        if pressed && grounded && upward_speed <= GROUND_NOISE_VY {
+        let want = pressed || charge.retry_secs > 0.0;
+        if want && grounded && upward_speed <= GROUND_NOISE_VY {
             charge.charging = true;
             charge.elapsed = 0.0;
+            charge.retry_secs = 0.0;
+        } else if charge.retry_secs > 0.0 {
+            charge.retry_secs = (charge.retry_secs - dt).max(0.0);
         }
         return None;
     }
@@ -741,10 +838,10 @@ mod jump_charge_tests {
     fn rising_edge_begins_but_does_not_launch_immediately() {
         let mut c = charge();
         // 上升沿当帧进入蓄力，不给离地速度
-        assert!(advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_none());
+        assert!(advance_charge(&mut c, true, 1, true, 0.0, 0.0, &tunings(), DT).is_none());
         assert!(c.charging);
         // 只攒了一帧，远没到站立蓄力时长
-        assert!(advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_none());
+        assert!(advance_charge(&mut c, true, 1, true, 0.0, 0.0, &tunings(), DT).is_none());
     }
 
     #[test]
@@ -753,13 +850,13 @@ mod jump_charge_tests {
         let mut launched = false;
         let mut ticks = 0;
         while !launched && ticks < 120 {
-            launched = advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_some();
+            launched = advance_charge(&mut c, true, 1, true, 0.0, 0.0, &tunings(), DT).is_some();
             ticks += 1;
         }
         assert!(launched, "站立档蓄满应给一次离地速度");
         assert!(!c.charging);
         // 已经离地，按住也不会二次起跳
-        assert!(advance_charge(&mut c, true, false, stand_launch(), 0.0, &tunings(), DT).is_none());
+        assert!(advance_charge(&mut c, true, 1, false, stand_launch(), 0.0, &tunings(), DT).is_none());
     }
 
     #[test]
@@ -767,22 +864,22 @@ mod jump_charge_tests {
         let mut c = charge();
         // 先蓄满跳起来
         for _ in 0..60 {
-            advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT);
+            advance_charge(&mut c, true, 1, true, 0.0, 0.0, &tunings(), DT);
         }
         // 空中：向上速度清掉残留蓄力
-        advance_charge(&mut c, true, false, stand_launch(), 0.0, &tunings(), DT);
+        advance_charge(&mut c, true, 1, false, stand_launch(), 0.0, &tunings(), DT);
         // 落地但按键仍按住：上升沿已过，不重新蓄力、不连跳
-        assert!(advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT).is_none());
+        assert!(advance_charge(&mut c, true, 1, true, 0.0, 0.0, &tunings(), DT).is_none());
         assert!(!c.charging);
     }
 
     #[test]
     fn charge_cancelled_when_walking_off_edge() {
         let mut c = charge();
-        advance_charge(&mut c, true, true, 0.0, 0.0, &tunings(), DT);
+        advance_charge(&mut c, true, 1, true, 0.0, 0.0, &tunings(), DT);
         assert!(c.charging);
         // 走出平台边缘 → 取消蓄力，自由下落
-        advance_charge(&mut c, true, false, 0.0, 0.0, &tunings(), DT);
+        advance_charge(&mut c, true, 1, false, 0.0, 0.0, &tunings(), DT);
         assert!(!c.charging);
     }
 
@@ -792,7 +889,7 @@ mod jump_charge_tests {
         let mut launched = false;
         let mut ticks = 0;
         while !launched && ticks < 120 {
-            launched = advance_charge(&mut c, true, true, 0.0, RUN_JUMP_SPEED, &tunings(), DT).is_some();
+            launched = advance_charge(&mut c, true, 1, true, 0.0, RUN_JUMP_SPEED, &tunings(), DT).is_some();
             ticks += 1;
         }
         assert!(launched);
@@ -803,7 +900,7 @@ mod jump_charge_tests {
     #[test]
     fn air_jump_is_ignored() {
         let mut c = charge();
-        assert!(advance_charge(&mut c, true, false, 1.0, 0.0, &tunings(), DT).is_none());
+        assert!(advance_charge(&mut c, true, 1, false, 1.0, 0.0, &tunings(), DT).is_none());
         assert!(!c.charging);
     }
 
@@ -817,7 +914,7 @@ mod jump_charge_tests {
         let mut launched = false;
         let mut ticks = 0;
         while !launched && ticks < 120 {
-            launched = advance_charge(&mut c, true, true, noise, 0.0, &tunings(), DT).is_some();
+            launched = advance_charge(&mut c, true, 1, true, noise, 0.0, &tunings(), DT).is_some();
             ticks += 1;
         }
         assert!(launched, "接触补偿的微小正速度不应打断蓄力");
@@ -831,7 +928,7 @@ mod jump_charge_tests {
         let mut launched = false;
         let mut ticks = 0;
         while !launched && ticks < 120 {
-            launched = advance_charge(&mut c, true, true, 0.192_409_41, 0.0, &tunings(), DT).is_some();
+            launched = advance_charge(&mut c, true, 1, true, 0.192_409_41, 0.0, &tunings(), DT).is_some();
             ticks += 1;
         }
         assert!(launched, "0.19 m/s 的贴地噪声不应打断蓄力");
@@ -956,6 +1053,8 @@ mod physics_probe {
         }
         if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
             li.0.jump = true;
+            // 服务端按序号认「新的一跳」：只抬电平不抬序号不算请求
+            li.0.jump_seq = 1;
         }
 
         let mut peak = 1.0f32;
@@ -1037,6 +1136,8 @@ mod physics_probe {
 
         if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
             li.0.jump = true;
+            // 服务端按序号认「新的一跳」：只抬电平不抬序号不算请求
+            li.0.jump_seq = 1;
         }
         let mut peak = rest_y;
         for _ in 0..200 {
@@ -1051,5 +1152,102 @@ mod physics_probe {
             peak > rest_y + 0.4,
             "方块顶上应能起跳，静止 {rest_y} 峰值 {peak}"
         );
+    }
+
+    /// 头顶贴着刚体（顶棚只留 2cm 净空）时，写入的离地速度会被接触求解当场吃掉。
+    /// 根抬不起来就必须及时退出跳跃状态：不能留着 `charging` / 验证计时在那儿，
+    /// 更不能让客户端一直等一个不会发生的离地。
+    #[test]
+    fn blocked_jump_exits_jump_state() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default()).init_asset::<Mesh>();
+        app.add_message::<AssetEvent<Mesh>>();
+        app.add_plugins((MinimalPlugins, TransformPlugin, PhysicsPlugins::default()))
+            .init_resource::<JumpTunings>()
+            .add_systems(FixedUpdate, drive_avatars)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                1.0 / 60.0,
+            )));
+        app.finish();
+
+        // 地面：顶面 y = 0
+        app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::cuboid(20.0, 1.0, 20.0),
+            Transform::from_xyz(0.0, -0.5, 0.0),
+        ));
+        // 顶棚：底面 y = 1.42，胶囊站着时头顶 1.40，只留 2cm
+        app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::cuboid(2.0, 1.0, 2.0),
+            Transform::from_xyz(0.0, 1.92, 0.0),
+        ));
+
+        let link = app
+            .world_mut()
+            .spawn((LatestInput(MoveInput::default()), InputGrace(INPUT_GRACE_SECS)))
+            .id();
+        let avatar = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::capsule(0.2, 1.0),
+                LockedAxes::ROTATION_LOCKED,
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                LinearVelocity::ZERO,
+                JumpCharge::default(),
+                AvatarIntent::default(),
+                Transform::from_xyz(0.0, 0.7, 0.0),
+            ))
+            .id();
+        app.world_mut().insert_resource(Room {
+            next_player_id: 0,
+            avatar_of_link: HashMap::from([(link, avatar)]),
+        });
+
+        // 先贴地站定
+        for _ in 0..40 {
+            app.update();
+        }
+        let rest_y = app.world().entity(avatar).get::<Transform>().unwrap().translation.y;
+
+        if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
+            li.0.jump = true;
+            // 服务端按序号认「新的一跳」：只抬电平不抬序号不算请求
+            li.0.jump_seq = 1;
+        }
+        let mut peak = rest_y;
+        let mut cleared_at = None;
+        let mut ever_charging = false;
+        for tick in 0..240 {
+            if let Some(mut gr) = app.world_mut().get_mut::<InputGrace>(link) {
+                gr.0 = INPUT_GRACE_SECS;
+            }
+            app.update();
+            let tr = app.world().entity(avatar).get::<Transform>().unwrap();
+            peak = peak.max(tr.translation.y);
+            let ch = app.world().entity(avatar).get::<JumpCharge>().unwrap();
+            ever_charging |= ch.charging;
+            if tick > 0 && ever_charging && !ch.charging && ch.verify_secs <= 0.0 {
+                cleared_at = cleared_at.or(Some(tick));
+            }
+        }
+
+        let ch = app.world().entity(avatar).get::<JumpCharge>().unwrap();
+        assert!(
+            peak - rest_y < 0.15,
+            "顶棚只留 2cm，根不该被抬起来：静止 {rest_y} 峰值 {peak}"
+        );
+        assert!(
+            !ch.charging && ch.verify_secs <= 0.0 && ch.retry_secs <= 0.0,
+            "被阻挡的起跳必须退出跳跃状态，实际 charging={} verify={} retry={}",
+            ch.charging,
+            ch.verify_secs,
+            ch.retry_secs
+        );
+        // 蓄力 0.45s（约 27 tick）+ 验证 0.12s（约 8 tick）：0.8s 内必须收干净
+        let cleared_at = cleared_at.unwrap_or(u32::MAX);
+        assert!(cleared_at < 60, "退出跳跃状态太慢：第 {cleared_at} tick");
     }
 }

@@ -66,7 +66,7 @@ impl AnimFocus {
 /// 当前角色的骨架与最近一次求值结果（供 UI 显示）
 #[derive(Resource, Default)]
 pub struct PoseDriver {
-    pub skeleton: Option<Skeleton>,
+    pub(crate) skeleton: Option<Skeleton>,
     /// 每个混合器各自的归一化相位
     pub phases: HashMap<String, f32>,
     pub weights: Vec<(String, f32)>,
