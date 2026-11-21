@@ -52,3 +52,12 @@ assets/scenes/load_scene_example-new.scn.ron
 # Python 字节码缓存（脚本运行时生成，不入库）
 __pycache__/
 *.pyc
+
+# 本地 vendored 补丁：iOS UIScene 版 winit，只在本机保留，不入库
+/third_party/winit/
+
+# 构建交付产物（本地保留，不入库）
+/dist/
+
+# 真机构建 DerivedData（11G+，不入库）
+/launcher/mobile/ios/build-device/
