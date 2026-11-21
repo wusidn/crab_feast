@@ -878,7 +878,7 @@ fn drive_remote_pose(
             raw_dt,
             player_transform.map(|t| t.translation.y).unwrap_or(0.0),
             jump_height,
-            || {
+            |variant| {
                 let transform = player_transform?;
                 let hips = hips_id?;
                 remote_jump_setup(
@@ -889,6 +889,7 @@ fn drive_remote_pose(
                     jump_dir,
                     Some(phase_now),
                     gait,
+                    variant,
                     hips,
                     &clips,
                     &clip_assets,

@@ -8,7 +8,7 @@
 动画里，绝对坐标不能直接比）。输出三组数：
 
 - `Running` 相位 → 双脚相对髋的前后 / 高度；
-- `RunningJump*` 落地段（land → end）同一组数；
+- `RunningJump1/2/3*` 落地段（land → end）同一组数；
 - 交回姿态对比：动作末帧 vs 移动剪辑在给定相位，着地脚差多少米。
 
 用途：调 `follow_landing_phase`（`crab_feast/src/anim/jump.rs`）的相位时，
@@ -127,9 +127,9 @@ def print_table(tag: str, rel: dict):
 
 def report(directory: str):
     run = Clip(os.path.join(directory, "Running.glb"))
-    jump = Clip(os.path.join(directory, "RunningJumpRight.glb"))
+    jump = Clip(os.path.join(directory, "RunningJump1.glb"))
     print(f"\n=== {os.path.basename(directory)}  Running {run.duration:.3f}s  "
-          f"RunningJumpRight {jump.duration:.3f}s ===")
+          f"RunningJump1 {jump.duration:.3f}s ===")
 
     print("\n[移动剪辑]")
     for phase in (RUN_CONTACT_RIGHT, 0.95, 0.99, 0.03, 0.066, 0.10, RUN_LIFT_RIGHT, RUN_CONTACT_LEFT):

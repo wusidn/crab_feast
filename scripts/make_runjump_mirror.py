@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""从 `RunningJump.glb` 生成左右镜像版本：沿身体正中矢状面（x 轴）反射整套 FK 骨架。
+"""从 `RunningJumpX.glb` 生成左右镜像版本：沿身体正中矢状面（x 轴）反射整套 FK 骨架。
 
 与旧的 `make_runjump_clips.py`（把支撑腿回正到 rest 站立姿态，导致腾空段膝角
 被钉到 ~178° 僵直垂挂）不同，本脚本做的是**真正的骨骼左右镜像**：
@@ -27,8 +27,8 @@
 用法
 ----
     python3 scripts/make_runjump_mirror.py \
-        --src assets/characters/animations/Amy/RunningJump.glb \
-        --out  assets/characters/animations/Amy/RunningJumpLeft.glb
+        --src assets/characters/animations/Amy/RunningJump1.glb \
+        --out  assets/characters/animations/Amy/RunningJump1Left.glb
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ import argparse
 import json
 import math
 import os
+import re
 import struct
 import sys
 
@@ -133,35 +134,51 @@ def reflect_translation(t, src_rest, dst_rest):
 # GLB 重建
 # --------------------------------------------------------------------------- #
 
+def side_key(name: str) -> str:
+    """把名字里的左右标记换成占位符，用来配对左右同名骨。
+
+    各角色的绑定来自不同 Mixamo 导出批次，左右标记的写法不统一：
+
+    * `mixamorig:LeftFoot` —— 前缀式（`Left` / `Right` 开头的骨名）；
+    * `Toe02_Left` / `Foot_IK_Left` —— 后缀式（独立 `Left` / `Right` 尾词）；
+    * `mixamorig1:LeftFoot` —— 骨骼前缀带批次号。
+
+    统一规则：前缀号去掉，**任何** `Left` / `Right` 词（独立词或骨名前缀）都换成
+    `@`。Pete 的骨骼前缀是 `mixamorig1:`，整条腿还带后缀式的控制骨，
+    只认 `mixamorig:` + `:Left` 会一个对都配不上（镜像静默失效、脚不换边）。
+    """
+    name = re.sub(r"(?<=mixamorig)\d+:", ":", name)
+    parts = re.split(r"([:_])", name)
+    out = []
+    for part in parts:
+        if part == "Left" or part == "Right":
+            out.append("@")
+        elif part.startswith("Left") and len(part) > 4:
+            out.append("@" + part[4:])
+        elif part.startswith("Right") and len(part) > 5:
+            out.append("@" + part[5:])
+        else:
+            out.append(part)
+    return "".join(out)
+
+
 def pair_nodes(nodes):
     """返回 partner: 源节点索引 → 镜像目标节点索引；中间骨映射到自身。"""
-    by_name = {i: n.get("name", "") for i, n in enumerate(nodes)}
-    left = {}
+    groups = {}
+    for i, node in enumerate(nodes):
+        key = side_key(node.get("name", ""))
+        groups.setdefault(key, []).append(i)
     partner = {}
-    for i, name in by_name.items():
-        if not name.startswith("mixamorig:"):
-            continue
-        if ":Left" in name:
-            left[name.split(":Left", 1)[1]] = i
-        elif ":Right" in name:
-            pass
-    for i, name in by_name.items():
-        if not name.startswith("mixamorig:"):
-            partner[i] = i
-            continue
-        if ":Right" in name:
-            suffix = name.split(":Right", 1)[1]
-            j = left.get(suffix)
-            if j is not None:
-                partner[i] = j
-                partner[j] = i
-            else:
+    for key, members in groups.items():
+        if "@" not in key or len(members) != 2:
+            for i in members:
                 partner[i] = i
-        elif ":Left" in name:
-            # 右配对在上面循环里补上；缺对侧则保持自身
-            partner.setdefault(i, i)
-        else:
-            partner[i] = i
+            continue
+        a, b = members
+        partner[a] = b
+        partner[b] = a
+    for i in range(len(nodes)):
+        partner.setdefault(i, i)
     return partner
 
 

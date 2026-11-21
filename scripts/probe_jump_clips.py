@@ -219,9 +219,9 @@ def probe(path: str, samples: int = 64) -> None:
 
 def main() -> int:
     dirs = sys.argv[1:] or [os.path.join(ROOT, "assets/characters/animations/Amy")]
-    names = ("Jumping.glb", "RunningJump.glb", "RunningJumpLeft.glb", "RunningJumpRight.glb",
-             "JumpingUp.glb", "JumpingDown.glb",
-             "Jump.glb", "JumpLeft.glb", "JumpRight.glb")
+    names = ("Jumping.glb", "RunningJump1.glb", "RunningJump1Left.glb",
+             "RunningJump2.glb", "RunningJump2Right.glb", "RunningJump3.glb", "RunningJump3Left.glb",
+             "JumpingUp.glb", "JumpingDown.glb")
     for d in dirs:
         for name in names:
             p = os.path.join(d, name)

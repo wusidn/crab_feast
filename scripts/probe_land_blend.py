@@ -14,7 +14,7 @@
 着地脚的世界前后位移 = 身体前进 `V·t` + 踝相对髋的 z（两条剪辑都把根运动
 烘进了动画里，只有相对量可比）。
 
-    python3 scripts/probe_land_blend.py [角色目录] [--fps N] [--clip RunningJumpRight]
+    python3 scripts/probe_land_blend.py [角色目录] [--fps N] [--clip RunningJump1]
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ RUN_LIFT_RIGHT = 0.135
 # 交接目标相位（`landing_phase` 算出来的 0.066）与推进量（RECOVER / 0.700）
 TARGET = 0.066
 ADVANCE = RECOVER / 0.700
-# 动作剪辑（`RunningJumpRight`）右脚的触地 / 离地相位
+# 动作剪辑（`RunningJump1`）右脚的触地 / 离地相位
 ACT_CONTACT_RIGHT = 0.875
 ACT_LIFT_RIGHT = 0.062
 
@@ -231,7 +231,7 @@ def run(directory: str, fps: float, clip_name: str, recover: float, target: floa
 def main() -> int:
     args = [a for a in sys.argv[1:]]
     fps = 74.0
-    clip_name = "RunningJumpRight"
+    clip_name = "RunningJump1"
     recover = RECOVER
     target = TARGET
     advance = None

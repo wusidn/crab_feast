@@ -182,7 +182,7 @@ pub(crate) fn drive_pose(
         // 0.24s 就走掉 0.343 个周期（比整段支撑期 0.208 还长），交接时支撑会换到
         // 另一只脚，看上去就是「步频少了一拍」。
         //
-        // 恢复段的相位由 jump.rs 每帧写（`follow_landing_phase`）：起点退到
+        // 恢复段的相位由 jump/landing.rs 每帧写（`follow_landing_phase`）：起点退到
         // 动作末帧那只着地脚的支撑位置之前一个恢复段，再按移动剪辑的原生速度
         // 往前推，交回那一刻正好落在着地脚的支撑位置上。这里只负责别让它偷跑。
         let hold = jump.is_active() && mixer.key == LocomotionMixer::ID;
@@ -245,7 +245,7 @@ pub(crate) fn drive_pose(
                 bone.apply_to(&mut transform);
             }
         }
-        // 空中把髋的竖直平移钉在起跳高度：角色升高由胶囊根承担（见 jump.rs）
+        // 空中把髋的竖直平移钉在起跳高度：角色升高由胶囊根承担（见 jump/drive.rs）
         if jump.is_airborne()
             && let Some(hips) = skeleton.hips
             && let Some(entity) = skeleton.by_id.get(&hips)

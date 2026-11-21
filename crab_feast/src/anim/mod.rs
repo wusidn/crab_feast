@@ -30,7 +30,7 @@ pub use character::{AnimCatalog, AnimRuntime, AnimSelection, SPEED_RANGE};
 pub use driver::{AnimFocus, PoseDriver};
 pub use jump::JumpAction;
 /// 跳跃档位与调参表：服务端复用同一份（蓄力时长 / 离地速度两端必须同源）。
-pub use jump::{JumpKind, JumpProfile, JumpTuning, JumpTunings};
+pub use jump::{JumpKind, JumpPose, JumpProfile, JumpTuning, JumpTunings};
 // 联机远端姿态驱动要用（`net` 之外没有调用方）
 #[allow(unused_imports)]
 pub(crate) use driver::{Skeleton, build_skeleton};

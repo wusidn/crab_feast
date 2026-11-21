@@ -8,7 +8,7 @@
 
     /Applications/Blender.app/Contents/MacOS/Blender -b \
         --python scripts/probe_blender_pose.py -- \
-        --glb assets/characters/animations/Amy/RunningJumpRight.glb --times 0.15 0.30 0.45
+        --glb assets/characters/animations/Amy/RunningJump1.glb --times 0.15 0.30 0.45
 """
 import argparse
 import bpy
