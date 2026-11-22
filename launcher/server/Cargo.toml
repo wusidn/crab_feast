@@ -16,6 +16,8 @@ avian3d.workspace = true
 crab_feast = { path = "../../crab_feast" }
 crab_feast_library = { path = "../../crab_feast_library", features = ["net"] }
 serde_json.workspace = true
+# 注册中心是普通 HTTP JSON 服务，服务端用阻塞客户端报到/心跳（独立线程，不进帧循环）
+ureq = { version = "3", default-features = true }
 lightyear = { version = "0.31", default-features = false, features = [
     "std",
     "server",

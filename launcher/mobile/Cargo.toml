@@ -13,5 +13,5 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 bevy.workspace = true
-crab_feast = {path = "../../crab_feast"}
+crab_feast = {path = "../../crab_feast", features = ["net"]}
 crab_feast_launcher = {path = "../shared"}

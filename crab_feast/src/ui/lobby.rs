@@ -11,8 +11,9 @@ use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 
 use crate::GameState;
-use crate::state::{AbortSession, LobbyNotice, SessionMode, SessionReady};
+use crate::state::{AbortSession, LobbyNotice, NetDiagnostics, SessionMode, SessionReady};
 use crate::ui::font::font_scope;
+use crate::BUILD_TAG;
 
 const BACKDROP: Color = Color::srgb(0.035, 0.045, 0.065);
 const PANEL: Color = Color::srgba(0.09, 0.11, 0.16, 0.95);
@@ -42,9 +43,13 @@ struct LobbySnapshot(Vec<RowData>);
 #[derive(Clone, PartialEq)]
 struct RowData {
     addr: SocketAddr,
+    /// 展示用地址：优先保留注册中心里的域名。
+    display: String,
     name: String,
     players: u8,
     max_players: u8,
+    /// 来源标签：局域网 / 注册中心 / 两者都有
+    source: &'static str,
 }
 
 #[derive(Component)]
@@ -72,6 +77,9 @@ struct LocalGameButton;
 struct LoginOverlay;
 
 #[derive(Component)]
+struct LoginDiagnosticText;
+
+#[derive(Component)]
 struct PreparingOverlay;
 
 impl Plugin for LobbyUiPlugin {
@@ -83,6 +91,10 @@ impl Plugin for LobbyUiPlugin {
             .add_systems(OnExit(GameState::Lobby), cleanup_lobby)
             .add_systems(OnEnter(GameState::Login), setup_login_overlay)
             .add_systems(OnExit(GameState::Login), cleanup_login_overlay)
+            .add_systems(
+                Update,
+                refresh_login_diagnostic.run_if(in_state(GameState::Login)),
+            )
             .add_systems(OnEnter(GameState::Game), setup_preparing_overlay)
             .add_systems(OnExit(GameState::Game), cleanup_preparing_overlay)
             .add_systems(
@@ -191,7 +203,7 @@ fn setup_lobby(
 
         parent.spawn((
             LobbyHint,
-            Text::new("正在搜索局域网服务器…"),
+            Text::new("正在搜索服务器（局域网 + 注册中心）…"),
             TextFont {
                 font_size: FontSize::Px(13.0),
                 ..default()
@@ -241,7 +253,7 @@ fn setup_lobby(
             );
 
         parent.spawn((
-            Text::new("同一局域网内的服务器会自动出现在列表里"),
+            Text::new("局域网广播与注册中心里的服务器都会自动出现在这里"),
             TextFont {
                 font_size: FontSize::Px(11.0),
                 ..default()
@@ -286,7 +298,10 @@ fn sync_rows_from_discovery(
         .snapshot()
         .into_iter()
         .map(|server| RowData {
+            // 先算来源标签：`name` 会被移进 RowData，之后再借 server 就晚了
+            source: server.source_label(),
             addr: server.addr,
+            display: server.display,
             name: server.name,
             players: server.players,
             max_players: server.max_players,
@@ -300,6 +315,16 @@ fn sync_rows_from_discovery(
 
     for entity in rows.0.drain(..) {
         commands.entity(entity).try_despawn();
+    }
+
+    if entries.is_empty() {
+        info!("大厅服务器列表：空");
+    }
+    for entry in &entries {
+        info!(
+            "大厅服务器：{} · {} · {}",
+            entry.name, entry.display, entry.source
+        );
     }
 
     for entry in &entries {
@@ -379,7 +404,7 @@ fn spawn_server_row(
                 TextColor(TEXT),
             ));
             left.spawn((
-                Text::new(addr.to_string()),
+                Text::new(format!("{} · {}", entry.display, entry.source)),
                 TextFont {
                     font_size: FontSize::Px(11.0),
                     ..default()
@@ -474,11 +499,21 @@ fn apply_selection(
     }
 }
 
-fn setup_login_overlay(mut commands: Commands, asset_server: Res<AssetServer>, mode: Res<SessionMode>) {
+fn setup_login_overlay(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mode: Res<SessionMode>,
+    diagnostics: Res<NetDiagnostics>,
+) {
     let font = asset_server.load(FONT_PATH);
     let detail = match *mode {
         SessionMode::Local => "正在进入本地游戏…".to_string(),
         SessionMode::Online { server } => format!("正在连接 {server}…"),
+    };
+    let diagnostic = if diagnostics.0.is_empty() {
+        format!("build {BUILD_TAG}")
+    } else {
+        diagnostics.0.clone()
     };
 
     commands
@@ -510,6 +545,15 @@ fn setup_login_overlay(mut commands: Commands, asset_server: Res<AssetServer>, m
                 Text::new(detail),
                 TextFont {
                     font_size: FontSize::Px(14.0),
+                    ..default()
+                },
+                TextColor(MUTED),
+            ));
+            parent.spawn((
+                LoginDiagnosticText,
+                Text::new(diagnostic),
+                TextFont {
+                    font_size: FontSize::Px(12.0),
                     ..default()
                 },
                 TextColor(MUTED),
@@ -564,6 +608,19 @@ fn setup_login_overlay(mut commands: Commands, asset_server: Res<AssetServer>, m
 fn cleanup_login_overlay(mut commands: Commands, roots: Query<Entity, With<LoginOverlay>>) {
     for entity in &roots {
         commands.entity(entity).try_despawn();
+    }
+}
+
+/// `connect` 在 OnEnter(Login) 里写诊断，遮罩可能是同一帧更早建出来的，
+/// 所以每帧把资源同步到文字上，避免只显示初始的 `build xxx`。
+fn refresh_login_diagnostic(
+    diagnostics: Res<NetDiagnostics>,
+    mut text: Query<&mut Text, With<LoginDiagnosticText>>,
+) {
+    if diagnostics.is_changed() {
+        for mut line in &mut text {
+            *line = Text::new(diagnostics.0.clone());
+        }
     }
 }
 

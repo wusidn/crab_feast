@@ -59,6 +59,7 @@
 			buildPhases = (
 				ECFC92D02C6F14FA0095E5B1 /* Rust */,
 				57CD630D253C80E60098CD4A /* Resources */,
+				CB7A55E10F3B4C7D8E9A1B02 /* Strip unused assets */,
 			);
 			buildRules = (
 			);
@@ -125,6 +126,27 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "./build_rust_deps.sh\n";
+		};
+		CB7A55E10F3B4C7D8E9A1B02 /* Strip unused assets */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Strip unused assets";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nAPP=${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\n# 资源全部改走热更：包体里不再携带 assets（首启由 App 从 OTA 服务拉取）\n# 需要临时带回包内资源调试时：CRAB_KEEP_BUNDLE_ASSETS=1\nif [ \"${CRAB_KEEP_BUNDLE_ASSETS:-0}\" = \"1\" ]; then\n  echo \"note: keep bundle assets (CRAB_KEEP_BUNDLE_ASSETS=1)\"\n  exit 0\nfi\nif [ -d \"${APP}/assets\" ]; then\n  echo \"note: strip assets from the app bundle (assets are hot-updated)\"\n  rm -rf \"${APP}/assets\"\nfi\n";
+
+
 		};
 /* End PBXShellScriptBuildPhase section */
 

@@ -28,8 +28,10 @@ android {
         applicationId "org.crab_feast.mobile"
         minSdk 29
         targetSdk 33
-        versionCode 1
-        versionName "1.0"
+        // CI 通过 -PcrabVersionCode / -PcrabVersionName 注入构建号，
+        // 本地构建保持原来的 1 / "1.0"。
+        versionCode ((project.findProperty("crabVersionCode") ?: "1") as String).toInteger()
+        versionName ((project.findProperty("crabVersionName") ?: "1.0") as String)
         // need this otherwise it won't insert libc++_shared.so
         externalNativeBuild {
             cmake {

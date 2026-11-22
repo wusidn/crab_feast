@@ -99,7 +99,36 @@ fn asset_file_path() -> String {
         }
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
+    {
+        // 包体里已经不含 assets，资源全部由热更落到 App 容器。
+        // 这里必须无条件返回该目录（首次启动时它是空的，同步完成前不会加载任何资源），
+        // 否则 asset_server 与 CRAB_ASSET_ROOT 会指向两个不同地方。
+        // 容器根不能只信 HOME：取不到就直接退到 TMPDIR 的上一级
+        let root = std::env::var("CRAB_HOME")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
+            .or_else(|| {
+                std::env::var("TMPDIR")
+                    .ok()
+                    .map(|t| std::path::PathBuf::from(t))
+                    .and_then(|t| t.parent().map(|p| p.to_path_buf()))
+            })
+            .filter(|c| c.join("Library").is_dir() || c.join("Documents").is_dir());
+        if let Some(root) = root {
+            let dir = root
+                .join("Library/Application Support")
+                .join("crab_feast")
+                .join("assets");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                return dir.to_string_lossy().into_owned();
+            }
+        }
+        "assets".to_string()
+    }
+
+    #[cfg(target_os = "android")]
     {
         "assets".to_string()
     }

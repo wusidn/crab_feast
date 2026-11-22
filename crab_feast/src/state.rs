@@ -14,7 +14,9 @@ use bevy::prelude::*;
 
 #[derive(States, Default, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum GameState {
+    /// 启动第一步：向 OTA 服务对比资源版本并落地差量包（桌面/安卓直接跳过）
     #[default]
+    AssetsSync,
     AssetLoading,
     /// 首页：局域网服务器列表 + 本地游戏
     Lobby,
@@ -55,6 +57,11 @@ pub struct AutoJoin(pub Option<SessionMode>);
 /// 回到大厅时要显示的一句话（登录失败、掉线等）。
 #[derive(Resource, Default, Debug, Clone)]
 pub struct LobbyNotice(pub Option<String>);
+
+/// 登录遮罩上的网络诊断：目标地址、本地绑定、UDP 预检结果。
+/// 真机拿不到控制台时靠这行文字判断包到底有没有发出去。
+#[derive(Resource, Default, Debug, Clone)]
+pub struct NetDiagnostics(pub String);
 
 /// 取消登录：网络侧收到后断开正在握手的连接。
 #[derive(Message, Clone, Copy, Debug, Default)]

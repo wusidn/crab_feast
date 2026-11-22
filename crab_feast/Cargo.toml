@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-# 联网：客户端预测/复制的传输层是 native-only（UDP），wasm 与 mobile 不打开
+# 联网：客户端预测/复制的传输层是 native-only（UDP），非 wasm 目标（PC / iOS / Android）打开
 net = ["crab_feast_library/net", "dep:lightyear", "dep:socket2"]
 
 [dependencies]
@@ -17,7 +17,11 @@ bevy_animation.workspace      = true
 serde.workspace               = true
 bevy_asset_loader.workspace = true
 iyes_progress.workspace = true
-serde_json.workspace = true
+serde_json.workspace     = true
+# 资源热更：HTTP 走 ureq（内置 rustls），校验用 sha2，解压用 flate2 自己读 zip
+ureq = { version = "3", default-features = true }
+sha2 = "0.10"
+flate2 = "1"
 # 发现广播的监听端要开 SO_REUSEPORT（同机多开客户端绑同一端口），socket2 的该
 # 接口藏在 "all" feature 后面
 socket2 = { version = "0.6", features = ["all"], optional = true }
@@ -28,3 +32,7 @@ lightyear = { version = "0.31", optional = true, default-features = false, featu
     "udp",
     "netcode",
 ] }
+
+[dev-dependencies]
+# 发现模块的端到端测试要起一个真实的注册中心（不依赖 Bevy，编译很快）
+crab_feast_web = { path = "../web" }

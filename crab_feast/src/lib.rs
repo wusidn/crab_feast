@@ -7,6 +7,7 @@ use crab_feast_library::platform::PlatformInfo;
 
 /// 动画层：跳跃档位与调参表要暴露给 dedicated server（蓄力/离地速度两端同源）。
 pub mod anim;
+mod assetpack;
 mod assets;
 mod camera;
 #[cfg(feature = "net")]
@@ -27,13 +28,30 @@ mod state;
 mod ui;
 
 pub use assets::GameAssets;
+// 真机上看不到 stdout：把日志函数暴露出去，启动时装的 panic hook 也写这份文件
+pub use assetpack::log_line;
 #[cfg(feature = "net")]
-pub use discovery::{DiscoveryPlugin, ServerBrowser};
+pub use discovery::{DiscoveryPlugin, RegistryConfig, ServerBrowser};
 #[cfg(feature = "net")]
 pub use net::{AutoJump, AutoWalk, LocalPlayer, NetConfig, NetPlugin};
-pub use state::{AutoJoin, GameState, LobbyNotice, SessionMode, SessionReady};
+pub use state::{
+    AutoJoin, GameState, LobbyNotice, NetDiagnostics, SessionMode, SessionReady,
+};
+
+/// 出包时由 `launcher/mobile/ios/build_rust_deps.sh` 从 Xcode 的
+/// `CURRENT_PROJECT_VERSION` 注入；PC 的 cargo 构建没有这个变量，显示 `dev`。
+pub const BUILD_TAG: &str = match option_env!("CRAB_BUILD_NUMBER") {
+    Some(value) => value,
+    None => "dev",
+};
 
 pub fn build_app(app: &mut App) {
+    // 装过热更包就把资源根指过去，角色清单扫描与 asset_server 加载必须是同一个目录
+    if let Some(dir) = assetpack::ready_pack_dir() {
+        // SAFETY: 单线程启动阶段设置，之后只读
+        unsafe { std::env::set_var("CRAB_ASSET_ROOT", &dir) };
+        info!("资源根目录：{}（热更包）", dir.display());
+    }
     app.insert_resource(PlatformInfo::current())
         .insert_resource(input::MovementSettings::default()) // 移动设置
         .add_plugins((
@@ -63,6 +81,7 @@ pub fn build_app(app: &mut App) {
                 },
             },
             anim::AnimPlugin,
+            assetpack::AssetPackPlugin,
             assets::AssetLoadingPlugin,
             session::SessionPlugin,
             settings::SettingsPlugin,

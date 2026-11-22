@@ -1,9 +1,9 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_inspector_egui::{bevy_egui::EguiPlugin, quick::WorldInspectorPlugin};
-use crab_feast::{AutoJoin, AutoJump, AutoWalk, NetConfig, NetPlugin, SessionMode};
+use crab_feast::{AutoJoin, AutoJump, AutoWalk, NetConfig, NetPlugin, RegistryConfig, SessionMode};
 use crab_feast_launcher::{
     LaunchConfig, build_app,
     config::{LauncherConfig, config_path_from_args},
@@ -43,6 +43,10 @@ fn main() {
                 server: args.server,
                 client_id: args.client_id,
             })
+            // 大厅的服务器列表：局域网广播 + 注册中心 HTTP。
+            // 必须在 `crab_feast::build_app` 之前插入——DiscoveryPlugin 在 build
+            // 阶段只读一次这个资源，晚插入就退回环境变量/默认地址了。
+            .insert_resource(RegistryConfig::from_option(args.registry.clone()))
             // `--server` / `--local` 带了明确目标就跳过大厅直接登录；否则停在大厅
             .insert_resource(AutoJoin(args.auto_join))
             .add_plugins(NetPlugin);
@@ -129,6 +133,25 @@ fn take_screenshot(
         .observe(save_to_disk(path));
 }
 
+/// `--server` 既接受 `IP:端口`，也接受域名（`game.qiaqia.cyou:5099`）。
+///
+/// 域名可能有 A/AAAA 两条记录，而当前游戏服只监听 IPv6，优先取 AAAA；
+/// 纯 IPv4 的地址仍按原样使用。
+fn resolve_server_addr(value: &str) -> Result<SocketAddr, String> {
+    let trimmed = value.trim();
+    let mut addrs = trimmed
+        .to_socket_addrs()
+        .map_err(|error| format!("{error}"))?;
+    let mut first = None;
+    for addr in addrs.by_ref() {
+        if addr.is_ipv6() {
+            return Ok(addr);
+        }
+        first.get_or_insert(addr);
+    }
+    first.ok_or_else(|| "没有解析到任何地址".to_string())
+}
+
 struct Args {
     /// 用的是 launcher.json 里的哪个玩家位（没配就是 auto）
     profile: String,
@@ -136,6 +159,8 @@ struct Args {
     client_id: u64,
     /// 命令行明确指定了「直接进哪一局」：连服务器或本地游戏
     auto_join: Option<SessionMode>,
+    /// 注册中心地址；`None` = 用默认/环境变量，`Some("off")` = 关闭
+    registry: Option<String>,
     /// 窗口左上角（同机多开时错开用）
     window: Option<(i32, i32)>,
     /// 跑够多少秒自动退出（冒烟测试用，正常玩不要传）
@@ -176,6 +201,8 @@ fn parse_args() -> Args {
     let mut screenshot: Option<std::path::PathBuf> = None;
     let mut explicit_server = false;
     let mut local_game = false;
+    let mut registry: Option<String> = None;
+    let mut no_registry = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--profile" => {
@@ -196,6 +223,12 @@ fn parse_args() -> Args {
             "--local" => {
                 local_game = true;
             }
+            "--registry" => {
+                if let Some(value) = args.next() {
+                    registry = Some(value);
+                }
+            }
+            "--no-registry" => no_registry = true,
             "--client-id" => {
                 if let Some(value) = args.next() {
                     client_id = value.parse().ok();
@@ -234,12 +267,14 @@ fn parse_args() -> Args {
             "--help" | "-h" => {
                 println!(
                     "crab_feast_pc --launch-all   # 按 launcher.json 起服务器 + 所有玩家\n\
-                     crab_feast_pc [--profile player1] [--server 127.0.0.1:5000 | --local] \
-                     [--client-id <n>] [--window x,y] [--config launcher.json] \
+                     crab_feast_pc [--profile player1] [--server game.qiaqia.cyou:5099 | --local] \
+                     [--client-id <n>] [--registry http://127.0.0.1:8090 | --no-registry] \
+                     [--window x,y] [--config launcher.json] \
                      [--screenshot <png>] [--exit-after <秒>] [--auto-walk <秒>]\n\
                      不传 --profile 时沿用 launcher.json 的 default_player 作为窗口/地址兜底，\n\
                      但 client_id 会按时间戳自动生成，保证同机多开不会撞号；\n\
-                     停在大厅的服务器列表；--server 自动加入该服务器，--local 直接本地游戏。"
+                     停在大厅的服务器列表；--server 自动加入该服务器，--local 直接本地游戏。\n\
+                     默认同时展示局域网广播与注册中心里的服务器，--no-registry 可关闭后者。"
                 );
                 std::process::exit(0);
             }
@@ -260,7 +295,7 @@ fn parse_args() -> Args {
         .or_else(|| profile.as_ref().and_then(|p| p.server.clone()))
         .or_else(|| config.server.addr.clone())
         .unwrap_or_else(|| crab_feast_library::net::DEFAULT_ADDR.to_string());
-    let server = server.parse().unwrap_or_else(|error| {
+    let server = resolve_server_addr(&server).unwrap_or_else(|error| {
         eprintln!("服务器地址 {server} 无法解析：{error}");
         std::process::exit(2);
     });
@@ -297,11 +332,20 @@ fn parse_args() -> Args {
         None
     };
 
+    // 注册中心：命令行 > launcher.json 顶层 registry；`--no-registry` 用 "off" 表达。
+    // 两者都没给时传 None，`RegistryConfig` 会退回 CRAB_REGISTRY_URL 或内置默认。
+    let registry = if no_registry {
+        Some("off".to_string())
+    } else {
+        registry.or_else(|| config.registry.clone())
+    };
+
     Args {
         profile: profile_name.unwrap_or_else(|| "auto".to_string()),
         server,
         client_id,
         auto_join,
+        registry,
         window,
         exit_after,
         auto_walk,

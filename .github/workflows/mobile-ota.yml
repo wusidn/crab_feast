@@ -1,0 +1,218 @@
+name: mobile-ota
+
+# 触发：main 分支上动到游戏代码 / 原生壳 / 资源清单时自动跑；也可以手动跑并选 profile。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crab_feast/**"
+      - "crab_feast_library/**"
+      - "crab_feast_ui/**"
+      - "launcher/**"
+      - "assets/**"
+      - "Cargo.toml"
+      - "scripts/ci/**"
+      - ".github/workflows/mobile-ota.yml"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "构建 profile（debug 快、release 小且装机快）"
+        type: choice
+        options: [debug, release]
+        default: debug
+      android:
+        description: "顺便构建 Android APK"
+        type: boolean
+        default: true
+  # 免费 Apple ID 的描述文件只有 7 天有效，想每 5 天自动重出一版就取消下面两行注释
+  # schedule:
+  #   - cron: "0 2 */5 * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mobile-ota-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IOS_SCHEME: crab_feast_mobile
+  IOS_TEAM_ID: 7JRXM77YNL
+  IOS_BUNDLE_ID: org.crab.feast
+  MARKETING_VERSION: "1.0.0"
+  APP_TITLE: "Crab Feast"
+  PROFILE: ${{ inputs.profile || 'debug' }}
+
+jobs:
+  build:
+    # 自托管 runner 的标签，见 docs/ci/mobile-cicd.md 第一步
+    runs-on: [self-hosted, macOS, crab-feast]
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 关键：clean 会删掉 target/ 和 build-device/，让每次构建都变成冷编译
+          clean: false
+
+      - name: 还原本地资产与补丁（vault）
+        env:
+          ASSET_VAULT: ${{ vars.CRAB_ASSET_VAULT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ASSET_VAULT}" ] || [ ! -d "${ASSET_VAULT}/assets" ]; then
+            echo "::error::仓库变量 CRAB_ASSET_VAULT 未设置，或该目录下没有 assets/"
+            exit 1
+          fi
+          # 754MB 的模型/动画资源不入库，构建前从本机资产库同步（rsync 增量，秒级）
+          rsync -a "${ASSET_VAULT}/assets/" assets/
+          mkdir -p third_party
+          rsync -a "${ASSET_VAULT}/winit/" third_party/winit/
+          # Cargo.lock 当前不入库，用资产库里的快照保证依赖版本可复现
+          if [ -f "${ASSET_VAULT}/Cargo.lock" ]; then
+            cp "${ASSET_VAULT}/Cargo.lock" Cargo.lock
+          fi
+
+      - name: 精简包体（剔除 Blender 源文件）
+        env:
+          # assets/source 是 345MB 的 FBX 源文件，运行时用不到。
+          # 如果哪天运行时要读它，把这里改成 "0"。
+          BUNDLE_SOURCE_ASSETS: "1"
+        run: |
+          set -euo pipefail
+          if [ "${BUNDLE_SOURCE_ASSETS}" = "1" ]; then
+            rm -rf assets/source
+          fi
+
+      - name: 计算版本号
+        id: ver
+        run: |
+          set -euo pipefail
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: 环境自检
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          cargo --version
+          python3 --version
+
+      - name: 构建并导出 iOS .ipa
+        run: |
+          set -euo pipefail
+          cd launcher/mobile/ios
+          CONF=$( [ "$PROFILE" = "release" ] && echo Release || echo Debug )
+          rm -rf "$RUNNER_TEMP/crab.xcarchive" "$RUNNER_TEMP/export"
+          xcodebuild \
+            -scheme "$IOS_SCHEME" \
+            -configuration "$CONF" \
+            -sdk iphoneos -arch arm64 \
+            -derivedDataPath build-device \
+            -allowProvisioningUpdates \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build_number }}" \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            -archivePath "$RUNNER_TEMP/crab.xcarchive" \
+            archive
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/crab.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist ExportOptions.plist \
+            -allowProvisioningUpdates
+          IPA=$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)
+          cp "$IPA" "$RUNNER_TEMP/crab_feast-ios.ipa"
+          ls -lh "$RUNNER_TEMP/crab_feast-ios.ipa"
+
+      - name: 构建 Android APK
+        if: github.event_name == 'workflow_dispatch' && inputs.android
+        run: |
+          set -euo pipefail
+          CARGO_FLAGS=""
+          GRADLE_TASK=assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if [ "$PROFILE" = "release" ]; then
+            CARGO_FLAGS="--release"
+            GRADLE_TASK=assembleRelease
+            APK=app/build/outputs/apk/release/app-release.apk
+          fi
+          # 注意: macOS 自带 bash 3.2，空数组用 "${ARR[@]}" 会报 unbound variable
+          cargo ndk -t arm64-v8a -o launcher/mobile/android/app/src/main/jniLibs \
+            build ${CARGO_FLAGS} -p crab_feast_mobile
+          cd launcher/mobile/android
+          ./gradlew "$GRADLE_TASK" --no-daemon \
+            -PcrabVersionCode="${{ steps.ver.outputs.build_number }}" \
+            -PcrabVersionName="$MARKETING_VERSION"
+          mkdir -p "$RUNNER_TEMP"
+          cp "$APK" "$RUNNER_TEMP/crab_feast-android.apk"
+          ls -lh "$RUNNER_TEMP/crab_feast-android.apk"
+
+      - name: 生成 OTA 清单与安装页
+        id: ota
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.ver.outputs.short_sha }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          IPA_URL="https://github.com/${{ github.repository }}/releases/download/mobile-latest/crab_feast-ios.ipa?v=${SHA}"
+          PAGE_BASE="https://${OWNER}.github.io/${REPO}/"
+          MANIFEST_URL="${PAGE_BASE}manifest.plist?v=${SHA}"
+          APK_ARGS=""
+          if [ -f "$RUNNER_TEMP/crab_feast-android.apk" ]; then
+            APK_ARGS="--apk-url https://github.com/${{ github.repository }}/releases/download/mobile-latest/crab_feast-android.apk?v=${SHA}"
+          fi
+          python3 scripts/ci/ota_manifest.py \
+            --ipa-url "$IPA_URL" \
+            --manifest-url "$MANIFEST_URL" \
+            --bundle-id "$IOS_BUNDLE_ID" \
+            --version "$MARKETING_VERSION" \
+            --build "${{ steps.ver.outputs.build_number }}" \
+            --title "$APP_TITLE" \
+            --subtitle "build ${{ steps.ver.outputs.build_number }} · $SHA · $PROFILE" \
+            --out-dir .ota \
+            --install-page-url "$PAGE_BASE" \
+            ${APK_ARGS}
+          echo "page_url=$PAGE_BASE" >> "$GITHUB_OUTPUT"
+          echo "manifest_url=$MANIFEST_URL" >> "$GITHUB_OUTPUT"
+
+      - name: 发布 iOS 到滚动 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mobile-latest
+          name: 移动端最新构建（滚动）
+          prerelease: true
+          make_latest: false
+          body: |
+            构建 #${{ steps.ver.outputs.build_number }} · `${{ steps.ver.outputs.short_sha }}` · ${{ env.PROFILE }}
+            安装页：${{ steps.ota.outputs.page_url }}
+          files: ${{ runner.temp }}/crab_feast-ios.ipa
+
+      - name: 发布 Android 到滚动 Release
+        if: github.event_name == 'workflow_dispatch' && inputs.android
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mobile-latest
+          prerelease: true
+          make_latest: false
+          files: ${{ runner.temp }}/crab_feast-android.apk
+
+      - name: 发布 OTA 安装页到 GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: .ota
+          keep_files: true
+          commit_message: "ota: build ${{ steps.ver.outputs.build_number }} (${{ steps.ver.outputs.short_sha }})"
+
+      - name: 写入运行摘要
+        run: |
+          {
+            echo "## 手机安装"
+            echo ""
+            echo "- iPhone（必须用 Safari 打开）：${{ steps.ota.outputs.page_url }}"
+            echo "- 直接 OTA：\`${{ steps.ota.outputs.manifest_url }}\`"
+            echo "- 构建：#${{ steps.ver.outputs.build_number }} · \`${{ steps.ver.outputs.short_sha }}\` · $PROFILE"
+          } >> "$GITHUB_STEP_SUMMARY"

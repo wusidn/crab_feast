@@ -1,0 +1,27 @@
+[package]
+name = "crab_feast_web"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "crab_feast_web"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crab-feast-web"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# 资源仓库：blob 内容寻址与增量包校验
+sha2 = "0.10"
+# 整包/增量包生成（assets_store.py 的运行时部分移植到 Rust）
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 8443 直连 OTA 的 TLS；ring 后端沿用 ureq 已引入的实现
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+base64 = "0.22"
+
+[dev-dependencies]
+# 集成测试要真起一个 HTTP 客户端去打自己，和客户端/服务端用的是同一个版本
+ureq = "3"

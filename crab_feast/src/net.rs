@@ -15,13 +15,14 @@
 //! - 其他玩家按 `PlayerModelAssets` 各自实例化一份模型 + 简易剪辑动画（Idle/Walk/Run 按
 //!   `NetMotion.speed` 切），胶囊只当"模型还没加载完"的占位。
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use avian3d::prelude::*;
 use bevy::{
     animation::{AnimatedBy, AnimationTargetId},
     ecs::system::SystemParam,
     prelude::*,
+    window::WindowOccluded,
 };
 use crab_feast_library::net::{
     ControlChannel, CrabProtocolPlugin, JoinRequest, MOVE_SPEED_MPS, MoveInput, NetMotion,
@@ -33,7 +34,7 @@ use lightyear::netcode::prelude::{
 };
 use lightyear::prelude::{client::*, *};
 
-use crate::GameState;
+use crate::{BUILD_TAG, GameState};
 use crate::anim::core::{SpaceEvalContext, evaluate_space};
 use crate::anim::jump::{
     JumpTunings, RemoteJump, blend_clip_pose, remote_jump_setup, uplink_jump_level,
@@ -46,7 +47,7 @@ use crate::camera::CameraFacing;
 use crate::ground::foot_ground_dist;
 use crate::input::{ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, wrap_pi};
 use crate::scene::Avatar;
-use crate::state::{AbortSession, LobbyNotice, SessionMode};
+use crate::state::{AbortSession, AutoJoin, LobbyNotice, NetDiagnostics, SessionMode};
 use crate::ui::debug::{DebugTimeScale, TimeScaleChanged};
 
 /// 服务器地址，由 launcher 通过 `--server` 写入。
@@ -86,6 +87,19 @@ pub enum LoginPhase {
     InGame(u8),
 }
 
+/// 前后台切换的现场记录。
+///
+/// iOS 进后台会冻结所有 socket，服务端按 netcode 默认 `timeout_seconds = 15`
+/// 把连接判死，玩家回来看到的是「连接服务器超时」。所以挂起时主动断开、
+/// 回前台再重连，两头都不留半死不活的连接。
+#[derive(Resource, Default, Debug)]
+pub struct SuspendState {
+    /// 挂起前连着的服务器
+    pending: Option<SocketAddr>,
+    /// 已收到「回前台」，等残留 client 收干净就重连
+    want_resume: bool,
+}
+
 pub struct NetPlugin;
 
 impl Plugin for NetPlugin {
@@ -105,6 +119,7 @@ impl Plugin for NetPlugin {
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .init_resource::<NetConfig>()
         .init_resource::<LoginPhase>()
+        .init_resource::<SuspendState>()
         // 世界时间速度上行：拖动滑杆 → 节流发包；服务端复制回来的值 → 写回资源
         .init_resource::<TimeScaleUplink>()
         // 只在 `Game` 里跑：调试面板本身也只在对局中出现，退出对局后残留的复制值
@@ -129,7 +144,9 @@ impl Plugin for NetPlugin {
         )
         // 登录阶段才建连接；大厅与本地游戏都不该有客户端实体
         .add_systems(OnEnter(GameState::Login), connect)
-        .add_systems(Update, abort_login)
+        // 前后台切换：挂起时立刻断开、回前台重连。挂在 `Update` 上不带状态过滤，
+        // 大厅/登录/对局都要能反应；重连必须晚一帧做，见 `resume_reconnect`。
+        .add_systems(Update, (abort_login, watch_occlusion, resume_reconnect))
         .add_systems(OnExit(GameState::Game), leave_game)
         .add_observer(spawn_remote_visual)
         .add_observer(on_connecting)
@@ -151,7 +168,10 @@ impl Plugin for NetPlugin {
                 // 脚部 IK 解的是「这一帧最终的姿态」：远端姿态必须先写完再让它解，
                 // 否则 IK 拿到的是一帧前的腿，脚会被锁在上一帧的位置上
                 .before(FootIkSet)
-                .before(bevy::transform::TransformSystems::Propagate),
+                .before(bevy::transform::TransformSystems::Propagate)
+                // 首启（热更资源还没落地）时下面这些资源全都不存在，`Res<T>` 校验
+                // 会直接 abort。资产就绪之前让这两个系统整个让路。
+                .run_if(remote_pose_ready),
         )
         .add_systems(
             Update,
@@ -209,17 +229,76 @@ fn setup_visual_assets(
     });
 }
 
+fn local_bind_addr(server: SocketAddr) -> SocketAddr {
+    if server.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    }
+}
+
+/// iOS 真机第一次访问局域网时会触发「本地网络」权限；如果用户拒绝，
+/// sendto 会失败或包被系统丢掉，表现就是永远「正在连接」。
+/// 真连接之前先用一个临时 UDP socket 发一个探测包：失败就把系统错误
+/// 带回大厅，至少能区分「socket/权限问题」和「网络路径问题」。
+#[cfg(target_os = "ios")]
+fn ios_udp_probe(server: SocketAddr) -> std::io::Result<()> {
+    let bind = local_bind_addr(server);
+    let socket = std::net::UdpSocket::bind(bind)?;
+    socket.send_to(b"CRAB-FE-PROBE", server)?;
+    info!("iOS UDP 预检成功：{bind} → {server}");
+    Ok(())
+}
+
+#[cfg(not(target_os = "ios"))]
+fn ios_udp_probe(_server: SocketAddr) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn connect(
     mut commands: Commands,
     config: Res<NetConfig>,
     mode: Res<SessionMode>,
     existing: Query<Entity, With<Client>>,
+    mut notice: ResMut<LobbyNotice>,
+    // 同一个系统里既要写又要读同一种消息会撞 B0002（`Res<Messages<T>>` 重复借用，
+    // 表现是一进登录就直接 non-unwinding panic），所以用 `ParamSet` 串行拿两次访问。
+    // 第二个参数只用来丢弃过期消息，见下面的说明
+    mut abort: ParamSet<(MessageWriter<AbortSession>, MessageReader<AbortSession>)>,
+    mut next: ResMut<NextState<GameState>>,
+    mut diagnostics: ResMut<NetDiagnostics>,
 ) {
+    // 前后台切换时 `occluded=true` / `false` 会攒到同一帧一起投递，挂起分支写下的
+    // `AbortSession` 要留到下一帧（`OnEnter(Login)`）才被 `abort_login` 读到 —— 那时
+    // 新连接已经建好，这条过期消息会把刚建好的客户端当旧连接断掉，表现为「回前台
+    // 一秒内闪一下登录 → 直接回大厅报连不上」。进这里是新一轮连接，先把它吃掉。
+    if abort.p1().read().next().is_some() {
+        crate::assetpack::log_line("connect: 丢弃一条过期的 AbortSession");
+    }
+
     // 只有「从大厅点了某台服务器加入」才建连接；本地游戏走的是纯单机路径
     let SessionMode::Online { server } = *mode else {
         info!("net: 本地会话，不建立服务器连接");
         return;
     };
+
+    let bind = local_bind_addr(server);
+    diagnostics.0 = format!("build {BUILD_TAG}｜目标 {server}｜本地 {bind}｜预检中…");
+    crate::assetpack::log_line(&format!("connect: 开始，目标 {server}，本地 {bind}"));
+
+    if let Err(error) = ios_udp_probe(server) {
+        error!("iOS UDP 预检失败：{error}");
+        crate::assetpack::log_line(&format!("connect: 预检失败 {error}"));
+        diagnostics.0 = format!("build {BUILD_TAG}｜目标 {server}｜本地 {bind}｜预检失败：{error}");
+        notice.0 = Some(format!(
+            "UDP 发送失败：{error}（请在 设置 → 隐私与安全性 → 本地网络 中允许 Crab Feast）"
+        ));
+        abort.p0().write(AbortSession);
+        next.set(GameState::Lobby);
+        return;
+    }
+    diagnostics.0 = format!("build {BUILD_TAG}｜目标 {server}｜本地 {bind}｜预检已发送");
+    crate::assetpack::log_line("connect: 预检通过，客户端实体创建");
 
     // 上一次失败的连接可能还留着实体：先收掉，保证同一时间只有一个 client
     for entity in &existing {
@@ -244,7 +323,10 @@ fn connect(
             Client,
             netcode,
             UdpIo::default(),
-            LocalAddr(SocketAddr::from(([0, 0, 0, 0], 0))),
+            // 本地 socket 必须和服务器地址同族：给 IPv6 服务器从一个
+            // 0.0.0.0 的 IPv4 socket 发包会直接 EAFNOSUPPORT，表现就是
+            // 大厅点「加入」后永远停在「正在连接」。
+            LocalAddr(local_bind_addr(server)),
             PeerAddr(server),
             ReplicationReceiver,
             MessageManager::default(),
@@ -278,6 +360,16 @@ fn abort_login(
         return;
     }
     info!("net: 登录被取消，断开客户端");
+    crate::assetpack::log_line(&format!(
+        "abort_login: 断开 {} 个 client，phase={}",
+        clients.iter().count(),
+        match &*phase {
+            LoginPhase::Idle => "Idle",
+            LoginPhase::Connecting => "Connecting",
+            LoginPhase::Handshaking => "Handshaking",
+            LoginPhase::InGame(_) => "InGame",
+        }
+    ));
     *phase = LoginPhase::Idle;
     for entity in &clients {
         commands.trigger(Disconnect { entity });
@@ -295,12 +387,125 @@ fn leave_game(
     clients: Query<Entity, With<Client>>,
 ) {
     *phase = LoginPhase::Idle;
+    crate::assetpack::log_line(&format!(
+        "leave_game: 断开 {} 个 client",
+        clients.iter().count()
+    ));
     // 退出对局时清掉还没发完的时间速度提议：不然下一局连上新服务器时，
     // 那条陈旧的 pending 会被发出去，把**别人**那台服务器的世界也拖慢
     *uplink = TimeScaleUplink::default();
     commands.remove_resource::<LocalPlayer>();
     for entity in &clients {
         commands.trigger(Disconnect { entity });
+    }
+}
+
+/// 进后台 / 回前台。
+///
+/// 判据是 `WindowOccluded`：bevy 0.20 的 `AppLifecycle` 只有赋值、没有
+/// `write_message`（全 crate 搜不到构造处），iOS 上真正能收到的是 winit 从
+/// `applicationDidEnterBackground` 发出的 `WindowEvent::Occluded`。
+///
+/// 注意这两个事件**几乎总是攒到回前台那一帧一起投递**（挂起期间不跑帧），
+/// 所以这里的挂起分支只负责「干净地断」，重连交给 `resume_reconnect` 延后一帧做。
+fn watch_occlusion(
+    mut occluded: MessageReader<WindowOccluded>,
+    state: Res<State<GameState>>,
+    mode: Res<SessionMode>,
+    mut phase: ResMut<LoginPhase>,
+    mut suspend: ResMut<SuspendState>,
+    clients: Query<Entity, With<Client>>,
+    mut commands: Commands,
+    mut notice: ResMut<LobbyNotice>,
+) {
+    for event in occluded.read() {
+        let current = state.get();
+        let mode_now = *mode;
+        crate::assetpack::log_line(&format!(
+            "lifecycle: occluded={} state={current:?} mode={mode_now:?} pending={:?}",
+            event.occluded, suspend.pending
+        ));
+
+        if event.occluded {
+            // 只有联机会话需要记现场；本地单机没有网络可断
+            if !matches!(current, GameState::Game | GameState::Login) {
+                continue;
+            }
+            let SessionMode::Online { server } = mode_now else {
+                continue;
+            };
+            if suspend.pending.is_some() {
+                continue;
+            }
+            suspend.pending = Some(server);
+            suspend.want_resume = false;
+            notice.0 = None;
+            // 先清阶段再断：`on_disconnected` 只看得到 `Idle`，不会当成掉线回大厅
+            *phase = LoginPhase::Idle;
+            for entity in &clients {
+                commands.trigger(Disconnect { entity });
+            }
+            crate::assetpack::log_line(&format!(
+                "lifecycle: 挂起，主动断开 {server}（断开 {} 个 client）",
+                clients.iter().count()
+            ));
+        } else if suspend.pending.is_some() {
+            suspend.want_resume = true;
+            crate::assetpack::log_line("lifecycle: 回前台，等旧 client 落地后重连");
+        }
+    }
+}
+
+/// 回前台后的重连，**必须比断开晚一帧以上**。
+///
+/// 同一帧里「断旧 client」和「建新 client」一起做，老的 netcode 客户端和它的
+/// socket 还没释放，新客户端建出来会立刻被置成 `Disconnected`（实测 entity 997v1：
+/// `phase=Connecting` 就掉线），表现就是刚回来又弹「连不上」。所以先等旧 client
+/// 从世界里面消失，再进登录流程。
+fn resume_reconnect(
+    mut suspend: ResMut<SuspendState>,
+    mut mode: ResMut<SessionMode>,
+    mut phase: ResMut<LoginPhase>,
+    mut auto: ResMut<AutoJoin>,
+    state: Res<State<GameState>>,
+    clients: Query<Entity, With<Client>>,
+    mut commands: Commands,
+    mut notice: ResMut<LobbyNotice>,
+    mut next: ResMut<NextState<GameState>>,
+) {
+    if !suspend.want_resume {
+        return;
+    }
+    if !clients.is_empty() {
+        // `Disconnect` 事件已经发过了，这里只把还没收干净的实体清掉；
+        // 它自己的 socket 在实体销毁时才释放，所以必须等这一帧结束
+        for entity in &clients {
+            commands.entity(entity).try_despawn();
+        }
+        crate::assetpack::log_line(&format!(
+            "lifecycle: 等旧 client 落地，先清掉 {} 个残留",
+            clients.iter().count()
+        ));
+        return;
+    }
+    let Some(server) = suspend.pending else {
+        suspend.want_resume = false;
+        return;
+    };
+    suspend.pending = None;
+    suspend.want_resume = false;
+    *phase = LoginPhase::Idle;
+    *mode = SessionMode::Online { server };
+    notice.0 = None;
+    let current = state.get();
+    crate::assetpack::log_line(&format!("lifecycle: 重连 {server}（当时状态 {current:?}）"));
+    if matches!(current, GameState::Login) {
+        // 握手被挂起打断了：先去大厅，再靠 `AutoJoin` 重新进登录 ——
+        // 同一个状态没法靠 `NextState` 重跑 `OnEnter(Login)`
+        auto.0 = Some(SessionMode::Online { server });
+        next.set(GameState::Lobby);
+    } else {
+        next.set(GameState::Login);
     }
 }
 
@@ -359,6 +564,16 @@ fn on_disconnected(
 ) {
     // 连接实体刚 spawn 出来时会先带一个 `Disconnected` 再转 `Connecting`，
     // 那种不算"掉线"：只有已经处于 Connecting/Handshaking/InGame 的断开才算
+    crate::assetpack::log_line(&format!(
+        "on_disconnected: entity={:?} phase={}",
+        trigger.entity,
+        match &*phase {
+            LoginPhase::Idle => "Idle",
+            LoginPhase::Connecting => "Connecting",
+            LoginPhase::Handshaking => "Handshaking",
+            LoginPhase::InGame(_) => "InGame",
+        }
+    ));
     let was_in_game = matches!(*phase, LoginPhase::InGame(_));
     let was_active = !matches!(*phase, LoginPhase::Idle) || was_in_game;
     *phase = LoginPhase::Idle;
@@ -370,6 +585,9 @@ fn on_disconnected(
     }
 
     warn!("net: disconnected {:?}，回到大厅", trigger.entity);
+    crate::assetpack::log_line(&format!(
+        "net: disconnected（was_in_game={was_in_game}）→ 回大厅"
+    ));
     notice.0 = Some(if was_in_game {
         "与服务器断开连接".to_string()
     } else {
@@ -394,6 +612,7 @@ fn on_welcome(
     for mut receiver in clients.iter_mut() {
         for welcome in receiver.receive() {
             info!("join: Welcome player_id={} → InGame", welcome.player_id);
+            crate::assetpack::log_line(&format!("join: Welcome player_id={}", welcome.player_id));
             *phase = LoginPhase::InGame(welcome.player_id);
             commands.insert_resource(LocalPlayer(welcome.player_id));
             // 登录完成：场景/角色/相机在 `Game` 的 `OnEnter` 里建
@@ -745,6 +964,22 @@ fn drive_net_animation(
 struct RemotePoseJump<'w, 's> {
     tunings: Res<'w, JumpTunings>,
     mismatched: Local<'s, bool>,
+}
+
+/// 远端姿态系统的前置条件。
+///
+/// 全新安装（或热更包还没下完）时 `AnimCatalog` 是空的，`PlayerModelAssets`
+/// 根本不会被 `prepare_player_models` 插入，它们和 `MixerCache`/`ClipSet`/
+/// `AnimSelection` 一起缺席。少了这道判断，第一帧的 `Res<T>` 校验就会 panic 并
+/// abort 整个进程 —— 表现就是「装上后一点就闪退」。
+fn remote_pose_ready(
+    models: Option<Res<PlayerModelAssets>>,
+    cache: Option<Res<MixerCache>>,
+    clips: Option<Res<ClipSet>>,
+    catalog: Option<Res<AnimCatalog>>,
+    selection: Option<Res<AnimSelection>>,
+) -> bool {
+    models.is_some() && cache.is_some() && clips.is_some() && catalog.is_some() && selection.is_some()
 }
 
 fn drive_remote_pose(
@@ -1213,6 +1448,18 @@ fn apply_replicated_time_scale(
 #[cfg(test)]
 mod time_scale_tests {
     use super::*;
+
+    #[test]
+    fn local_bind_matches_server_address_family() {
+        let v4: SocketAddr = "127.0.0.1:5099".parse().unwrap();
+        let v6: SocketAddr = "[2409:8a3c:424:5ff0:1cda:21aa:9ba1:d1cd]:5099"
+            .parse()
+            .unwrap();
+        assert!(local_bind_addr(v4).is_ipv4());
+        assert!(local_bind_addr(v6).is_ipv6());
+        assert_eq!(local_bind_addr(v4).port(), 0);
+        assert_eq!(local_bind_addr(v6).port(), 0);
+    }
 
     /// 客户端收到复制值后必须真的把 `Time<Virtual>` 改掉，不然「滑杆同步了但世界没变」
     #[test]

@@ -13,6 +13,9 @@ if [[ "$CONFIGURATION" != "Debug" ]]; then
     RELFLAG=--release
 fi
 
+# 登录遮罩会显示这个值，方便确认手机上跑的到底是哪一版。
+export CRAB_BUILD_NUMBER="${CURRENT_PROJECT_VERSION:-dev}"
+
 set -euvx
 
 # add homebrew bin path, as it's the most commonly used package manager on macOS

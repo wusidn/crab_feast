@@ -1,7 +1,10 @@
 {
   "server": {
-    "addr": "127.0.0.1:5099"
+    "addr": "[2409:8a3c:424:5ff0:1cda:21aa:9ba1:d1cd]:5099",
+    "registry": "http://127.0.0.1:8090",
+    "public_host": "game.qiaqia.cyou"
   },
+  "registry": "http://127.0.0.1:8090",
   "default_player": "player1",
   "players": [
     { "name": "player1", "client_id": 11, "window": [0, 60] },

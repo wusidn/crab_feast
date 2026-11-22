@@ -1,8 +1,11 @@
 //! 服务端自广播：每两秒往发现端口发一条 `ServerAnnounce`。
 //!
 //! 客户端大厅页只监听、不探测：服务器活着就一直在列表里，进程一停，
-//! 广播断掉超过几秒客户端就把它从列表里剔掉。地址绑到 `0.0.0.0` 时客户端
-//! 用广播包的源 IP 兜底，所以服务端不需要知道自己该报哪张网卡的地址。
+//! 广播断掉超过几秒客户端就把它从列表里剔掉。
+//!
+//! 广播里报的是**对外地址**（`--public-host` 解析出来的地址），不是监听地址：
+//! 监听 `[::]:5099` 时如果广播 `[::]`，客户端会用广播包的源 IPv4 兜底，
+//! 注册中心那条却是公网 IPv6，同一台服会在大厅里裂成两行。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
@@ -24,11 +27,15 @@ pub struct Beacon {
     socket: UdpSocket,
     timer: Timer,
     name: String,
-    addr: SocketAddr,
+    /// 对外公布、客户端用来直连的地址（不是本地监听地址）。
+    announce_addr: SocketAddr,
 }
 
 /// 在 `setup` 里调：建一个独立 UDP socket（不占用游戏端口）并开始广播。
-pub fn start(commands: &mut Commands, addr: SocketAddr) {
+///
+/// `announce_addr` 是给客户端连的对外地址；`name` 是大厅显示名，
+/// 和注册中心用同一个，没配就退回 `host · 端口`。
+pub fn start(commands: &mut Commands, announce_addr: SocketAddr, name: Option<String>) {
     let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(socket) => socket,
         Err(error) => {
@@ -45,16 +52,18 @@ pub fn start(commands: &mut Commands, addr: SocketAddr) {
     // 第一帧就发一条：不想让玩家在大厅里干等两秒才看见服务器
     timer.set_elapsed(Duration::from_secs_f32(INTERVAL));
 
-    info!("服务器发现广播：{}（udp:{DISCOVERY_PORT}）", addr);
+    info!("服务器发现广播：{}（udp:{DISCOVERY_PORT}）", announce_addr);
     commands.insert_resource(Beacon {
         socket,
         timer,
-        name: server_name(addr),
-        addr,
+        name: name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| server_name(announce_addr)),
+        announce_addr,
     });
 }
 
-fn server_name(addr: SocketAddr) -> String {
+pub fn server_name(addr: SocketAddr) -> String {
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "crab-feast".to_string());
@@ -70,9 +79,9 @@ pub fn broadcast(time: Res<Time>, mut beacon: ResMut<Beacon>, room: Res<Room>) {
     let announce = ServerAnnounce {
         magic: DISCOVERY_MAGIC.to_string(),
         name: beacon.name.clone(),
-        // 如实报监听地址：绑 0.0.0.0 时客户端会用源 IP 替换
-        addr: beacon.addr.to_string(),
-        port: beacon.addr.port(),
+        // 报对外地址；客户端不需要再用包源 IP 猜
+        addr: beacon.announce_addr.to_string(),
+        port: beacon.announce_addr.port(),
         players: room.avatar_of_link.len().min(MAX_PLAYERS as usize) as u8,
         max_players: MAX_PLAYERS,
         tick_hz: TICK_HZ as f32,

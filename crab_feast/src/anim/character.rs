@@ -229,11 +229,17 @@ impl Plugin for CharacterPlugin {
 
 /// 启动时扫描 assets/characters：rigs 下的每个 glb 是一个角色，animations 下的同名目录是它的剪辑
 fn scan_catalog() -> AnimCatalog {
-    let Some(root) = find_asset_root() else {
-        warn!("没有找到 assets 目录，角色与剪辑清单为空");
-        return AnimCatalog::default();
-    };
+    match find_asset_root() {
+        Some(root) => scan_catalog_at(&root),
+        None => {
+            warn!("没有找到 assets 目录，角色与剪辑清单为空");
+            AnimCatalog::default()
+        }
+    }
+}
 
+/// 扫描指定资源根（热更包落地后要重扫一次，否则这一局的角色清单是空的）
+pub(crate) fn scan_catalog_at(root: &std::path::Path) -> AnimCatalog {
     let rigs_dir = root.join("characters/rigs");
     let animations_root = root.join("characters/animations");
 
@@ -847,4 +853,27 @@ where
         }
     }
     None
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// 热更包落地后要重扫清单；这里确认扫描函数不依赖环境变量、给定根就能扫出角色
+    #[test]
+    fn scan_catalog_at_finds_characters() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets");
+        if !root.join("characters/rigs").is_dir() {
+            eprintln!("跳过：{} 下没有角色素材", root.display());
+            return;
+        }
+        let catalog = scan_catalog_at(&root);
+        assert!(!catalog.characters.is_empty(), "应扫出角色");
+        assert!(!catalog.clips.is_empty(), "应扫出剪辑");
+        println!(
+            "扫描到 {} 个角色 / {} 个剪辑",
+            catalog.characters.len(),
+            catalog.clips.len()
+        );
+    }
 }

@@ -8,6 +8,10 @@ bevy.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 资源热更：ureq 自带 rustls + gzip；解压用 flate2 自己读 zip，不引 zip crate
+ureq = { version = "3", default-features = true }
+sha2 = "0.10"
+flate2 = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.7"

@@ -19,11 +19,12 @@ use crab_feast::ground;
 use crab_feast::level::spawn_static_level;
 use crab_feast_launcher::config::{LauncherConfig, config_path_from_args};
 use crab_feast_library::net::{
-    ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR, JoinRequest, MOVE_SPEED_MPS, MoveInput,
-    NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId, NetPos, NetTimeScale, NetYaw,
-    TICK_HZ, TimeScaleRequest, Welcome,
+    ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR, DEFAULT_REGISTRY_URL, JoinRequest,
+    MOVE_SPEED_MPS, MoveInput, NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId,
+    NetPos, NetTimeScale, NetYaw, TICK_HZ, TimeScaleRequest, Welcome,
 };
 mod beacon;
+mod registration;
 
 use crab_feast_library::tuning;
 use lightyear::{
@@ -73,7 +74,7 @@ struct Room {
 struct Joined(u8);
 
 fn main() {
-    let (addr, exit_after, log_state_enabled) = parse_args();
+    let args = parse_args();
 
     let mut app = App::new();
     // 无渲染的服务器仍要跑 Avian：它的碰撞体后端会读 Mesh 资产，
@@ -101,11 +102,15 @@ fn main() {
     .insert_resource(Room::default())
     // 四档跳跃调参：站 / 跑 / 上 / 下。与客户端默认值同源，调一处两端一致。
     .init_resource::<JumpTunings>()
-    .insert_resource(ServerAddr(addr))
+    .insert_resource(ServerAddr(args.addr))
+    // 大厅显示名先解析一次，广播和注册中心共用，避免两边名字不一致
+    .insert_resource(ServerDisplayName(args.display_name))
+    // 注册配置在启动系统里消费一次；`None` 表示不注册（--no-registry / "off"）
+    .insert_resource(RegistrySettings(args.registry))
     // 物理与轻年都跑 FixedUpdate，把步长对齐到同一个 tick，避免两边时钟各走各的
     .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
     .add_systems(Startup, setup)
-    .add_systems(Update, beacon::broadcast)
+    .add_systems(Update, (beacon::broadcast, publish_player_count))
     .add_observer(on_new_link)
     .add_observer(on_disconnect)
     .add_systems(
@@ -132,12 +137,12 @@ fn main() {
             .after(PhysicsSystems::Writeback),
     );
 
-    if let Some(secs) = exit_after {
+    if let Some(secs) = args.exit_after {
         app.insert_resource(ExitAfter(Timer::from_seconds(secs, TimerMode::Once)))
             .add_systems(Update, exit_when_elapsed);
     }
 
-    if log_state_enabled {
+    if args.log_state {
         // FixedUpdate 是 60Hz，除以 60 就是每秒一次
         app.add_systems(FixedUpdate, log_state.run_if(every_second));
     }
@@ -153,6 +158,28 @@ fn every_second(mut counter: Local<u32>) -> bool {
 
 #[derive(Resource)]
 struct ServerAddr(SocketAddr);
+
+/// 大厅显示名。`None`/空表示按 `host · 端口` 自动生成；广播和注册中心共用。
+#[derive(Resource)]
+struct ServerDisplayName(Option<String>);
+
+/// 注册配置。`None` 表示不向注册中心报到（`--no-registry` 或配置成 `"off"`）。
+///
+/// 用资源而不是直接传参给 `setup`：`setup` 是 Startup 系统，参数越多越容易碰到
+/// Bevy 的系统参数上限；配置在 `main` 里解析完就固定了，资源是最自然的载体。
+#[derive(Resource)]
+struct RegistrySettings(Option<registration::Config>);
+
+/// 把房间人数同步给注册线程。心跳线程读原子，不碰 ECS，所以不用加锁。
+fn publish_player_count(
+    room: Res<Room>,
+    registration: Option<Res<registration::Registration>>,
+) {
+    if let Some(registration) = registration {
+        let players = room.avatar_of_link.len().min(MAX_PLAYERS as usize) as u8;
+        registration.set_players(players);
+    }
+}
 
 /// 世界时钟实体（`NetTimeScale` 的持有者，见 [`setup`]）。
 #[derive(Component)]
@@ -208,13 +235,29 @@ fn exit_when_elapsed(
     }
 }
 
-fn parse_args() -> (SocketAddr, Option<f32>, bool) {
+/// 启动参数解析结果。
+struct Args {
+    addr: SocketAddr,
+    exit_after: Option<f32>,
+    log_state: bool,
+    /// 大厅显示名：`--name` > launcher.json > `CRAB_SERVER_NAME`
+    display_name: Option<String>,
+    /// `None` = 不向注册中心报到
+    registry: Option<registration::Config>,
+}
+
+fn parse_args() -> Args {
     let config = LauncherConfig::load(config_path_from_args().as_deref());
     let mut args = std::env::args().skip(1);
     // 优先级：--addr > launcher.json 的 server.addr > 协议默认地址
     let mut addr: Option<String> = None;
     let mut exit_after: Option<f32> = None;
     let mut log_state = false;
+    // 注册相关：命令行 > launcher.json > 环境变量 > 内置默认
+    let mut registry_url: Option<String> = None;
+    let mut public_host = config.server.public_host.clone();
+    let mut name = config.server.name.clone();
+    let mut no_registry = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--addr" => {
@@ -226,6 +269,22 @@ fn parse_args() -> (SocketAddr, Option<f32>, bool) {
                 // 已经提前读过，这里只跳过值
                 let _ = args.next();
             }
+            "--registry" => {
+                if let Some(value) = args.next() {
+                    registry_url = Some(value);
+                }
+            }
+            "--no-registry" => no_registry = true,
+            "--public-host" => {
+                if let Some(value) = args.next() {
+                    public_host = Some(value);
+                }
+            }
+            "--name" => {
+                if let Some(value) = args.next() {
+                    name = Some(value);
+                }
+            }
             "--exit-after" => {
                 if let Some(value) = args.next() {
                     exit_after = value.parse().ok();
@@ -235,8 +294,13 @@ fn parse_args() -> (SocketAddr, Option<f32>, bool) {
             "--help" | "-h" => {
                 println!(
                     "crab-feast-server [--addr 0.0.0.0:5000] [--config launcher.json] \
+                     [--registry http://127.0.0.1:8090] [--no-registry] \
+                     [--public-host <域名/IP>] [--name <大厅显示名>] \
                      [--exit-after <秒>] [--log-state]\n\
-                     不传 --addr 时读 launcher.json 的 server.addr。"
+                     不传 --addr 时读 launcher.json 的 server.addr。\n\
+                     默认会向服务器注册中心报到；地址可用 CRAB_REGISTRY_URL 覆盖。\n\
+                     对外地址默认取监听 IP；绑 0.0.0.0 时自动探测本机网卡，\n\
+                     跨公网部署请用 --public-host 指定域名或公网 IP。"
                 );
                 std::process::exit(0);
             }
@@ -250,7 +314,45 @@ fn parse_args() -> (SocketAddr, Option<f32>, bool) {
         eprintln!("地址 {addr} 无法解析：{error}");
         std::process::exit(2);
     });
-    (addr, exit_after, log_state)
+
+    let registry_url = registry_url
+        .or_else(|| config.server.registry.clone())
+        .or_else(|| env_nonempty("CRAB_REGISTRY_URL"))
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+    let display_name = name.or_else(|| env_nonempty("CRAB_SERVER_NAME"));
+    let registry = if no_registry || is_off(&registry_url) {
+        None
+    } else {
+        Some(registration::Config {
+            url: registry_url,
+            public_host: public_host.or_else(|| env_nonempty("CRAB_PUBLIC_HOST")),
+            name: display_name.clone(),
+        })
+    };
+
+    Args {
+        addr,
+        exit_after,
+        log_state,
+        display_name,
+        registry,
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// `"off"` / `"none"` / `"disabled"` / 空串都视为关闭注册。
+fn is_off(url: &str) -> bool {
+    let url = url.trim();
+    url.is_empty()
+        || url.eq_ignore_ascii_case("off")
+        || url.eq_ignore_ascii_case("none")
+        || url.eq_ignore_ascii_case("disabled")
 }
 
 /// 每秒打印一次所有玩家的位置与朝向：验证「输入→位移→复制」时不用开客户端观察器。
@@ -268,7 +370,12 @@ fn log_state(players: Query<(&NetPlayerId, &Transform, &NetYaw, &NetMotion)>) {
     }
 }
 
-fn setup(mut commands: Commands, addr: Res<ServerAddr>) {
+fn setup(
+    mut commands: Commands,
+    addr: Res<ServerAddr>,
+    registry: Res<RegistrySettings>,
+    display_name: Res<ServerDisplayName>,
+) {
     // 一个 UDP endpoint：监听 addr，每个远端地址自动派生子 link 实体
     let server = commands
         .spawn((
@@ -304,8 +411,31 @@ fn setup(mut commands: Commands, addr: Res<ServerAddr>) {
 
     info!("dedicated server listening on {}", addr.0);
 
-    // 定时 UDP 广播自己的地址/端口/人数，客户端大厅直接收，不用手输地址
-    beacon::start(&mut commands, addr.0);
+    // 广播和注册中心必须报同一个对外地址：绑定 [::] 时如果广播 [::]，
+    // 客户端会退回广播包的源 IPv4，而注册中心是公网 IPv6，大厅里会裂成两行。
+    let announce_addr = registry
+        .0
+        .as_ref()
+        .and_then(|config| config.public_host.as_deref())
+        .and_then(|host| registration::advertised_addr(host, addr.0.port()))
+        .unwrap_or(addr.0);
+
+    // 定时 UDP 广播自己的地址/端口/人数，客户端大厅直接收，不用手输地址。
+    // 名字和注册中心用同一个：否则同一台服务器两条来源会各报一个名字，
+    // 大厅合并成一行后名字会在两边之间来回跳。
+    beacon::start(&mut commands, announce_addr, display_name.0.clone());
+
+    // 向中央 Web 服务注册：跨网段/公网的大厅靠这条，不再依赖 UDP 广播。
+    // 注册线程自己重试、心跳、退出注销，这里只管把它挂到 App 上。
+    if let Some(config) = registry.0.clone() {
+        let config = registration::Config {
+            name: display_name.0.clone(),
+            ..config
+        };
+        if let Some(registration) = registration::Registration::start(addr.0, config, MAX_PLAYERS) {
+            commands.insert_resource(registration);
+        }
+    }
 }
 
 /// 连接建立：只把这条连接需要的收发能力装上，**不建角色**。

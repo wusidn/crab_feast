@@ -7,6 +7,8 @@ members = [
     "launcher/wasm",
     # Shared launcher layer
     "launcher/shared",
+    # 服务器注册中心（Web 服务）
+    "web",
     # Game
     "crab_feast",
     # Game Library
@@ -20,7 +22,7 @@ default-members = ["launcher/pc"]
 [workspace.dependencies]
 # complex_script_segmentation：给 parley 打开 ICU4X 的 CJK 词典切分，
 # 否则文本排版会打 "ICU4X data error: No segmentation model for complex script"
-bevy                    = { version = "0.20.1", features = ["bevy_dev_tools", "debug", "render_dev_tools", "complex_script_segmentation"] }
+bevy                    = { version = "0.20.1", features = ["bevy_dev_tools", "debug", "render_dev_tools", "complex_script_segmentation", "default_font"] }
 # 物理引擎：Avian 0.8（对应 Bevy 0.20）。
 # 关闭默认特性里的 parallel，因为 parry 的 rayon 后端在 wasm32 上编译不过；
 # 其余默认特性（3d / parry-f32 / debug-plugin / xpbd_joints /
@@ -44,6 +46,13 @@ bevy_asset_loader      = { version = "0.28.1", features = ["progress_tracking", 
 iyes_progress          = "0.18.0"
 # 开发构建按 Bevy 官方建议开轻量优化：本仓库开箱是 opt-level 0，
 # 混合预览每帧要采样 4 个剪辑 × 169 骨骼的姿态，未优化时会明显掉帧。
+[profile.release]
+# 移动端 OTA 装机靠蜂窝流量，二进制越小越好
+lto = "thin"          # 跨 crate 内联，代码段能小一截
+codegen-units = 1     # 配合 lto，进一步压缩体积
+strip = "symbols"     # 48 万个符号没必要进包
+opt-level = 3
+
 [profile.dev]
 opt-level = 1
 

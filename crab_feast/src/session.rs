@@ -13,7 +13,7 @@ use crate::GameState;
 use crate::anim::{AnimRuntime, PoseDriver};
 use crate::input::MovementInput;
 use crate::scene::Avatar;
-use crate::state::{AbortSession, AutoJoin, LobbyNotice, SessionMode, SessionReady};
+use crate::state::{AbortSession, AutoJoin, LobbyNotice, NetDiagnostics, SessionMode, SessionReady};
 
 /// 本地登录的过渡时长：让「正在登录」界面至少露一次脸，不至于闪一下就进场景。
 const LOCAL_LOGIN_SECS: f32 = 0.4;
@@ -32,23 +32,22 @@ struct LoginStage {
 #[derive(Resource, Default)]
 struct WorldClock(f32);
 
+
 impl Plugin for SessionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SessionMode>()
             .init_resource::<SessionReady>()
             .init_resource::<AutoJoin>()
             .init_resource::<LobbyNotice>()
+            .init_resource::<NetDiagnostics>()
             .init_resource::<LoginStage>()
             .init_resource::<WorldClock>()
             .add_message::<AbortSession>()
             .add_systems(OnEnter(GameState::Lobby), consume_auto_join)
             .add_systems(OnEnter(GameState::Login), begin_login)
-            .add_systems(
-                Update,
-                (tick_local_login, connect_timeout_notice)
+            .add_systems(Update, (tick_local_login, connect_timeout_notice)
                     .run_if(in_state(GameState::Login)),
-            )
-            .add_systems(OnEnter(GameState::Game), reset_world_clock)
+            )            .add_systems(OnEnter(GameState::Game), reset_world_clock)
             .add_systems(
                 Update,
                 (mark_world_ready, note_ready_timeout)
@@ -117,6 +116,7 @@ fn connect_timeout_notice(
     };
     if timer.tick(time.delta()).just_finished() {
         notice.0 = Some("连接服务器超时，请重试".to_string());
+        crate::assetpack::log_line("login: 握手超时 → 回大厅");
         abort.write(AbortSession);
         next.set(GameState::Lobby);
     }

@@ -26,6 +26,12 @@ pub struct LauncherConfig {
     /// 不传 `--profile` 时默认用哪个玩家位。
     #[serde(default)]
     pub default_player: Option<String>,
+    /// 客户端要拉取的服务器注册中心地址（Web 服务）。
+    ///
+    /// 不填 → 用内置默认（`http://127.0.0.1:8090`，可用 `CRAB_REGISTRY_URL` 覆盖）；
+    /// 填 `"off"` / 空字符串 → 关闭注册中心列表，只保留局域网广播。
+    #[serde(default)]
+    pub registry: Option<String>,
 }
 
 /// 服务端段。
@@ -34,6 +40,15 @@ pub struct ServerSection {
     /// 监听地址；留空则用协议默认 `127.0.0.1:5000`。
     #[serde(default)]
     pub addr: Option<String>,
+    /// 启动时向这个 Web 服务注册自己；`"off"` 关闭注册。
+    #[serde(default)]
+    pub registry: Option<String>,
+    /// 对外上报的域名 / 公网 IP。绑 `0.0.0.0` 时用它告诉外网客户端该连哪。
+    #[serde(default)]
+    pub public_host: Option<String>,
+    /// 大厅里显示的服务器名字；不填用「机器名 · 端口」。
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// 一个玩家位：一个客户端进程的启动参数。
@@ -56,7 +71,12 @@ pub struct PlayerProfile {
 
 impl Default for ServerSection {
     fn default() -> Self {
-        Self { addr: None }
+        Self {
+            addr: None,
+            registry: None,
+            public_host: None,
+            name: None,
+        }
     }
 }
 
@@ -64,6 +84,7 @@ impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
             server: ServerSection::default(),
+            registry: None,
             players: vec![
                 PlayerProfile {
                     name: "player1".to_string(),

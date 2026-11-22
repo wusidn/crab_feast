@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  免费账号的 7 天描述文件续期巡检。
+  每 6 小时看一次当前 ipa 里 profile 的剩余时间，低于 OTA_RENEW_LEAD_HOURS（默认 72h）
+  才会真的重出包；其余时候只读不写，开销可以忽略。
+
+  安装：
+    mkdir -p ~/Library/LaunchAgents
+    cp scripts/dev/org.crab.feast.ota-renew.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.crab.feast.ota-renew.plist
+  卸载：
+    launchctl bootout gui/$(id -u)/org.crab.feast.ota-renew
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.crab.feast.ota-renew</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>scripts/dev/ota_renew.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/cc/workspace/projects/crab_feast</string>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>StandardOutPath</key><string>/Users/cc/Library/Logs/crab-feast-ota/renew.log</string>
+  <key>StandardErrorPath</key><string>/Users/cc/Library/Logs/crab-feast-ota/renew.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>/Users/cc</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+  </dict>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
