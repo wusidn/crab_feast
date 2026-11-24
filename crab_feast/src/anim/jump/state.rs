@@ -168,9 +168,40 @@ impl Default for JumpAction {
 }
 
 impl JumpAction {
-    /// 双脚是否离地。空中不接管水平输入、也不让脚 IK 钉脚。
+    /// 双脚是否离地。空中水平速度只能限速转向（见 `crab_feast_library::air`），
+    /// 也不让脚 IK 钉脚。
     pub fn is_airborne(&self) -> bool {
         self.state == JumpState::Air
+    }
+
+    /// 进入滞空后已经过了多久（秒）。
+    ///
+    /// 空中操控只在起跳后的头一段时间里生效（见
+    /// `crab_feast_library::net::air_steer_active`），这个值就是那把尺。
+    /// 用「起跳后经过多久」而不是「距落地还有多久」：落地时刻要算未来，
+    /// 而服务端只能数 tick，两端得用同一个判据才谈得上逐 tick 一致。
+    pub fn air_elapsed(&self) -> f32 {
+        if self.is_airborne() {
+            self.air_time
+        } else {
+            0.0
+        }
+    }
+
+    /// 单测用：造一个「已经在滞空」的动作层，不必真跑一遍起跳流程。
+    #[cfg(test)]
+    pub(crate) fn in_air_for_test() -> Self {
+        Self {
+            state: JumpState::Air,
+            ..Default::default()
+        }
+    }
+
+    /// 单测用：把滞空计时拨到某一刻，验证「起跳多久之后锁死落点」。
+    #[cfg(test)]
+    pub(crate) fn set_air_elapsed_for_test(&mut self, secs: f32) {
+        self.state = JumpState::Air;
+        self.air_time = secs;
     }
 
     /// 动作层是否在接管姿态（蓄力 / 滞空 / 落地都算）。

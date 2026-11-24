@@ -175,7 +175,10 @@ fn pick_clip_matches_local_rules() {
         JumpPose::Stand.clip()
     );
 
-    clips.insert(JumpPose::Run1Left.clip(), Handle::<AnimationClip>::default());
+    clips.insert(
+        JumpPose::Run1Left.clip(),
+        Handle::<AnimationClip>::default(),
+    );
     let gait = ClipGait {
         stride: 1.6,
         contact_left: Some(0.50),

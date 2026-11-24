@@ -13,6 +13,8 @@ use bevy::{
 use super::widgets;
 use crate::ui::font::font_scope;
 
+use super::page_scroll::ScrollDragShield;
+
 /// 页面标识。`None` 表示根页面。
 pub type PageId = &'static str;
 
@@ -255,6 +257,8 @@ impl<S: States> Plugin for MenuPlugin<S> {
     fn build(&self, app: &mut App) {
         app.init_resource::<MenuConfig>()
             .init_resource::<MenuState>()
+            // 触屏上下滑动：状态 + 拖动遮罩的显隐都归它自己管
+            .init_resource::<super::page_scroll::PageScroll>()
             .add_message::<MenuEvent>()
             .add_systems(
                 OnEnter(self.state.clone()),
@@ -265,6 +269,19 @@ impl<S: States> Plugin for MenuPlugin<S> {
             .add_systems(
                 Update,
                 (menu_hotkeys, advance_menu, sync_menu_layout)
+                    .chain()
+                    .run_if(in_state(self.state.clone())),
+            )
+            .add_systems(
+                Update,
+                (
+                    super::page_scroll::reset_page_scroll,
+                    super::page_scroll::page_scroll_begin,
+                    super::page_scroll::page_scroll_move,
+                    super::page_scroll::page_scroll_end,
+                    super::page_scroll::page_scroll_momentum,
+                    super::page_scroll::sync_scroll_shield,
+                )
                     .chain()
                     .run_if(in_state(self.state.clone())),
             );
@@ -326,6 +343,23 @@ fn setup_menu(mut commands: Commands, asset_server: Res<AssetServer>, config: Re
             ChildOf(drawer)
         })
         .id();
+
+    // 拖动遮罩：手指滑动期间盖住整块页面，松手就落在它身上。
+    // 见 [`super::page_scroll`]：Bevy 的 `PointerClick` 不检查位移，
+    // 不挡一下，滑到最后手指抬起时会把按下时那一行当成点击。
+    commands.spawn_scene(bsn! {
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            top: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            display: Display::None,
+        }
+        GlobalZIndex(140)
+        ScrollDragShield
+        ChildOf(drawer)
+    });
 
     spawn_page(
         &mut commands,

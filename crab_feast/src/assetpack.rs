@@ -125,7 +125,12 @@ pub struct PackJob {
 
 impl Default for PackJob {
     fn default() -> Self {
-        Self { done: false, ok: true, message: "准备同步资源…".into(), progress: 0.0 }
+        Self {
+            done: false,
+            ok: true,
+            message: "准备同步资源…".into(),
+            progress: 0.0,
+        }
     }
 }
 
@@ -139,10 +144,7 @@ impl Plugin for AssetPackPlugin {
         app.init_state::<GameState>()
             .insert_resource(PackSync::default())
             .add_systems(OnEnter(GameState::AssetsSync), start_sync)
-            .add_systems(
-                Update,
-                tick_sync.run_if(in_state(GameState::AssetsSync)),
-            )
+            .add_systems(Update, tick_sync.run_if(in_state(GameState::AssetsSync)))
             // 大厅左下角显示资源版本，用来确认跑的到底是不是热更下来的那一包
             .add_systems(OnEnter(GameState::Lobby), spawn_pack_badge)
             .add_systems(OnExit(GameState::Lobby), despawn_pack_badge);
@@ -164,7 +166,10 @@ fn spawn_pack_badge(mut commands: Commands) {
         .unwrap_or(0);
     commands.spawn((
         Text::new(format!("PACK {ver} · {files} dirs")),
-        TextFont { font_size: FontSize::Px(12.0), ..default() },
+        TextFont {
+            font_size: FontSize::Px(12.0),
+            ..default()
+        },
         TextColor(Color::srgba(0.62, 0.68, 0.78, 0.9)),
         Node {
             position_type: PositionType::Absolute,
@@ -191,11 +196,7 @@ struct SyncUi;
 #[derive(Component)]
 struct SyncBarFill;
 
-fn start_sync(
-    mut commands: Commands,
-    sync: Res<PackSync>,
-    mut next: ResMut<NextState<GameState>>,
-) {
+fn start_sync(mut commands: Commands, sync: Res<PackSync>, mut next: ResMut<NextState<GameState>>) {
     // 桌面/安卓没有落地目录，直接进资源加载
     let Some(dir) = pack_dir() else {
         log_line("pack_dir=None（没找到可写容器，同步被跳过）");
@@ -243,7 +244,10 @@ fn start_sync(
     // 它只有 ASCII，所以同步阶段一律显示英文
     commands.spawn((
         Text::new("ASSET SYNC ..."),
-        TextFont { font_size: FontSize::Px(20.0), ..default() },
+        TextFont {
+            font_size: FontSize::Px(20.0),
+            ..default()
+        },
         TextColor(Color::srgb(0.85, 0.89, 0.95)),
         Node {
             position_type: PositionType::Absolute,
@@ -385,7 +389,10 @@ fn sync_pack(base: &str, dir: &Path, job: &Arc<Mutex<PackJob>>) -> Result<String
 
     set_msg(
         job,
-        format!("{mode}：{from} → {remote}（{:.1}MB）", total as f64 / 1048576.0),
+        format!(
+            "{mode}：{from} → {remote}（{:.1}MB）",
+            total as f64 / 1048576.0
+        ),
     );
 
     fs::create_dir_all(dir).map_err(|e| format!("建目录失败 {dir:?}: {e}"))?;
@@ -520,15 +527,22 @@ fn download(
     let mut got = 0u64;
 
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("下载中断: {e}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("下载中断: {e}"))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("写盘失败: {e}"))?;
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("写盘失败: {e}"))?;
         hasher.update(&buf[..n]);
         got += n as u64;
         if let Ok(mut j) = job.lock() {
-            j.progress = if total > 0 { (got as f32 / total as f32).min(0.99) } else { -1.0 };
+            j.progress = if total > 0 {
+                (got as f32 / total as f32).min(0.99)
+            } else {
+                -1.0
+            };
             j.message = format!(
                 "下载中 {:.1} / {:.1} MB",
                 got as f64 / 1048576.0,
@@ -584,34 +598,33 @@ fn read_central_directory(file: &mut File) -> Result<Vec<ZipEntry>, String> {
         tail[eocd + 19],
     ]) as u64;
 
-    file.seek(SeekFrom::Start(cd_off)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(cd_off))
+        .map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; cd_size as usize];
     file.read_exact(&mut buf).map_err(|e| e.to_string())?;
 
     let mut entries = Vec::with_capacity(count);
     let mut pos = 0usize;
     while pos + 46 <= buf.len() {
-        if buf[pos] != 0x50 || buf[pos + 1] != 0x4b || buf[pos + 2] != 0x01 || buf[pos + 3] != 0x02 {
+        if buf[pos] != 0x50 || buf[pos + 1] != 0x4b || buf[pos + 2] != 0x01 || buf[pos + 3] != 0x02
+        {
             break;
         }
         let method = u16::from_le_bytes([buf[pos + 10], buf[pos + 11]]);
-        let comp = u32::from_le_bytes([
-            buf[pos + 20],
-            buf[pos + 21],
-            buf[pos + 22],
-            buf[pos + 23],
-        ]) as u64;
+        let comp =
+            u32::from_le_bytes([buf[pos + 20], buf[pos + 21], buf[pos + 22], buf[pos + 23]]) as u64;
         let name_len = u16::from_le_bytes([buf[pos + 28], buf[pos + 29]]) as usize;
         let extra_len = u16::from_le_bytes([buf[pos + 30], buf[pos + 31]]) as usize;
         let comment_len = u16::from_le_bytes([buf[pos + 32], buf[pos + 33]]) as usize;
-        let local = u32::from_le_bytes([
-            buf[pos + 42],
-            buf[pos + 43],
-            buf[pos + 44],
-            buf[pos + 45],
-        ]) as u64;
+        let local =
+            u32::from_le_bytes([buf[pos + 42], buf[pos + 43], buf[pos + 44], buf[pos + 45]]) as u64;
         let name = String::from_utf8_lossy(&buf[pos + 46..pos + 46 + name_len]).into_owned();
-        entries.push(ZipEntry { name, method, comp_size: comp, local_offset: local });
+        entries.push(ZipEntry {
+            name,
+            method,
+            comp_size: comp,
+            local_offset: local,
+        });
         pos += 46 + name_len + extra_len + comment_len;
     }
     Ok(entries)
@@ -641,13 +654,16 @@ fn apply_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
         let name_len = u16::from_le_bytes([head[26], head[27]]) as u64;
         let extra_len = u16::from_le_bytes([head[28], head[29]]) as u64;
         let data_off = entry.local_offset + 30 + name_len + extra_len;
-        file.seek(SeekFrom::Start(data_off)).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(data_off))
+            .map_err(|e| e.to_string())?;
 
-        let mut out = File::create(&out_path).map_err(|e| format!("创建 {out_path:?} 失败: {e}"))?;
+        let mut out =
+            File::create(&out_path).map_err(|e| format!("创建 {out_path:?} 失败: {e}"))?;
         match entry.method {
             0 => {
                 let mut take = (&mut file).take(entry.comp_size);
-                std::io::copy(&mut take, &mut out).map_err(|e| format!("写 {out_path:?} 失败: {e}"))?;
+                std::io::copy(&mut take, &mut out)
+                    .map_err(|e| format!("写 {out_path:?} 失败: {e}"))?;
             }
             8 => {
                 let take = (&mut file).take(entry.comp_size);
@@ -689,7 +705,10 @@ mod tests {
 
         let version = read_version(&dir).expect("应写出版本标记");
         assert!(dir.join("characters/rigs").is_dir(), "角色目录应落地");
-        assert!(dir.join("fonts/PingFang-SC-Regular.ttf").is_file(), "字体应落地");
+        assert!(
+            dir.join("fonts/PingFang-SC-Regular.ttf").is_file(),
+            "字体应落地"
+        );
 
         // 解压出来的文件大小必须和版本清单一致
         let index = get_json(&format!("{base}/assets/state.json")).unwrap();

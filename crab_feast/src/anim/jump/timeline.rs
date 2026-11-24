@@ -28,7 +28,9 @@ pub(super) const MIN_BLEND_SECS: f32 = 0.02;
 /// 让「离地帧满权重」优先：宁可把淡入压进那半帧，也不能让人已经离地、
 /// 姿态还停在跑步循环上。
 fn blend_for(take_secs: f32) -> f32 {
-    BLEND_IN_SECS.min(take_secs.max(MIN_BLEND_SECS)).min(take_secs)
+    BLEND_IN_SECS
+        .min(take_secs.max(MIN_BLEND_SECS))
+        .min(take_secs)
 }
 
 /// 髋曲线的采样频率（只采一个通道，一次性开销）

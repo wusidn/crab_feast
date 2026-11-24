@@ -13,7 +13,9 @@ use crate::GameState;
 use crate::anim::{AnimRuntime, PoseDriver};
 use crate::input::MovementInput;
 use crate::scene::Avatar;
-use crate::state::{AbortSession, AutoJoin, LobbyNotice, NetDiagnostics, SessionMode, SessionReady};
+use crate::state::{
+    AbortSession, AutoJoin, LobbyNotice, NetDiagnostics, SessionMode, SessionReady,
+};
 
 /// 本地登录的过渡时长：让「正在登录」界面至少露一次脸，不至于闪一下就进场景。
 const LOCAL_LOGIN_SECS: f32 = 0.4;
@@ -32,7 +34,6 @@ struct LoginStage {
 #[derive(Resource, Default)]
 struct WorldClock(f32);
 
-
 impl Plugin for SessionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SessionMode>()
@@ -45,13 +46,14 @@ impl Plugin for SessionPlugin {
             .add_message::<AbortSession>()
             .add_systems(OnEnter(GameState::Lobby), consume_auto_join)
             .add_systems(OnEnter(GameState::Login), begin_login)
-            .add_systems(Update, (tick_local_login, connect_timeout_notice)
-                    .run_if(in_state(GameState::Login)),
-            )            .add_systems(OnEnter(GameState::Game), reset_world_clock)
             .add_systems(
                 Update,
-                (mark_world_ready, note_ready_timeout)
-                    .run_if(in_state(GameState::Game)),
+                (tick_local_login, connect_timeout_notice).run_if(in_state(GameState::Login)),
+            )
+            .add_systems(OnEnter(GameState::Game), reset_world_clock)
+            .add_systems(
+                Update,
+                (mark_world_ready, note_ready_timeout).run_if(in_state(GameState::Game)),
             )
             .add_systems(OnExit(GameState::Game), cleanup_world);
     }

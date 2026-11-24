@@ -1,6 +1,7 @@
 //! 游戏内的右侧抽屉菜单：图标、抽屉面板、页面栈，以及页面通用 UI 积木。
 //!
 //! - [`drawer`]：抽屉本体、页面注册与页面切换
+//! - [`page_scroll`]：页面内容区的触屏上下滑动（拖动 + 惯性）
 //! - [`widgets`]：文字、小标题、按钮、下拉框、滑动条等页面通用控件
 //!
 //! 具体功能页面（例如动画预览）由各功能模块在进入游戏状态时注册并填充内容。
@@ -8,6 +9,7 @@
 use bevy::prelude::*;
 
 mod drawer;
+mod page_scroll;
 pub(crate) mod widgets;
 
 pub(crate) use drawer::*;

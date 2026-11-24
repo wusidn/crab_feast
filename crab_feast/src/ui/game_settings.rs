@@ -43,10 +43,7 @@ impl Plugin for GameSettingsPlugin {
             fill_menu_page.after(MenuSet::Setup),
         )
         .add_message::<ExitToLobby>()
-        .add_systems(
-            Update,
-            handle_exit.run_if(in_state(GameState::Game)),
-        );
+        .add_systems(Update, handle_exit.run_if(in_state(GameState::Game)));
     }
 }
 
@@ -156,7 +153,6 @@ fn exit_card() -> impl Scene + use<> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,7 +170,10 @@ mod tests {
             .expect("注册系统跑不起来");
         let config = app.world().resource::<MenuConfig>();
         assert!(
-            config.pages.iter().any(|page| page.id == GAME_SETTINGS_PAGE),
+            config
+                .pages
+                .iter()
+                .any(|page| page.id == GAME_SETTINGS_PAGE),
             "游戏设置页应该出现在菜单里"
         );
 
@@ -252,5 +251,3 @@ mod tests {
         );
     }
 }
-
-

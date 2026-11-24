@@ -58,6 +58,10 @@ __pycache__/
 # 本地 vendored 补丁：iOS UIScene 版 winit，只在本机保留，不入库
 /third_party/winit/
 
+# 本地 vendored 依赖：avian3d 0.8 带 AVIAN_DEBUG_GRAV 插桩日志的副本，
+# 由 Cargo.toml 里的 `path = "_vendored/avian3d"` 引用，只在本机保留，不入库
+/_vendored/
+
 # 构建交付产物（本地保留，不入库）
 /dist/
 

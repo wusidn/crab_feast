@@ -5,7 +5,11 @@
 //!
 //! 启动：`cargo run -p crab_feast_server -- --addr 0.0.0.0:5000`
 
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    time::Duration,
+};
 
 use avian3d::prelude::*;
 use bevy::{
@@ -16,12 +20,13 @@ use bevy::{
 };
 use crab_feast::anim::jump::{JumpKind, JumpProfile, JumpTunings};
 use crab_feast::ground;
-use crab_feast::level::spawn_static_level;
+use crab_feast::level::{PLAYER_SPAWN_Y, spawn_static_level};
 use crab_feast_launcher::config::{LauncherConfig, config_path_from_args};
 use crab_feast_library::net::{
-    ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR, DEFAULT_REGISTRY_URL, JoinRequest,
-    MOVE_SPEED_MPS, MoveInput, NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetMotion, NetPlayerId,
-    NetPos, NetTimeScale, NetYaw, TICK_HZ, TimeScaleRequest, Welcome,
+    AIR_ACCEL_RANGE, AIR_STEER_SECS_RANGE, ControlChannel, CrabProtocolPlugin, DEFAULT_ADDR,
+    DEFAULT_REGISTRY_URL, JUMP_LAUNCH_VY_RANGE, JoinRequest, MOVE_SPEED_MPS, MoveInput,
+    NETCODE_DEV_KEY, NETCODE_PROTOCOL_ID, NetJump, NetMotion, NetPlayerId, NetPos, NetTick,
+    NetTimeScale, NetYaw, TICK_HZ, TimeScaleRequest, Welcome, air_steer_active, air_steer_velocity,
 };
 mod beacon;
 mod registration;
@@ -61,12 +66,39 @@ const LAUNCH_MIN_RISE: f32 = 0.15;
 /// 100 是当前设计目标，超过就拒绝，别让编号偷偷回绕。
 const MAX_PLAYERS: u8 = 100;
 
-/// 房间状态：连接 → 角色实体 的映射，以及下一个玩家编号。
+/// 房间状态：连接 → 角色实体 的映射。
 #[derive(Resource, Default)]
 struct Room {
-    next_player_id: u8,
     /// link 实体（lightyear 为每个连接生成一个）→ 该玩家的角色实体
     avatar_of_link: HashMap<Entity, Entity>,
+}
+
+/// 模拟 tick 计数：每发布一次状态自增，跟 `NetPos` 一起复制给客户端。
+///
+/// 客户端拿它当插值时间轴，不用收包时刻——网络抖动不会改变快照之间的模拟间隔。
+#[derive(Resource, Default)]
+struct NetTickCounter(u32);
+
+/// 找出最小的空闲玩家编号；满员返回 `None`。
+///
+/// 不能只增不减：编号决定出生点的 X，一路递增的话每重连一次就往后挪 1.5m，
+/// 几次之后就挪出地面，角色一出生就在空中往下掉。
+fn free_player_id(used: &HashSet<u8>) -> Option<u8> {
+    (0..MAX_PLAYERS).find(|id| !used.contains(id))
+}
+
+/// 出生位：编号铺成 20 列 × 5 行的网格，整块出生区都落在地面内。
+///
+/// - 行距 2m：z 只取 0/2/4/6/8，刚好避开场景方块占的 z∈[0.5,1.5] 与 [2.5,3.5]；
+/// - 列距 1.5m：x 取 0…28.5，加胶囊半径也不出 30m 半宽的地面；
+/// - 编号 0 仍然落在原点，单人局的出生位和以前一致。
+fn spawn_point(player_id: u8) -> Vec3 {
+    const COLUMNS: u8 = 20;
+    const COLUMN_SPACING: f32 = 1.5;
+    const ROW_SPACING: f32 = 2.0;
+    let column = (player_id % COLUMNS) as f32;
+    let row = (player_id / COLUMNS) as f32;
+    Vec3::new(column * COLUMN_SPACING, PLAYER_SPAWN_Y, row * ROW_SPACING)
 }
 
 /// 标记：这个连接已经 Join 过，角色实体已创建（防止重复 Join 再建一个）。
@@ -100,6 +132,7 @@ fn main() {
         CrabProtocolPlugin,
     ))
     .insert_resource(Room::default())
+    .init_resource::<NetTickCounter>()
     // 四档跳跃调参：站 / 跑 / 上 / 下。与客户端默认值同源，调一处两端一致。
     .init_resource::<JumpTunings>()
     .insert_resource(ServerAddr(args.addr))
@@ -171,10 +204,7 @@ struct ServerDisplayName(Option<String>);
 struct RegistrySettings(Option<registration::Config>);
 
 /// 把房间人数同步给注册线程。心跳线程读原子，不碰 ECS，所以不用加锁。
-fn publish_player_count(
-    room: Res<Room>,
-    registration: Option<Res<registration::Registration>>,
-) {
+fn publish_player_count(room: Res<Room>, registration: Option<Res<registration::Registration>>) {
     if let Some(registration) = registration {
         let players = room.avatar_of_link.len().min(MAX_PLAYERS as usize) as u8;
         registration.set_players(players);
@@ -450,6 +480,10 @@ fn on_new_link(trigger: On<Add<LinkOf>>, mut commands: Commands, room: Res<Room>
         MessageSender::<JoinRequest>::default(),
         InputGrace(0.0),
         LatestInput::default(),
+        InputQueue {
+            cap: 720,
+            ..InputQueue::default()
+        },
         // 编号只是给服务器日志/调试看的，真正的 player_id 在 Join 之后才有
         Name::new(format!("link-{}", room.avatar_of_link.len())),
     ));
@@ -467,7 +501,11 @@ fn handle_join(
         Option<&Joined>,
         &mut MessageSender<Welcome>,
     )>,
+    avatars: Query<&NetPlayerId>,
 ) {
+    // 本帧已经用掉的编号也先记进来：同一帧两个连接同时 Join 时，
+    // 后面那个不能看到同一个「空闲 0」而和前面的人分到同一个出生位
+    let mut used: HashSet<u8> = avatars.iter().map(|player| player.0).collect();
     for (link, mut receiver, joined, mut sender) in links.iter_mut() {
         let mut requested = false;
         // `JoinRequest` 是空消息，收到几条都一样，只关心"有没有"
@@ -485,18 +523,17 @@ fn handle_join(
             continue;
         }
 
-        let player_id = room.next_player_id;
-        if player_id >= MAX_PLAYERS {
+        let Some(player_id) = free_player_id(&used) else {
             warn!("房间已满（{MAX_PLAYERS}），拒绝 {link:?} 的 Join");
             continue;
-        }
-        room.next_player_id += 1;
+        };
+        used.insert(player_id);
 
-        // 出生点沿 X 轴拉开，避免多个胶囊叠在一起
-        let spawn_x = (player_id as f32) * 1.5;
+        // 出生点按编号铺网格，避免多个胶囊叠在一起，也不会铺到地面外面
+        let spawn = spawn_point(player_id);
         let avatar = commands
             .spawn((
-                Transform::from_xyz(spawn_x, 1.0, 0.0),
+                Transform::from_translation(spawn),
                 RigidBody::Dynamic,
                 Collider::capsule(0.2, 1.0),
                 LockedAxes::ROTATION_LOCKED,
@@ -505,8 +542,9 @@ fn handle_join(
                 LinearVelocity::ZERO,
                 Replicate::default(),
                 NetPlayerId(player_id),
-                NetPos([spawn_x, 1.0, 0.0]),
+                NetPos(spawn.to_array()),
                 NetYaw(0.0),
+                NetTick(0),
                 NetMotion {
                     dir: [0.0, 0.0],
                     speed: 0.0,
@@ -515,6 +553,10 @@ fn handle_join(
                 AvatarLocal::default(),
                 Name::new(format!("player-{player_id}")),
             ))
+            // 站着不动几秒物理会把刚体睡过去，之后写入的速度不再积分——服务端
+            // 若也睡下去，玩家一推杆只会看到人极慢地蹭。与客户端同参数。
+            // （不放进上面的元组：Bevy 的元组 Bundle 只实现到 15 个元素）
+            .insert(SleepingDisabled)
             .id();
 
         room.avatar_of_link.insert(link, avatar);
@@ -566,9 +608,110 @@ const INPUT_GRACE_SECS: f32 = 0.2;
 #[derive(Component, Default)]
 struct LatestInput(MoveInput);
 
+/// 客户端输入按「该生效的 tick」排队。
+///
+/// 这是两端相位的对齐点。以前输入是「到达即执行」：客户端在自己那一帧就反向/松手，
+/// 服务端要等包到（~3-6 tick）才做同一件事，于是两条轨迹整体错开
+/// ≈ 速度 × 单程延迟（180° 甩头实测 20~35cm，和解只能把人往回拽一下）。
+/// 客户端在每条输入里带上它本地预测的 tick（与服务端 `NetTick` 同一条时间轴），
+/// 服务端排进缓冲、到点的那个 tick 再取用，两端就逐 tick 同源。
+#[derive(Component, Default)]
+struct InputQueue {
+    pending: HashMap<u32, MoveInput>,
+    /// 这里最多只留这么多条：客户端 tick 跑飞时不至于把内存堆爆
+    cap: usize,
+}
+
+/// 缓冲里过期多久的输入直接扔掉（一个来回的量级，丢包时那条永远等不到它的 tick）
+const INPUT_QUEUE_STALE_TICKS: u32 = 8;
+
+impl InputQueue {
+    /// 存一条按 tick 排队的输入。
+    fn insert(&mut self, input: MoveInput) {
+        if self.pending.len() >= self.cap {
+            // 兜底：真堆满了就全丢，宁可退回「到达即生效」一 tick，也不能无限涨
+            self.pending.clear();
+        }
+        self.pending.insert(input.tick, input);
+    }
+
+    /// 这一 tick 该用的输入。
+    ///
+    /// 正常情况是精确命中（客户端提前 ~一个来回把输入送进未来的 tick）。
+    /// 万一客户端 tick 整体落后了（掉帧、拨钟、刚连上），精确命中就永远等不到，
+    /// 这时候退一步取「最近一条已经过期的」，保证输入始终在推进，
+    /// 而不是把人冻在最后一条上一直往前跑。
+    fn take_for(&mut self, tick: u32) -> Option<MoveInput> {
+        if let Some(input) = self.pending.remove(&tick) {
+            return Some(input);
+        }
+        let mut newest: Option<u32> = None;
+        for candidate in self.pending.keys().copied() {
+            let behind = tick.wrapping_sub(candidate);
+            let is_past = behind != 0 && behind < 1 << 31 && behind <= INPUT_QUEUE_STALE_TICKS;
+            if is_past && newest.is_none_or(|best| tick.wrapping_sub(best) > behind) {
+                newest = Some(candidate);
+            }
+        }
+        newest.and_then(|tick| self.pending.remove(&tick))
+    }
+
+    /// 清掉已经错过生效点的残留（客户端落后于服务端 / 丢包 / tick 对不上时会有）
+    fn prune(&mut self, now: u32) {
+        self.pending.retain(|tick, _| {
+            let behind = now.wrapping_sub(*tick);
+            // `behind` 很小说明是过去（该删）；很大说明还在未来（留着等它到点）
+            !(behind != 0 && behind < 1 << 31 && behind > INPUT_QUEUE_STALE_TICKS)
+        });
+    }
+}
+
+/// TEMP 诊断：每秒钟把「本 tick 的输入到底命中没命中」汇总一行。
+#[derive(Default)]
+struct InputDiag {
+    exact: u32,
+    fallback: u32,
+    none: u32,
+    sent: u32,
+    queue_len: usize,
+    applied_tick: u32,
+    next_print: f32,
+}
+
 /// 距离「上一次收到输入」还剩多久，收到输入时重置为 `INPUT_GRACE_SECS`。
 #[derive(Component)]
 struct InputGrace(f32);
+
+/// 服务端跳跃阶段，用来给远端动画定锚点（编码进 `NetJump.phase`）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum JumpPhase {
+    /// 站在地上，没有跳跃
+    #[default]
+    Ground,
+    /// 已接受起跳请求，贴地蓄力
+    Charge,
+    /// 已写离地速度，滞空
+    Air,
+    /// 已触地，落地恢复
+    Land,
+}
+
+impl JumpPhase {
+    fn code(self) -> u8 {
+        match self {
+            JumpPhase::Ground => crab_feast_library::net::jump_phase::GROUND,
+            JumpPhase::Charge => crab_feast_library::net::jump_phase::CHARGE,
+            JumpPhase::Air => crab_feast_library::net::jump_phase::AIR,
+            JumpPhase::Land => crab_feast_library::net::jump_phase::LAND,
+        }
+    }
+}
+
+/// 落地段保持多少个 tick 再宣布回地面。
+///
+/// 远端落地恢复段约 0.2s（12 tick），这里多留 2 tick：远端拿到 `LAND` 后按
+/// 自己的剪辑恢复段播完，服务器提前回 `Ground` 也不会把恢复段截断。
+const NET_LAND_TICKS: u32 = 14;
 
 /// 跳跃蓄力状态（服务端本地，不进复制协议）。
 ///
@@ -602,6 +745,27 @@ struct JumpCharge {
     verify_secs: f32,
     /// 写离地速度那一 tick 的根高度，跟当前高度比出「到底抬没抬」。
     launch_y: f32,
+    /// 对外发布的阶段（`NetJump.phase`）
+    phase: JumpPhase,
+    /// 当前阶段已经过的 tick
+    phase_ticks: u32,
+    /// 这一跳的序号（= 上行 `jump_seq`），跟随 `NetJump` 一起复制
+    seq: u8,
+}
+
+impl JumpCharge {
+    /// 开始一跳：序号、阶段、计时一起重置
+    fn begin_phase(&mut self, phase: JumpPhase, seq: u8) {
+        self.phase = phase;
+        self.phase_ticks = 0;
+        self.seq = seq;
+    }
+
+    /// 阶段互换但序号不变（蓄力取消 / 触地 / 落地播完）
+    fn move_phase(&mut self, phase: JumpPhase) {
+        self.phase = phase;
+        self.phase_ticks = 0;
+    }
 }
 
 /// 消费消息，只把最新一条存到 link 上。
@@ -612,42 +776,137 @@ fn collect_inputs(
         &mut MessageReceiver<MoveInput>,
         &mut LatestInput,
         &mut InputGrace,
+        &mut InputQueue,
     )>,
 ) {
-    for (mut receiver, mut latest, mut grace) in links.iter_mut() {
-        let mut newest = None;
-        // 一帧可能收到多条，只认最后一条（输入是「当前状态」不是「事件流」）
-        for message in receiver.receive() {
-            newest = Some(message);
-        }
-        if let Some(input) = newest {
+    for (mut receiver, mut latest, mut grace, mut queue) in links.iter_mut() {
+        // 一帧可能收到多条：同一个 tick 只留最后一条（输入是「当前状态」不是事件流），
+        // 不同 tick 全部入队，由 `drive_avatars` 在各自该生效的 tick 取用
+        for input in receiver.receive() {
+            grace.0 = INPUT_GRACE_SECS;
+            if input.tick == 0 {
+                // 还没和服务端对上 tick：退回原样「到达即生效」
+                latest.0 = input;
+                continue;
+            }
             if input.jump && !latest.0.jump {
                 info!(
-                    "server: 收到跳跃请求 seq={} kind={}",
-                    input.jump_seq, input.jump_kind
+                    "server: 收到跳跃请求 seq={} kind={} tick={}",
+                    input.jump_seq, input.jump_kind, input.tick
                 );
             }
-            latest.0 = input;
-            grace.0 = INPUT_GRACE_SECS;
+            queue.insert(input);
         }
     }
+}
+
+/// 落地段的目标速度：满速 × 转身降速。
+///
+/// `dir` 是输入的世界方向，`yaw` 是服务端权威朝向（弧度，0 = +Z，与客户端
+/// `yaw_of` 同一约定）。夹角只按最小弧算，往左甩 180° 和往右甩 180° 一样该停。
+///
+/// 客户端 `movement_system` 是同一套语义（那边读 `FacingState.error_deg`），
+/// 差一个 tick 的误差只有 1.5°，预测不会被拉回去。
+/// 本 tick 的**目标**降速比例：只看夹角，不含时间斜坡。
+///
+/// `dir` 是输入的世界方向，`yaw` 是服务端权威朝向（弧度，0 = +Z，与客户端
+/// `yaw_of` 同一约定）。夹角只按最小弧算，往左甩 180° 和往右甩 180° 一样。
+fn ground_brake_target(dir: Vec2, yaw: f32, turn_start_deg: f32, turn_min_scale: f32) -> f32 {
+    if dir.length_squared() <= 1e-6 {
+        // 松手：目标就是满速，斜坡自己往回爬
+        return 1.0;
+    }
+    let goal = dir.x.atan2(dir.y);
+    // 0 表示「客户端没带这组旋钮」：用服务端默认值，老客户端不至于被当成满速
+    let start = if turn_start_deg > 0.0 {
+        turn_start_deg
+    } else {
+        tuning::TURN_BRAKE_START_DEG_DEFAULT
+    };
+    let floor = if turn_min_scale > 0.0 {
+        turn_min_scale
+    } else {
+        tuning::TURN_BRAKE_MIN_SCALE_DEFAULT
+    };
+    tuning::turn_speed_scale_with(tuning::wrap_pi(goal - yaw).to_degrees(), start, floor)
+}
+
+/// 地面速度的目标：方向取**输入方向**（不是身体朝向），大小 = 满速 × 斜坡。
+///
+/// 朝向和位移是两条独立的时间轴：甩头时人先刹住、再倒退走，身体用 90°/s 慢慢
+/// 转过去。方向若跟着脸向，位移就会被身体带着划出一道大圆弧——那是实测被否掉的
+/// 观感。惯性由 [`tuning::ground_velocity_step`] 在速度层给（反向走直线）。
+fn ground_velocity(dir: Vec2, brake: f32) -> Vec2 {
+    dir.normalize_or_zero() * MOVE_SPEED_MPS * brake
 }
 
 /// 每个逻辑帧把最新输入写成速度，并推进宽限期。
 fn drive_avatars(
     time: Res<Time<Fixed>>,
+    // 物理探针的最小 App 里没有这两个：没有 tick 计数/队列就退回「到达即生效」
+    // （探针本来就把输入直接塞在 `LatestInput` 里）
+    counter: Option<Res<NetTickCounter>>,
     tunings: Res<JumpTunings>,
-    mut links: Query<(Entity, &LatestInput, &mut InputGrace)>,
-    mut avatars: Query<(Entity, &mut LinearVelocity, &mut AvatarIntent, &mut JumpCharge, &Transform)>,
+    mut links: Query<(
+        Entity,
+        &mut LatestInput,
+        &mut InputGrace,
+        Option<&mut InputQueue>,
+    )>,
+    mut avatars: Query<(
+        Entity,
+        &mut LinearVelocity,
+        &mut AvatarIntent,
+        &mut JumpCharge,
+        &Transform,
+        // 转身降速要用「身体还差多少没转过来」；单测里没有朝向组件就按 1.0 放行
+        Option<&NetYaw>,
+        // 刹车力按本 tick 的转速给：人还没开始转的那几帧不刹
+        Option<&FacingRate>,
+        // 降速斜坡：刹不住惯性就会一帧掉到下限
+        &mut TurnBrake,
+    )>,
     room: Res<Room>,
     spatial: SpatialQuery,
+    mut diag: Local<std::collections::HashMap<Entity, InputDiag>>,
 ) {
     let dt = time.delta_secs();
-    for (link, latest, mut grace) in links.iter_mut() {
+    // 本 tick 的输入该是哪一条：`NetTickCounter` 在 `FixedPostUpdate` 每步加一，
+    // 所以在 `FixedUpdate` 里它是「已完成步数」，本步要完成的是它的下一个编号
+    let desired = counter
+        .as_ref()
+        .map_or(0, |counter| counter.0.wrapping_add(1));
+    for (link, mut latest, mut grace, queue) in links.iter_mut() {
+        let stat = diag.entry(link).or_default();
+        if let Some(mut queue) = queue {
+            queue.prune(desired);
+            let exact = queue.pending.contains_key(&desired);
+            if let Some(input) = queue.take_for(desired) {
+                if exact {
+                    stat.exact += 1;
+                } else {
+                    stat.fallback += 1;
+                }
+                latest.0 = input;
+            } else {
+                stat.none += 1;
+            }
+            stat.queue_len = queue.pending.len();
+        }
+        stat.applied_tick = latest.0.tick;
         let Some(&avatar) = room.avatar_of_link.get(&link) else {
             continue;
         };
-        let Ok((entity, mut velocity, mut intent, mut charge, transform)) = avatars.get_mut(avatar)
+        let Ok((
+            entity,
+            mut velocity,
+            mut intent,
+            mut charge,
+            transform,
+            net_yaw,
+            facing_rate,
+            mut brake,
+        )) = avatars.get_mut(avatar)
         else {
             continue;
         };
@@ -664,6 +923,9 @@ fn drive_avatars(
             charge.elapsed = 0.0;
             charge.prev_jump = false;
             charge.verify_secs = 0.0;
+            charge.move_phase(JumpPhase::Ground);
+            // 断流也把斜坡往回爬，别让下一条输入从「还在刹车」的格子里起步
+            brake.0 = tuning::ramp_turn_brake(brake.0, 1.0, 0.0, dt);
             continue;
         }
         grace.0 -= dt;
@@ -678,18 +940,75 @@ fn drive_avatars(
         } else {
             0.0
         };
-        velocity.0.x = direction.x * MOVE_SPEED_MPS;
-        velocity.0.z = direction.y * MOVE_SPEED_MPS;
+        let yaw = net_yaw.map_or(0.0, |yaw| yaw.0);
+        // 降速斜坡**每个 tick 都推**，空中也推：空中不改地速，但绝不能让两端的斜坡
+        // 停在不同的格子上——落地那一 tick 速度是从坡上取的，差一格就是一步。
+        let target = ground_brake_target(
+            direction,
+            yaw,
+            latest.0.turn_brake_start_deg,
+            latest.0.turn_brake_min_scale,
+        );
+        brake.0 =
+            tuning::ramp_turn_brake(brake.0, target, facing_rate.map_or(0.0, |rate| rate.0), dt);
+
+        if charge.phase != JumpPhase::Air {
+            // 转身降速：夹角大时压到下限、**不归零**，甩头时人还往前走，只是慢下来。
+            // 旋钮来自客户端上行（`turn_brake_start_deg` / `turn_brake_min_scale`），
+            // 两端用同一条曲线 + 同一个斜坡才能逐 tick 对齐。
+            let ground = if direction.length_squared() > 1e-6 {
+                let target = ground_velocity(direction, brake.0);
+                // 反向按有限加速度掰（和客户端同一个函数）：先刹到 0 再反向加速
+                let stepped = tuning::ground_velocity_step(
+                    [velocity.0.x, velocity.0.z],
+                    target.to_array(),
+                    tuning::REVERSE_ACCEL_MPS2,
+                    dt,
+                );
+                Vec2::new(stepped[0], stepped[1])
+            } else {
+                // 松手：没有方向就没有位移（斜坡归位是另一回事，不能凭空推人）
+                Vec2::ZERO
+            };
+            velocity.0.x = ground.x;
+            velocity.0.z = ground.y;
+        } else {
+            // 滞空：**保动量、限转向**——不写目标速度，只把当前水平速度以有限加速度
+            // 转向输入方向，速度大小原样保留。松手时上面 `intent.speed` 会归零，
+            // 但这里根本不读它，所以「松手」不会把动量抽走。
+            //
+            // 必须和客户端 `movement_system` 逐 tick 一致（同一份
+            // `air_steer_velocity`，同一套参数）：一端给空中控制、另一端不给，
+            // 同一跳的落点就差一截，预测端只好被和解来回拽。
+            //
+            // 「起跳后多久」用 `phase_ticks * dt` 算，和服务端能拿到的东西一致；
+            // 客户端也按「起跳后经过多久」判，两端窗口对齐。见 `air_steer_active`。
+            let air_elapsed = charge.phase_ticks as f32 * dt;
+            let accel = latest
+                .0
+                .air_accel
+                .clamp(AIR_ACCEL_RANGE.0, AIR_ACCEL_RANGE.1);
+            let steer_secs = latest
+                .0
+                .air_steer_secs
+                .clamp(AIR_STEER_SECS_RANGE.0, AIR_STEER_SECS_RANGE.1);
+            // 加速度按摇杆量级缩放，和客户端一致：`dir` 的长度就是摇杆偏转量
+            let push = (dir.length() * latest.0.force.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            if air_steer_active(air_elapsed, steer_secs) {
+                let steered = air_steer_velocity(
+                    [velocity.0.x, velocity.0.z],
+                    [direction.x, direction.y],
+                    accel * push,
+                    dt,
+                );
+                velocity.0.x = steered[0];
+                velocity.0.z = steered[1];
+            }
+        }
 
         // 跳跃：先贴地蓄力，蓄满才给离地速度（见 [`advance_charge`]）
         // 接地用脚下射线而不是绝对高度：站在 1m 方块上（胶囊中心 y≈1.7）也要能跳
-        let grounded = ground::grounded(
-            &spatial,
-            entity,
-            transform,
-            velocity.0.y,
-            GROUND_NOISE_VY,
-        );
+        let grounded = ground::grounded(&spatial, entity, transform, velocity.0.y, GROUND_NOISE_VY);
         // 这一跳走哪一档由客户端在起跳帧带上来；蓄力期间每 tick 更新一次，
         // 客户端的消息比上升沿晚一帧也不会用错档。
         charge.kind = JumpKind::from_code(latest.0.jump_kind);
@@ -708,12 +1027,14 @@ fn drive_avatars(
                 charge.charging = false;
                 charge.elapsed = 0.0;
                 charge.retry_secs = 0.0;
+                charge.move_phase(JumpPhase::Ground);
                 info!(
                     "server: 起跳失败（根未抬升），退出跳跃状态 y={:.3} vy={:.3} grounded={grounded}",
                     transform.translation.y, velocity.0.y
                 );
             }
         }
+        let was_charging = charge.charging;
         let launched = advance_charge(
             &mut charge,
             latest.0.jump,
@@ -724,8 +1045,23 @@ fn drive_avatars(
             &tunings,
             dt,
         );
-        if let Some(vy) = launched {
+        // 新的一跳：蓄力一开始就发布，远端才能演蹲姿，而不是等离地了再补动作
+        if !was_charging && charge.charging {
+            charge.begin_phase(JumpPhase::Charge, latest.0.jump_seq);
+        }
+        if let Some(default_vy) = launched {
+            // 起跳速度由客户端设置面板决定，随快照上行：两端同一个数，跳起来才一样高。
+            // 0 / 越界值（老协议、坏包）退回档位表的默认值，绝不按 0 起跳。
+            let vy = if latest.0.jump_vy > 0.0 {
+                latest
+                    .0
+                    .jump_vy
+                    .clamp(JUMP_LAUNCH_VY_RANGE.0, JUMP_LAUNCH_VY_RANGE.1)
+            } else {
+                default_vy
+            };
             velocity.0.y = vy;
+            charge.begin_phase(JumpPhase::Air, latest.0.jump_seq);
             // 写速只是请求：从下一 tick 起拿根高度验证物理有没有真的把人抬起来
             charge.verify_secs = LAUNCH_VERIFY_SECS;
             charge.launch_y = transform.translation.y;
@@ -742,9 +1078,7 @@ fn drive_avatars(
             }
         }
         // 逐帧：起跳后把竖直速度与高度打出来，用来区分「初速度不够」和「人被卡住」
-        if std::env::var("CRAB_LOG_SRV").is_ok()
-            && (charge.charging || velocity.0.y.abs() > 0.02)
-        {
+        if std::env::var("CRAB_LOG_SRV").is_ok() && (charge.charging || velocity.0.y.abs() > 0.02) {
             info!(
                 "srv av y={:.3} vy={:.3} xz={:.2},{:.2} grounded={grounded} charging={} el={:.3}",
                 transform.translation.y,
@@ -754,6 +1088,57 @@ fn drive_avatars(
                 charge.charging,
                 charge.elapsed
             );
+        }
+
+        // 对外阶段推进：Charge 被取消 → Ground；Air 触地 → Land；Land 播完 → Ground。
+        // 远端动画按阶段 + `phase_ticks` 直接排剪辑，不再靠位置差观察。
+        match charge.phase {
+            JumpPhase::Charge => {
+                if !charge.charging {
+                    charge.move_phase(JumpPhase::Ground);
+                }
+            }
+            JumpPhase::Air => {
+                // 起跳后前几 tick 射线还贴着地，别一离地就判落地
+                if charge.phase_ticks >= 4 && grounded && velocity.0.y <= GROUND_NOISE_VY {
+                    charge.move_phase(JumpPhase::Land);
+                }
+            }
+            JumpPhase::Land => {
+                if charge.phase_ticks >= NET_LAND_TICKS {
+                    charge.move_phase(JumpPhase::Ground);
+                }
+            }
+            JumpPhase::Ground => {}
+        }
+        if charge.phase != JumpPhase::Ground {
+            charge.phase_ticks = charge.phase_ticks.saturating_add(1);
+        }
+
+        // 现场排查：`CRAB_LOG_INPUT=1` 时每秒一行，看服务端到底吃到哪一条输入
+        if std::env::var("CRAB_LOG_INPUT").is_ok() && time.elapsed_secs() >= stat.next_print {
+            stat.next_print = time.elapsed_secs() + 1.0;
+            info!(
+                "srv input: desired={desired} applied_t={} exact={} fallback={} none={} qlen={} \
+                 dir=({:.2},{:.2}) force={:.2} pos=({:.2},{:.2},{:.2}) y={:.2} phase={:?}",
+                stat.applied_tick,
+                stat.exact,
+                stat.fallback,
+                stat.none,
+                stat.queue_len,
+                latest.0.dir[0],
+                latest.0.dir[1],
+                latest.0.force,
+                transform.translation.x,
+                transform.translation.y,
+                transform.translation.z,
+                transform.translation.y,
+                charge.phase
+            );
+            stat.exact = 0;
+            stat.fallback = 0;
+            stat.none = 0;
+            stat.sent = 0;
         }
     }
 }
@@ -904,6 +1289,22 @@ fn face_movement(
     }
 }
 
+/// 转身降速的斜坡状态（比例 0~1）。
+///
+/// 夹角是瞬时量，直接乘速度会一帧从满速掉到下限；这里按时间滑下去、再滑回来，
+/// 甩头才像「惯性刹住」而不是被拉住。客户端用同名资源（`input::TurnBrakeRamp`），
+/// 两端每 tick 调同一个 [`tuning::ramp_turn_brake`]，帧率不同也走同一条时间曲线。
+///
+/// 默认 1.0：出生就是满速档，不用先爬一段。
+#[derive(Component)]
+struct TurnBrake(f32);
+
+impl Default for TurnBrake {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
 /// 朝向限速的跨帧状态（度/秒）。
 ///
 /// 没有它，「起步第一帧就满速」会把角加速度那一段吃掉——单机的手感全靠它。
@@ -919,6 +1320,10 @@ struct AvatarLocal {
     facing: FacingRate,
     intent: AvatarIntent,
     jump_charge: JumpCharge,
+    /// 复制给远端的跳跃阶段（打包进来是为了不超 Bevy 的 15 元素 Bundle 上限）
+    net_jump: NetJump,
+    /// 转身降速的斜坡（比例 0~1）：和客户端同一个 `ramp_turn_brake` 逐 tick 推
+    turn_brake: TurnBrake,
 }
 
 /// 把物理结果写成协议组件，交给复制层。
@@ -931,9 +1336,30 @@ struct AvatarLocal {
 /// 动画输入的话，顶墙时速度会在 3 → 0 → 3 之间跳，远端动画就在 Run / Idle 反复切。
 /// 反过来，被人推着走的时候意向是 0 而位置一直在动，位置差算出来的速度不为 0，
 /// 只看速度就会让人「被搬走的同时原地跑步」，所以要单独给一个主动度。
-fn publish_state(mut avatars: Query<(&Transform, &mut NetPos, &mut NetMotion, &AvatarIntent)>) {
-    for (transform, mut pos, mut motion, intent) in avatars.iter_mut() {
+fn publish_state(
+    mut tick: ResMut<NetTickCounter>,
+    mut avatars: Query<(
+        &Transform,
+        &mut NetPos,
+        &mut NetMotion,
+        &mut NetTick,
+        &mut NetJump,
+        &JumpCharge,
+        &AvatarIntent,
+    )>,
+) {
+    // 一个 tick 只自增一次：这个系统排在 `FixedPostUpdate`，每个定步长跑一遍
+    tick.0 = tick.0.wrapping_add(1);
+    for (transform, mut pos, mut motion, mut net_tick, mut net_jump, charge, intent) in
+        avatars.iter_mut()
+    {
         pos.0 = transform.translation.to_array();
+        net_tick.0 = tick.0;
+        // 跳跃阶段与序号一起发布：远端按 phase + ticks 排剪辑，不再从位置差里猜
+        net_jump.seq = charge.seq;
+        net_jump.phase = charge.phase.code();
+        net_jump.ticks = charge.phase_ticks.min(u16::MAX as u32) as u16;
+        net_jump.kind = charge.kind.code();
         motion.dir = intent.dir;
         motion.speed = intent.measured;
         // `intent.speed` 是目标地速（= 顶速 × 输入力度），无输入时就是 0
@@ -986,7 +1412,9 @@ mod jump_charge_tests {
         assert!(launched, "站立档蓄满应给一次离地速度");
         assert!(!c.charging);
         // 已经离地，按住也不会二次起跳
-        assert!(advance_charge(&mut c, true, 1, false, stand_launch(), 0.0, &tunings(), DT).is_none());
+        assert!(
+            advance_charge(&mut c, true, 1, false, stand_launch(), 0.0, &tunings(), DT).is_none()
+        );
     }
 
     #[test]
@@ -1019,7 +1447,8 @@ mod jump_charge_tests {
         let mut launched = false;
         let mut ticks = 0;
         while !launched && ticks < 120 {
-            launched = advance_charge(&mut c, true, 1, true, 0.0, RUN_JUMP_SPEED, &tunings(), DT).is_some();
+            launched = advance_charge(&mut c, true, 1, true, 0.0, RUN_JUMP_SPEED, &tunings(), DT)
+                .is_some();
             ticks += 1;
         }
         assert!(launched);
@@ -1058,7 +1487,8 @@ mod jump_charge_tests {
         let mut launched = false;
         let mut ticks = 0;
         while !launched && ticks < 120 {
-            launched = advance_charge(&mut c, true, 1, true, 0.192_409_41, 0.0, &tunings(), DT).is_some();
+            launched =
+                advance_charge(&mut c, true, 1, true, 0.192_409_41, 0.0, &tunings(), DT).is_some();
             ticks += 1;
         }
         assert!(launched, "0.19 m/s 的贴地噪声不应打断蓄力");
@@ -1117,9 +1547,151 @@ mod physics_probe {
             let tr = app.world().entity(body).get::<Transform>().unwrap();
             peak = peak.max(tr.translation.y);
         }
-        let end: f32 = app.world().entity(body).get::<Transform>().unwrap().translation.y;
+        let end: f32 = app
+            .world()
+            .entity(body)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            .y;
         println!("PROBE peak_y={peak} end_y={end}");
         assert!(peak > 1.5, "峰值应明显高于初始 1.0，实际 {peak}");
+    }
+
+    /// 朝前的正常跑动不能被转身降速误伤：yaw 与输入同向时必须就是满速
+    #[test]
+    fn ground_brake_uses_the_authoritative_yaw() {
+        /// 返回 `(第一次采样时刻的位移, 总位移, 最终 yaw 弧度)`：只测总位移看不出
+        /// 「先刹住再起步」的曲线，必须把转身段单独量出来
+        fn run_case(dir: [f32; 2], yaw: f32, ticks: u32) -> (f32, f32, f32) {
+            let mut app = App::new();
+            app.add_plugins(AssetPlugin::default()).init_asset::<Mesh>();
+            app.add_message::<AssetEvent<Mesh>>();
+            app.add_plugins((MinimalPlugins, TransformPlugin, PhysicsPlugins::default()))
+                .init_resource::<JumpTunings>()
+                .add_systems(FixedUpdate, drive_avatars)
+                .add_systems(FixedPostUpdate, face_movement)
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                    1.0 / 60.0,
+                )));
+            app.finish();
+            app.world_mut().spawn((
+                RigidBody::Static,
+                Collider::cuboid(40.0, 1.0, 40.0),
+                Transform::from_xyz(0.0, -0.5, 0.0),
+            ));
+            let link = app
+                .world_mut()
+                .spawn((
+                    LatestInput(MoveInput {
+                        dir,
+                        force: 1.0,
+                        ..MoveInput::default()
+                    }),
+                    InputGrace(INPUT_GRACE_SECS),
+                ))
+                .id();
+            let avatar = app
+                .world_mut()
+                .spawn((
+                    RigidBody::Dynamic,
+                    Collider::capsule(0.2, 1.0),
+                    LockedAxes::ROTATION_LOCKED,
+                    LinearDamping(0.3),
+                    AngularDamping(0.3),
+                    LinearVelocity::ZERO,
+                    JumpCharge::default(),
+                    AvatarIntent::default(),
+                    TurnBrake::default(),
+                    FacingRate::default(),
+                    NetYaw(yaw),
+                    Transform::from_xyz(0.0, 1.0, 0.0),
+                ))
+                .id();
+            app.world_mut().insert_resource(Room {
+                avatar_of_link: HashMap::from([(link, avatar)]),
+            });
+            for _ in 0..20 {
+                app.update();
+            }
+            let start = app
+                .world()
+                .entity(avatar)
+                .get::<Transform>()
+                .unwrap()
+                .translation;
+            let sample_at = (ticks / 3).max(1);
+            // 甩头后位移方向会和输入方向正交甚至反向（U 形弧），净位移会被抵消，
+            // 所以量**路程**：每 tick 的位移长度累加，才看得出「一直在走，只是变慢」
+            let mut early_path = 0.0f32;
+            let mut path = 0.0f32;
+            let mut last = start;
+            for tick in 0..ticks {
+                if tick == sample_at {
+                    early_path = path;
+                }
+                if let Some(mut gr) = app.world_mut().get_mut::<InputGrace>(link) {
+                    gr.0 = INPUT_GRACE_SECS;
+                }
+                app.update();
+                let now = app
+                    .world()
+                    .entity(avatar)
+                    .get::<Transform>()
+                    .unwrap()
+                    .translation;
+                let step = Vec2::new(now.x - last.x, now.z - last.z).length();
+                path += step;
+                last = now;
+            }
+            let end = last;
+            let yaw_now = app
+                .world()
+                .entity(avatar)
+                .get::<NetYaw>()
+                .unwrap()
+                .0
+                .to_degrees();
+            let dist = end - start;
+            println!(
+                "BRAKE dir={dir:?} yaw0={:.1}° → yaw={yaw_now:.1}° net=({:.2},{:.2}) path={:.2}m early={:.2}m",
+                yaw.to_degrees(),
+                dist.x,
+                dist.z,
+                path,
+                early_path
+            );
+            (early_path, path, yaw_now)
+        }
+
+        // 正前方（+Z）：yaw 与输入同向，必须满速
+        let (_, forward_path, _) = run_case([0.0, 1.0], 0.0, 120);
+        let forward_speed = forward_path / 2.0;
+        assert!(
+            // 起步有 0.15s 的加速曲线（20 m/s²），两秒平均会少走约 0.22m
+            (forward_speed - MOVE_SPEED_MPS).abs() < 0.3,
+            "正前方没跑满速：{forward_speed:.2} m/s"
+        );
+        // 正后方：先按惯性刹住、再低速折线转过去。
+        // 第一秒只该滑出一小段（约一个刹车距离），既不是满速冲出去、也不是站住不动
+        let (early_path, back_path, back_yaw) = run_case([0.0, -1.0], 0.0, 180);
+        assert!(back_yaw.abs() > 170.0, "转身没转过来：{back_yaw:.1}°");
+        // 顶速是 3m/s：第一秒滑到 2 米以上就等于根本没减速。
+        // 下界留 0.5 是不许「原地站住」——惯性要留着（用户明确要这个体感）
+        assert!(
+            early_path < MOVE_SPEED_MPS * 0.7,
+            "180° 甩头第一秒滑了 {early_path:.2} 米，还在按满速冲"
+        );
+        assert!(
+            early_path > 0.5,
+            "180° 甩头第一秒只走了 {early_path:.2} 米，刹得太死"
+        );
+        // 3 秒的路程要明显少于满速的 9 米（那段是低速折线），但也不能停住
+        // 3 秒满速是 9 米；转完 1.1 秒之后会重新提速，所以上限放到 3.2×顶速
+        assert!(
+            back_path > MOVE_SPEED_MPS * 1.5 && back_path < MOVE_SPEED_MPS * 3.2,
+            "折线转弯的路程不对：{back_path:.2} 米"
+        );
     }
 
     /// 走真实 `FixedUpdate` 调度驱动 `drive_avatars`：先让胶囊在地面平衡贴地，
@@ -1147,7 +1719,10 @@ mod physics_probe {
 
         let link = app
             .world_mut()
-            .spawn((LatestInput(MoveInput::default()), InputGrace(INPUT_GRACE_SECS)))
+            .spawn((
+                LatestInput(MoveInput::default()),
+                InputGrace(INPUT_GRACE_SECS),
+            ))
             .id();
         let avatar = app
             .world_mut()
@@ -1160,12 +1735,12 @@ mod physics_probe {
                 LinearVelocity::ZERO,
                 JumpCharge::default(),
                 AvatarIntent::default(),
+                TurnBrake::default(),
                 Transform::from_xyz(0.0, 1.0, 0.0),
             ))
             .id();
 
         app.world_mut().insert_resource(Room {
-            next_player_id: 0,
             avatar_of_link: HashMap::from([(link, avatar)]),
         });
 
@@ -1197,7 +1772,13 @@ mod physics_probe {
             let tr = app.world().entity(avatar).get::<Transform>().unwrap();
             peak = peak.max(tr.translation.y);
         }
-        let end: f32 = app.world().entity(avatar).get::<Transform>().unwrap().translation.y;
+        let end: f32 = app
+            .world()
+            .entity(avatar)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            .y;
         let vel = app.world().entity(avatar).get::<LinearVelocity>().unwrap();
         let ch = app.world().entity(avatar).get::<JumpCharge>().unwrap();
         println!(
@@ -1233,7 +1814,10 @@ mod physics_probe {
 
         let link = app
             .world_mut()
-            .spawn((LatestInput(MoveInput::default()), InputGrace(INPUT_GRACE_SECS)))
+            .spawn((
+                LatestInput(MoveInput::default()),
+                InputGrace(INPUT_GRACE_SECS),
+            ))
             .id();
         let avatar = app
             .world_mut()
@@ -1246,19 +1830,25 @@ mod physics_probe {
                 LinearVelocity::ZERO,
                 JumpCharge::default(),
                 AvatarIntent::default(),
+                TurnBrake::default(),
                 Transform::from_xyz(0.0, 2.0, 0.0),
             ))
             .id();
 
         app.world_mut().insert_resource(Room {
-            next_player_id: 0,
             avatar_of_link: HashMap::from([(link, avatar)]),
         });
 
         for _ in 0..40 {
             app.update();
         }
-        let rest_y = app.world().entity(avatar).get::<Transform>().unwrap().translation.y;
+        let rest_y = app
+            .world()
+            .entity(avatar)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            .y;
         assert!(
             (rest_y - 1.7).abs() < 0.1,
             "应落在方块顶上（y≈1.7），实际 {rest_y}"
@@ -1315,7 +1905,10 @@ mod physics_probe {
 
         let link = app
             .world_mut()
-            .spawn((LatestInput(MoveInput::default()), InputGrace(INPUT_GRACE_SECS)))
+            .spawn((
+                LatestInput(MoveInput::default()),
+                InputGrace(INPUT_GRACE_SECS),
+            ))
             .id();
         let avatar = app
             .world_mut()
@@ -1328,11 +1921,11 @@ mod physics_probe {
                 LinearVelocity::ZERO,
                 JumpCharge::default(),
                 AvatarIntent::default(),
+                TurnBrake::default(),
                 Transform::from_xyz(0.0, 0.7, 0.0),
             ))
             .id();
         app.world_mut().insert_resource(Room {
-            next_player_id: 0,
             avatar_of_link: HashMap::from([(link, avatar)]),
         });
 
@@ -1340,7 +1933,13 @@ mod physics_probe {
         for _ in 0..40 {
             app.update();
         }
-        let rest_y = app.world().entity(avatar).get::<Transform>().unwrap().translation.y;
+        let rest_y = app
+            .world()
+            .entity(avatar)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            .y;
 
         if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
             li.0.jump = true;
@@ -1379,5 +1978,451 @@ mod physics_probe {
         // 蓄力 0.45s（约 27 tick）+ 验证 0.12s（约 8 tick）：0.8s 内必须收干净
         let cleared_at = cleared_at.unwrap_or(u32::MAX);
         assert!(cleared_at < 60, "退出跳跃状态太慢：第 {cleared_at} tick");
+    }
+
+    /// 空中推杆只能**限速**改落点：速度大小原样保留，方向慢慢转过去。
+    ///
+    /// 旧规则是「一个字都不许动」（落点全锁死），手感上太苛刻；新规则是
+    /// 落地段的转身降速：180° 甩头降到下限（不停住）、90° 侧移几乎不受影响、松手就是 0。
+    ///
+    /// 这条守的是玩家实测的那个问题：拉满反向推杆时人还按满速往后滑，
+    /// 混合空间却在反放跑 / 横移之间来回交叉，两套腿叠出残影。
+    #[test]
+    fn ground_velocity_brakes_on_reversal() {
+        let start = tuning::TURN_BRAKE_START_DEG_DEFAULT;
+        let floor = tuning::TURN_BRAKE_MIN_SCALE_DEFAULT;
+        let dt = 1.0 / 60.0;
+
+        /// 朝同一方向推：身体按 `step_yaw` 转、刹车按本 tick 转速推，
+        /// 速度按 `ground_velocity_step` 在速度层逼近目标。
+        /// 返回（最低比例, 末帧比例, 末帧朝向, 末帧速度, 走过的路程, 最大横向偏移,
+        ///       过程中的最低速度——反向要经过 0）
+        fn run(
+            dir: Vec2,
+            yaw0: f32,
+            v0: Vec2,
+            ticks: u32,
+            start: f32,
+            floor: f32,
+            dt: f32,
+        ) -> (f32, f32, f32, Vec2, f32, f32, f32) {
+            let mut brake = 1.0f32;
+            let mut yaw = yaw0;
+            let mut rate = 0.0f32;
+            let mut velocity = v0;
+            let mut min_scale = 1.0f32;
+            let mut path = 0.0f32;
+            let mut lateral = 0.0f32;
+            let mut min_speed = v0.length();
+            for _ in 0..ticks {
+                let target = ground_brake_target(dir, yaw, start, floor);
+                brake = tuning::ramp_turn_brake(brake, target, rate, dt);
+                min_scale = min_scale.min(brake);
+                let goal = ground_velocity(dir, brake);
+                let stepped = tuning::ground_velocity_step(
+                    velocity.to_array(),
+                    goal.to_array(),
+                    tuning::REVERSE_ACCEL_MPS2,
+                    dt,
+                );
+                velocity = Vec2::new(stepped[0], stepped[1]);
+                min_speed = min_speed.min(velocity.length());
+                path += velocity.length() * dt;
+                // 只量「和输入方向垂直」的那一轴：输入沿 ±Z 时看 x，沿 ±X 时看 y
+                lateral = lateral.max(if dir.x.abs() < 1e-6 {
+                    velocity.x.abs()
+                } else {
+                    velocity.y.abs()
+                });
+                // 和服务端 `face_movement` 同一条转向
+                if dir.length_squared() > 1e-6 {
+                    let error = tuning::wrap_pi(dir.x.atan2(dir.y) - yaw);
+                    let (next, next_rate) = tuning::step_yaw(yaw, rate, error, dt);
+                    yaw = next;
+                    rate = next_rate;
+                }
+            }
+            (min_scale, brake, yaw, velocity, path, lateral, min_speed)
+        }
+
+        let cruise = Vec2::new(0.0, MOVE_SPEED_MPS);
+
+        // 正前方：满速，斜坡不动
+        let (_, scale, _, velocity, _, lateral, _) =
+            run(Vec2::new(0.0, 1.0), 0.0, cruise, 10, start, floor, dt);
+        assert!(
+            (velocity.length() - MOVE_SPEED_MPS).abs() < 1e-4,
+            "{velocity:?}"
+        );
+        assert!((scale - 1.0).abs() < 1e-6);
+        assert!(lateral < 1e-4);
+
+        // 甩头第一帧：转速还没起来，刹车给力是 0，速度几乎没掉
+        let target = ground_brake_target(Vec2::new(0.0, -1.0), 0.0, start, floor);
+        let brake = tuning::ramp_turn_brake(1.0, target, 0.0, dt);
+        assert!(brake > 0.99, "第一帧就刹死了：{brake}");
+
+        // 180° 甩头：这是玩家要的「刹住 → 倒退走 → 再转身」
+        let (min_scale, _, yaw, velocity, _, lateral, min_speed) =
+            run(Vec2::new(0.0, -1.0), 0.0, cruise, 120, start, floor, dt);
+        assert!(
+            (min_scale - floor).abs() < 1e-4,
+            "180° 该压到下限 {floor}，实测最低 {min_scale}"
+        );
+        // 速度必须过零（先刹住、再反向），而不是一帧翻过去
+        assert!(min_speed < 0.2, "反向要经过静止，实测最低 {min_speed}");
+        // 两秒后是在下限上倒退走，方向就是输入方向
+        assert!(
+            velocity.y < -MOVE_SPEED_MPS * floor * 0.9,
+            "该倒着往回走了：{velocity:?}"
+        );
+        // 全程不许横向偏出去（之前取身体朝向时这里会跑出 1.6 m）
+        assert!(lateral < 1e-4, "反向过程划出圆弧了：横向 {lateral}");
+        assert!(yaw.abs() < 180f32.to_radians());
+        assert!(floor > 0.0, "下限不能归零");
+
+        // 90° 侧移：夹角正好在「开始刹车」的边上，速度一帧就换向、腿还在原地转。
+        // 身体转得快，夹角很快掉到 90° 以下，刹车就先松手了，所以只到中间档
+        let (min_scale, _, _, velocity, _, lateral, _) =
+            run(Vec2::new(1.0, 0.0), 0.0, cruise, 60, start, floor, dt);
+        assert!(
+            min_scale < 0.7 && min_scale > floor + 0.05,
+            "90° 应该是中间档，实测 {min_scale}"
+        );
+        // 换向现在是一条受加速度约束的曲线（不许一帧翻过去），所以过渡期里
+        // 垂直分量会从 3 掉到 0——只验「末态」在新方向上，不再拿全程最大值卡它
+        assert!(
+            velocity.x > 2.0 && velocity.y.abs() < 1e-3,
+            "90° 侧移最后该沿着新方向跑：{velocity:?}"
+        );
+        assert!(lateral <= MOVE_SPEED_MPS + 1e-4, "{lateral}");
+
+        // 过渡段：误差 60° 介于满速和下限之间
+        let yaw0 = std::f32::consts::PI - 60f32.to_radians();
+        let (_, scale, _, _, _, _, _) = run(
+            Vec2::new(0.0, -1.0),
+            yaw0,
+            Vec2::new(0.0, -MOVE_SPEED_MPS),
+            8,
+            start,
+            floor,
+            dt,
+        );
+        assert!(
+            scale > floor + 0.05 && scale < 1.0 - 0.05,
+            "60° 应该是中间值，实测 {scale}"
+        );
+
+        // 转过来之后：满速沿新方向，降速不漏到稳态
+        let (_, scale, yaw, velocity, _, _, _) = run(
+            Vec2::new(0.0, -1.0),
+            std::f32::consts::PI,
+            Vec2::new(0.0, -MOVE_SPEED_MPS),
+            60,
+            start,
+            floor,
+            dt,
+        );
+        assert!(scale > 0.99, "转身完成后该回满速，实测 {scale}");
+        assert!(
+            velocity.y < -MOVE_SPEED_MPS * 0.9 && yaw.abs() > 90f32.to_radians(),
+            "{velocity:?}"
+        );
+
+        // 旋钮直接生效
+        let (min_scale, _, _, _, _, _, _) =
+            run(Vec2::new(0.0, -1.0), 0.0, cruise, 120, start, floor, dt);
+        assert!((min_scale - floor).abs() < 1e-4);
+        let target = ground_brake_target(Vec2::new(0.0, -1.0), 0.0, start, 1.0);
+        assert_eq!(target, 1.0, "下限 1.0 应完全不降速");
+
+        // 松手：目标回到满速，斜坡自己往回爬
+        let target = ground_brake_target(Vec2::ZERO, 2.0, start, floor);
+        assert_eq!(target, 1.0);
+        let brake = tuning::ramp_turn_brake(0.3, target, 0.0, dt);
+        assert!(brake > 0.3, "松手后斜坡该往回爬");
+        assert_eq!(ground_velocity(Vec2::ZERO, 0.0), Vec2::ZERO);
+    }
+
+    /// 「保动量、限转向」。但「推杆当场把落点掰过去」仍然是错的：
+    /// 0.2 秒内转过的角度必须远小于 90°。
+    ///
+    /// 这条和客户端 `movement_system` 是同一条规则（同一个 `air_steer_velocity`）：
+    /// 一端给空中控制、另一端不给，同一跳的落点就会差一截，预测端只好被和解来回拽。
+    #[test]
+    fn airborne_input_steers_gradually_without_changing_speed() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default()).init_asset::<Mesh>();
+        app.add_message::<AssetEvent<Mesh>>();
+        app.add_plugins((MinimalPlugins, TransformPlugin, PhysicsPlugins::default()))
+            .init_resource::<JumpTunings>()
+            .add_systems(FixedUpdate, drive_avatars)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                1.0 / 60.0,
+            )));
+        app.finish();
+
+        app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::cuboid(20.0, 1.0, 20.0),
+            Transform::from_xyz(0.0, -0.5, 0.0),
+        ));
+
+        let link = app
+            .world_mut()
+            .spawn((
+                LatestInput(MoveInput::default()),
+                InputGrace(INPUT_GRACE_SECS),
+            ))
+            .id();
+        let avatar = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::capsule(0.2, 1.0),
+                LockedAxes::ROTATION_LOCKED,
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                LinearVelocity::ZERO,
+                JumpCharge::default(),
+                AvatarIntent::default(),
+                TurnBrake::default(),
+                // 脸已经朝 +X：地速方向取身体朝向，起步不该先转个 90° 的弧
+                NetYaw(std::f32::consts::FRAC_PI_2),
+                FacingRate::default(),
+                Transform::from_xyz(0.0, 1.0, 0.0),
+            ))
+            .id();
+        app.world_mut().insert_resource(Room {
+            avatar_of_link: HashMap::from([(link, avatar)]),
+        });
+
+        // 站在地上，朝 +X 跑起来。和真客户端一样，每条快照都带上跳跃手感参数
+        // （缺了就是 0 = 完全锁死，那是另一个设计，不是这里要测的）
+        if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
+            li.0.dir = [1.0, 0.0];
+            li.0.force = 1.0;
+            li.0.air_accel = crab_feast_library::net::AIR_ACCEL_DEFAULT;
+            li.0.air_steer_secs = crab_feast_library::net::AIR_STEER_SECS_DEFAULT;
+            li.0.jump_vy = crab_feast_library::net::JUMP_LAUNCH_VY_DEFAULT;
+        }
+        for _ in 0..30 {
+            if let Some(mut gr) = app.world_mut().get_mut::<InputGrace>(link) {
+                gr.0 = INPUT_GRACE_SECS;
+            }
+            app.update();
+        }
+        let vx_run = app
+            .world()
+            .entity(avatar)
+            .get::<LinearVelocity>()
+            .unwrap()
+            .0
+            .x;
+        assert!(vx_run > 2.5, "先要跑起来，实际 vx={vx_run}");
+
+        // 起跳
+        if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
+            li.0.jump = true;
+            li.0.jump_seq = 1;
+        }
+        let mut vx_at_takeoff = 0.0f32;
+        let mut airborne = false;
+        for _ in 0..120 {
+            if let Some(mut gr) = app.world_mut().get_mut::<InputGrace>(link) {
+                gr.0 = INPUT_GRACE_SECS;
+            }
+            app.update();
+            let ch = app.world().entity(avatar).get::<JumpCharge>().unwrap();
+            if ch.phase == JumpPhase::Air {
+                airborne = true;
+                vx_at_takeoff = app
+                    .world()
+                    .entity(avatar)
+                    .get::<LinearVelocity>()
+                    .unwrap()
+                    .0
+                    .x;
+                break;
+            }
+        }
+        assert!(airborne, "没进入滞空阶段");
+
+        // 空中把摇杆掰到 +Z（和起跳方向正交）
+        if let Some(mut li) = app.world_mut().get_mut::<LatestInput>(link) {
+            li.0.dir = [0.0, 1.0];
+        }
+        for _ in 0..12 {
+            if let Some(mut gr) = app.world_mut().get_mut::<InputGrace>(link) {
+                gr.0 = INPUT_GRACE_SECS;
+            }
+            app.update();
+        }
+
+        let velocity = app
+            .world()
+            .entity(avatar)
+            .get::<LinearVelocity>()
+            .unwrap()
+            .0;
+        let intent = app.world().entity(avatar).get::<AvatarIntent>().unwrap();
+        let speed_before = vx_at_takeoff.abs();
+        let speed_now = velocity.x.hypot(velocity.z);
+        assert!(
+            speed_now > speed_before * 0.9 && speed_now <= speed_before * 1.02,
+            "空中的速度大小必须保下来：起跳 {speed_before:.2} → 现在 {speed_now:.2}"
+        );
+        // 0.2s × 4 m/s² 在 3 m/s 上只该转过十几度：vz 明显非零，但远不到把 vx 掰没
+        assert!(velocity.z > 0.3, "0.2 秒还一点没转：vz={:.2}", velocity.z);
+        assert!(
+            velocity.z < 1.5 && velocity.x > speed_before * 0.7,
+            "空中推杆把落点瞬间掰过去了：v=({:.2},{:.2})",
+            velocity.x,
+            velocity.z
+        );
+        assert!(
+            (intent.dir[1] - 1.0).abs() < 1e-3 && intent.dir[0].abs() < 1e-3,
+            "朝向意向应当跟着摇杆：{:?}",
+            intent.dir
+        );
+    }
+}
+
+/// 出生位分配的回归：编号只增不减会把玩家挪出地面，一出生就在空中下坠。
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    /// 编号复用：空房间回到 0，有断档就用最小的空位
+    #[test]
+    fn free_player_id_reuses_the_lowest_gap() {
+        assert_eq!(free_player_id(&HashSet::new()), Some(0));
+        let used = HashSet::from([0, 2, 3]);
+        assert_eq!(free_player_id(&used), Some(1), "断档里的 1 才是下一个");
+        let full: HashSet<u8> = (0..MAX_PLAYERS).collect();
+        assert_eq!(free_player_id(&full), None, "满员不能再发编号");
+    }
+
+    /// 每个编号的出生位都必须落在地面里、不压方块、脚底贴着地面
+    #[test]
+    fn spawn_points_stay_inside_the_ground_and_clear_the_blocks() {
+        for id in 0..MAX_PLAYERS {
+            let p = spawn_point(id);
+            assert!(
+                p.y >= crab_feast::level::PLAYER_CAPSULE_HALF_HEIGHT,
+                "id {id}: 出生高度 {p:?} 低于胶囊半高"
+            );
+            assert!(
+                p.x + 0.2 < crab_feast::level::GROUND_HALF,
+                "id {id}: {p:?} 超出地面 X"
+            );
+            assert!(
+                p.z.abs() + 0.2 < crab_feast::level::GROUND_HALF,
+                "id {id}: {p:?} 超出地面 Z"
+            );
+            for cube in crab_feast::level::CUBE_CENTERS {
+                let clear_x = (p.x - cube.x).abs() >= 0.5 + 0.2;
+                let clear_z = (p.z - cube.z).abs() >= 0.5 + 0.2;
+                assert!(
+                    clear_x || clear_z,
+                    "id {id}: 出生点 {p:?} 和方块 {cube:?} 重叠"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_queue_tests {
+    use super::*;
+
+    /// 输入按「该生效的 tick」取用：早到的留着、到点的那一 tick 才被取走
+    #[test]
+    fn queue_hands_out_the_input_for_its_own_tick() {
+        let mut queue = InputQueue {
+            cap: 16,
+            ..InputQueue::default()
+        };
+        for tick in [7u32, 8, 9] {
+            queue.insert(MoveInput {
+                tick,
+                dir: [tick as f32, 0.0],
+                ..MoveInput::default()
+            });
+        }
+        // 还没到点的 tick 取不到，也不该被吞掉
+        assert!(queue.take_for(6).is_none());
+        let got = queue.take_for(8).expect("第 8 tick 的输入该在队里");
+        assert_eq!(got.tick, 8);
+        assert_eq!(got.dir[0], 8.0);
+        // 同一个 tick 重复发送（一帧多帧率）只留最后一条
+        queue.insert(MoveInput {
+            tick: 10,
+            dir: [1.0, 0.0],
+            ..MoveInput::default()
+        });
+        queue.insert(MoveInput {
+            tick: 10,
+            dir: [2.0, 0.0],
+            ..MoveInput::default()
+        });
+        assert_eq!(queue.take_for(10).unwrap().dir[0], 2.0);
+    }
+
+    /// 错过生效点太久的残留会被清掉；还在未来的必须留着等它到点
+    #[test]
+    fn prune_drops_only_stale_entries() {
+        let mut queue = InputQueue {
+            cap: 16,
+            ..InputQueue::default()
+        };
+        for tick in [5u32, 6, 20] {
+            queue.insert(MoveInput {
+                tick,
+                ..MoveInput::default()
+            });
+        }
+        queue.prune(20);
+        assert!(queue.take_for(5).is_none(), "落后 15 tick 的输入该扔掉");
+        assert!(queue.take_for(6).is_none());
+        assert!(queue.take_for(20).is_some(), "到点的那条要还在");
+    }
+
+    /// 客户端 tick 整体落后时：精确命中不了也不能把输入吞掉，取最近的过期那条顶上
+    #[test]
+    fn lagging_client_still_advances() {
+        let mut queue = InputQueue {
+            cap: 16,
+            ..InputQueue::default()
+        };
+        for tick in [2u32, 3, 4] {
+            queue.insert(MoveInput {
+                tick,
+                dir: [tick as f32, 0.0],
+                ..MoveInput::default()
+            });
+        }
+        // 服务端已经走到第 6 tick，客户端只送到第 4 tick
+        let got = queue.take_for(6).expect("落后的输入也要顶上，不能冻住");
+        assert_eq!(got.tick, 4, "应该取最近的一条");
+        assert!(queue.take_for(7).is_some(), "剩下第 3 tick 那条继续顶");
+        assert!(queue.take_for(8).is_some());
+        assert!(queue.take_for(9).is_none(), "一条不剩就沿用上一条");
+    }
+
+    /// 兜底：客户端 tick 跑飞时不能无限堆
+    #[test]
+    fn queue_is_capped() {
+        let mut queue = InputQueue {
+            cap: 4,
+            ..InputQueue::default()
+        };
+        for tick in 0..10u32 {
+            queue.insert(MoveInput {
+                tick: tick + 1,
+                ..MoveInput::default()
+            });
+        }
+        assert!(queue.pending.len() <= 4, "{}", queue.pending.len());
     }
 }

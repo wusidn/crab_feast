@@ -10,17 +10,26 @@ pub mod anim;
 mod assetpack;
 mod assets;
 mod camera;
+/// 系统健康诊断：逐条移动/表现链路的实时指标与状态灯。
+mod diagnose;
 #[cfg(feature = "net")]
 mod discovery;
 /// 脚下接地探测：客户端动画层与服务端物理共用（任意台面高度都成立）。
 pub mod ground;
-mod input;
+pub mod input;
 /// 关卡：静态场景的设计数据（地面 / 方块尺寸与位置）与本地构建入口。
 ///
 /// dedicated server 也会引用这里的数据建自己的权威碰撞几何。
 pub mod level;
+/// 全局光照：场景主平行光的亮度设置。
+mod lighting;
 #[cfg(feature = "net")]
 mod net;
+/// 复制快照的落地：位置直接对齐 + 本地动画参数。
+#[cfg(feature = "net")]
+mod net_pose;
+/// 移动端双指缩放：独立的触摸输入系统，只在触屏设备上跑。
+mod pinch;
 mod scene;
 mod session;
 mod settings;
@@ -34,9 +43,7 @@ pub use assetpack::log_line;
 pub use discovery::{DiscoveryPlugin, RegistryConfig, ServerBrowser};
 #[cfg(feature = "net")]
 pub use net::{AutoJump, AutoWalk, LocalPlayer, NetConfig, NetPlugin};
-pub use state::{
-    AutoJoin, GameState, LobbyNotice, NetDiagnostics, SessionMode, SessionReady,
-};
+pub use state::{AutoJoin, GameState, LobbyNotice, NetDiagnostics, SessionMode, SessionReady};
 
 /// 出包时由 `launcher/mobile/ios/build_rust_deps.sh` 从 Xcode 的
 /// `CURRENT_PROJECT_VERSION` 注入；PC 的 cargo 构建没有这个变量，显示 `dev`。
@@ -83,10 +90,13 @@ pub fn build_app(app: &mut App) {
             anim::AnimPlugin,
             assetpack::AssetPackPlugin,
             assets::AssetLoadingPlugin,
+            pinch::PinchPlugin,
             session::SessionPlugin,
+            lighting::LightingPlugin,
             settings::SettingsPlugin,
             ui::UiPlugin,
             scene::ScenePlugin,
+            diagnose::DiagnosticsPlugin,
         ));
 
     // 大厅的服务器列表靠这条后台监听线程喂数据；没有网络特性的构建没有列表

@@ -1,4 +1,4 @@
-use crate::level::{LevelBlock, LevelLook, spawn_static_level};
+use crate::level::{LevelBlock, LevelLook, PLAYER_SPAWN_Y, spawn_static_level};
 use avian3d::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
@@ -21,6 +21,15 @@ pub struct ScenePlugin;
 #[derive(Component)]
 pub struct Avatar;
 
+/// 朝向节点：位于 Avatar 本体与模型之间。
+///
+/// 本体（`Avatar`）只承担物理与**平移**插值，绝不写它的 `Transform.rotation`——
+/// 插值库会把 fixed 之外对本体 Transform 的改动判定成「手动传送」，连平移两格一起清空，
+/// 表现为空帧 + 整格瞬移。朝向由 [`crate::input::facing_system`] 写到这个子节点上，
+/// 模型（及其骨骼、脚部 IK）作为它的后代继承世界朝向，本体旋转保持物理默认值。
+#[derive(Component)]
+pub struct AvatarYaw;
+
 /// 与关卡无关的场景装饰（灯光等）：退出 `Game` 时按这个标记统一清掉。
 #[derive(Component, Default, Clone)]
 pub struct SceneDecor;
@@ -29,6 +38,14 @@ impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ControlInputPlugin)
             .add_plugins((PhysicsPlugins::default(), PhysicsDebugPlugin))
+            // 关掉 Avian 的「Transform → Position」反向回读：物理 `Position` 只由求解写，
+            // 内置插值改写的是展示用 `Transform`，绝不能被反写回 `Position`（旧事故里
+            // 速度 3.02 → 0.38 m/s 就是这么被吃掉的）。静态关卡启动时已由这条回读把
+            // Transform 同步进 Position，之后位置不再动，关掉不影响碰撞几何。
+            .insert_resource(avian3d::physics_transform::PhysicsTransformConfig {
+                transform_to_position: false,
+                ..Default::default()
+            })
             .configure_sets(
                 Update,
                 // 相机定机位 → 摇杆换算世界方向 → 角色限速转身，这一串跑完才轮到
@@ -63,13 +80,18 @@ impl ScenePlugin {
                 Transform::from_xyz(4.0, 8.0, 4.0)
                 SceneDecor
                 --
-                // 全局光照：从右上方照下来，比 Bevy 默认的日光（10_000 lux）暗一级
+                // 全局光照：从右上方照下来，比 Bevy 默认的日光（10_000 lux）暗一级。
+                // 亮度真正由「画面设置」里的 LightingSettings 驱动：GlobalLight 标记
+                // 让 LightingPlugin 找到这盏灯，开机/改设置时把 illuminance 刷进来，
+                // 这里的 300 只是灯刚生成那一帧的兜底（与 lighting::DEFAULT_GLOBAL_ILLUMINANCE 同值，
+                // bsn 的字段值只收字面量，取不了常量）
                 DirectionalLight {
                     color: Color::WHITE,
                     illuminance: 300.0,
                     shadow_maps_enabled: true,
                 }
                 Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_4))
+                crate::lighting::GlobalLight
                 SceneDecor
             });
 
@@ -86,26 +108,42 @@ impl ScenePlugin {
         // 注意这里看的是运行时 `SessionMode`，不看编译特性：pc 二进制带 `net`，
         // 但它也能从大厅点「本地游戏」进来，那条路必须有自己的角色。
         if matches!(*mode, SessionMode::Local) {
-            commands.spawn((
-                Transform::from_xyz(0.0, 2.0, 0.0),
-                RigidBody::Dynamic,
-                // Avian 的 capsule 用「半径 + 不含半球的原柱长度」，
-                // rapier 的 capsule_y(half_height, radius) 等价于 capsule(0.2, 1.0)
-                Collider::capsule(0.2, 1.0),
-                // DebugRender::default().with_collider_color(Color::WHITE),
-                Restitution::new(0.3),
-                LinearDamping(0.3),
-                AngularDamping(0.3),
-                // SweptCcd::default(),
-                LockedAxes::ROTATION_LOCKED,
-                LinearVelocity::ZERO,
-                MovementController::default(),
-                // 角色不再被 look 输入直接拧头：它只拿一个目标朝向，按角速度追
-                Facing::default(),
-                InheritedVisibility::default(),
-                Visibility::Visible,
-                Avatar,
-            ));
+            let avatar = commands
+                .spawn((
+                    Transform::from_xyz(0.0, PLAYER_SPAWN_Y, 0.0),
+                    // Avian 内置帧间插值：只插值**平移**（TranslationInterpolation）。
+                    // 本体旋转保持物理默认值，朝向写在子节点 `AvatarYaw` 上，不挂
+                    // RotationInterpolation。旧注释说的「插值位置反写 Position、速度被
+                    // 吃成 0.38 m/s」根因是反向回读 `transform_to_position` 没关；
+                    // 下面在插件配置里把它关掉，插值结果只用于展示，绝不回流物理 `Position`。
+                    TranslationInterpolation,
+                    RigidBody::Dynamic,
+                    // Avian 的 capsule 用「半径 + 不含半球的原柱长度」，
+                    // rapier 的 capsule_y(half_height, radius) 等价于 capsule(0.2, 1.0)
+                    Collider::capsule(0.2, 1.0),
+                    // DebugRender::default().with_collider_color(Color::WHITE),
+                    Restitution::new(0.3),
+                    LinearDamping(0.3),
+                    AngularDamping(0.3),
+                    // SweptCcd::default(),
+                    LockedAxes::ROTATION_LOCKED,
+                    LinearVelocity::ZERO,
+                    // 休眠中的刚体不会响应速度写入：角色在出生点站几秒后物理会把它睡过去，
+                    // 之后 `movement_system` 每帧写满速也一句都不积分，人就以极低的残余速度
+                    // 慢慢蹭（实测命令 3.02 m/s、实际位移只有 0.34 m/s）。联机预测端早就
+                    // 挂了这一位（见 net.rs），单机这条路漏了，两边手感才对不上
+                    SleepingDisabled,
+                    MovementController::default(),
+                    // 角色不再被 look 输入直接拧头：它只拿一个目标朝向，按角速度追
+                    Facing::default(),
+                    InheritedVisibility::default(),
+                    Visibility::Visible,
+                    Avatar,
+                ))
+                .id();
+            // 朝向子节点：模型挂到它下面，facing_system 只写这里的 rotation，
+            // 本体 Transform 的旋转不再被改动，平移 easing 两格就不会被清空。
+            commands.spawn((AvatarYaw, Transform::default(), ChildOf(avatar)));
         }
 
         // 相机不再是角色的子节点：挂着就会被角色的旋转带走，朝向永远耦合。

@@ -75,6 +75,7 @@ mod plugin;
 mod remote;
 pub mod resources;
 mod selection;
+mod settings;
 mod state;
 mod timeline;
 mod tuning;
@@ -86,6 +87,7 @@ pub use resources::{
     Anticipation, JumpClipSpec, JumpPose, JumpPoseDef, JumpRules, RULES, SupportFoot,
 };
 pub use selection::pick_clip;
+pub use settings::JumpSettings;
 pub use state::{JumpAction, JumpPolicy, JumpState, JumpTiming};
 pub use tuning::{JumpKind, JumpProfile, JumpTuning, JumpTunings};
 

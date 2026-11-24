@@ -25,6 +25,8 @@
 //!   否则脚掌的旋转一直跟着动画的 hips 走，抬起一只脚原地转身时着地那只脚
 //!   会在原地「拧螺丝」。
 
+use crate::GameState;
+use crate::input::wrap_pi;
 use avian3d::prelude::{SpatialQuery, SpatialQueryFilter};
 use bevy::math::{Affine3A, Dir3};
 use bevy::prelude::*;
@@ -32,8 +34,6 @@ use bevy::transform::TransformSystems;
 use crab_feast_library::ik::{
     FootContact, FootLock, FootLockConfig, ROLL_SPAN, aim_world_rotation, solve_two_bone,
 };
-use crate::GameState;
-use crate::input::wrap_pi;
 
 use super::character::{AnimModelRoot, AnimRuntime};
 use super::driver::{AnimFocus, PoseDriver, drive_pose};
@@ -1275,7 +1275,6 @@ fn solve_foot_ik(
                 transform.rotation = solved.foot_local;
             }
         }
-
     }
 }
 

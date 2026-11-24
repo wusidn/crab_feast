@@ -7,6 +7,8 @@
 //! ├─ 开关卡片    输入平滑                        [开启]
 //! ├─ 系数卡片    平滑系数                0.50
 //! │              轨道 ──────────────●──────────
+//! ├─ 开关卡片    本地预测 + 和解软修正（联机）      [开启]
+//! │              和解偏置 … m/s（实时读数）
 //! ├─ 开关卡片    脚部 IK（锁脚防滑步）           [开启]
 //! │              权重 …·修正 … m（实时读数）
 //! └─ 开关卡片    模拟端脚部 IK（远端角色）          [开启]
@@ -24,6 +26,7 @@ use crate::anim::{FootIk, FootIkSettings};
 use crate::input::{FacingController, FacingState, MovementSettings, SMOOTHING_MIN};
 use crate::ui::debug::DebugTimeScale;
 use crate::ui::menu::{MenuConfig, MenuPageBody, MenuPageDef, MenuSet, widgets};
+use crab_feast_library::tuning::{TURN_BRAKE_MIN_RANGE, TURN_BRAKE_START_RANGE};
 
 /// 菜单页面 id
 pub const MOVEMENT_SETTINGS_PAGE: &str = "movement_settings";
@@ -39,6 +42,22 @@ pub struct SmoothingFactorLabel;
 /// 平滑系数滑动条标记
 #[derive(Component, Clone, Default)]
 pub struct SmoothingSlider;
+
+/// 转身降速起点标签
+#[derive(Component, Clone, Default)]
+pub struct TurnBrakeStartLabel;
+
+/// 转身降速起点滑动条标记
+#[derive(Component, Clone, Default)]
+pub struct TurnBrakeStartSlider;
+
+/// 转身降速下限标签
+#[derive(Component, Clone, Default)]
+pub struct TurnBrakeMinLabel;
+
+/// 转身降速下限滑动条标记
+#[derive(Component, Clone, Default)]
+pub struct TurnBrakeMinSlider;
 
 /// 脚部 IK 开关按钮
 #[derive(Component, Clone, Default)]
@@ -82,6 +101,10 @@ impl Plugin for MovementSettingsPlugin {
                 update_smoothing_toggle_label.run_if(in_state(GameState::Game)),
                 update_slider_from_settings.run_if(in_state(GameState::Game)),
                 update_smoothing_factor_label.run_if(in_state(GameState::Game)),
+                update_turn_brake_start_label.run_if(in_state(GameState::Game)),
+                update_turn_brake_start_slider.run_if(in_state(GameState::Game)),
+                update_turn_brake_min_label.run_if(in_state(GameState::Game)),
+                update_turn_brake_min_slider.run_if(in_state(GameState::Game)),
                 update_foot_ik_label.run_if(in_state(GameState::Game)),
                 update_foot_ik_status.run_if(in_state(GameState::Game)),
                 update_remote_foot_ik_label.run_if(in_state(GameState::Game)),
@@ -146,6 +169,10 @@ fn page_scene(
             @{toggle_card(settings)}
             --
             @{factor_card(settings)}
+            --
+            @{turn_brake_start_card(settings)}
+            --
+            @{turn_brake_min_card(settings)}
             --
             @{foot_ik_card(foot_ik_enabled)}
             --
@@ -247,6 +274,155 @@ fn factor_card(settings: &MovementSettings) -> impl Scene + use<> {
                 settings.smoothing_factor = change.value.clamp(0.0, 1.0);
             })
         ]
+    }
+}
+
+/// 转身降速起点卡片：夹角多大开始压地速
+fn turn_brake_start_card(settings: &MovementSettings) -> impl Scene + use<> {
+    let start = settings.turn_brake_start_deg;
+    let start_text = format!("{start:.0}°");
+    bsn! {
+        Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Stretch,
+            row_gap: Val::Px(10.0),
+            padding: UiRect::axes(Val::Px(12.0), Val::Px(12.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(8.0)),
+        }
+        BackgroundColor(CARD_BACKGROUND)
+        BorderColor::all(widgets::BORDER_SOFT)
+        Children [
+            Node {
+                width: Val::Percent(100.0),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+            }
+            Children [
+                @{widgets::text("转身降速到位角（到这个夹角就收到下限）", 12.0, widgets::LABEL_COLOR)}
+                --
+                Text::new(start_text)
+                TextFont { font_size: FontSize::Px(12.0) }
+                TextColor(widgets::TEXT_COLOR)
+                TurnBrakeStartLabel
+            ]
+            --
+            @{widgets::slider(
+                start,
+                TURN_BRAKE_START_RANGE.0,
+                TURN_BRAKE_START_RANGE.1,
+                1.0,
+            )}
+            TurnBrakeStartSlider
+            on(slider_self_update)
+            on(|change: On<ValueChange<f32>>, mut settings: ResMut<MovementSettings>| {
+                settings.turn_brake_start_deg = change.value.clamp(
+                    TURN_BRAKE_START_RANGE.0,
+                    TURN_BRAKE_START_RANGE.1,
+                );
+            })
+        ]
+    }
+}
+
+/// 转身降速下限卡片：180° 反跑时还保留多少地速（1.0 = 完全不降速）
+fn turn_brake_min_card(settings: &MovementSettings) -> impl Scene + use<> {
+    let min_scale = settings.turn_brake_min_scale;
+    let min_text = format!("{min_scale:.2}×");
+    bsn! {
+        Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Stretch,
+            row_gap: Val::Px(10.0),
+            padding: UiRect::axes(Val::Px(12.0), Val::Px(12.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(8.0)),
+        }
+        BackgroundColor(CARD_BACKGROUND)
+        BorderColor::all(widgets::BORDER_SOFT)
+        Children [
+            Node {
+                width: Val::Percent(100.0),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+            }
+            Children [
+                @{widgets::text("转身降速下限（大转弯时保留的地速）", 12.0, widgets::LABEL_COLOR)}
+                --
+                Text::new(min_text)
+                TextFont { font_size: FontSize::Px(12.0) }
+                TextColor(widgets::TEXT_COLOR)
+                TurnBrakeMinLabel
+            ]
+            --
+            @{widgets::slider(
+                min_scale,
+                TURN_BRAKE_MIN_RANGE.0,
+                TURN_BRAKE_MIN_RANGE.1,
+                0.01,
+            )}
+            TurnBrakeMinSlider
+            on(slider_self_update)
+            on(|change: On<ValueChange<f32>>, mut settings: ResMut<MovementSettings>| {
+                settings.turn_brake_min_scale = change.value.clamp(
+                    TURN_BRAKE_MIN_RANGE.0,
+                    TURN_BRAKE_MIN_RANGE.1,
+                );
+            })
+        ]
+    }
+}
+
+/// 转角降速起点的标签与滑杆同步
+fn update_turn_brake_start_label(
+    settings: Res<MovementSettings>,
+    mut labels: Query<&mut Text, With<TurnBrakeStartLabel>>,
+) {
+    let value = format!("{:.0}°", settings.turn_brake_start_deg);
+    for mut text in &mut labels {
+        if text.0 != value {
+            text.0 = value.clone();
+        }
+    }
+}
+
+fn update_turn_brake_start_slider(
+    settings: Res<MovementSettings>,
+    sliders: Query<(Entity, &TurnBrakeStartSlider, &SliderValue), With<Slider>>,
+    mut commands: Commands,
+) {
+    for (entity, _marker, current) in &sliders {
+        let desired = settings.turn_brake_start_deg;
+        if (current.0 - desired).abs() > 0.01 {
+            commands.entity(entity).insert(SliderValue(desired));
+        }
+    }
+}
+
+fn update_turn_brake_min_label(
+    settings: Res<MovementSettings>,
+    mut labels: Query<&mut Text, With<TurnBrakeMinLabel>>,
+) {
+    let value = format!("{:.2}×", settings.turn_brake_min_scale);
+    for mut text in &mut labels {
+        if text.0 != value {
+            text.0 = value.clone();
+        }
+    }
+}
+
+fn update_turn_brake_min_slider(
+    settings: Res<MovementSettings>,
+    sliders: Query<(Entity, &TurnBrakeMinSlider, &SliderValue), With<Slider>>,
+    mut commands: Commands,
+) {
+    for (entity, _marker, current) in &sliders {
+        let desired = settings.turn_brake_min_scale;
+        if (current.0 - desired).abs() > 0.001 {
+            commands.entity(entity).insert(SliderValue(desired));
+        }
     }
 }
 
@@ -643,9 +819,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// 页面必须是「根 → 四张卡片 → 卡片内的行/控件」的嵌套，而不是一列扁平兄弟
+    /// 页面必须是「根 → 七张卡片 → 卡片内的行/控件」的嵌套，而不是一列扁平兄弟
     #[test]
-    fn page_is_four_cards_with_nested_controls() {
+    fn page_is_six_cards_with_nested_controls() {
         let (app, body) = build_test_page();
         let world = app.world();
 
@@ -655,8 +831,8 @@ mod tests {
         let cards = children_of(world, root);
         assert_eq!(
             cards.len(),
-            4,
-            "应该是输入平滑开关卡片 + 系数卡片 + 脚部 IK 卡片 + 模拟端脚部 IK 卡片"
+            6,
+            "应该是输入平滑开关 + 系数 + 转身降速起点 + 转身降速下限 + 脚部 IK + 模拟端脚部 IK"
         );
 
         // 开关卡片：标签和按钮都得在卡片里
@@ -703,8 +879,55 @@ mod tests {
             "进度条必须是滑杆的后代"
         );
 
+        // 转身降速的两张卡片：结构和系数卡片一样，标记各自独立
+        for (card, slider_marker, label_marker, expected_range) in [
+            (
+                cards[2],
+                "TurnBrakeStartSlider",
+                "TurnBrakeStartLabel",
+                TURN_BRAKE_START_RANGE,
+            ),
+            (
+                cards[3],
+                "TurnBrakeMinSlider",
+                "TurnBrakeMinLabel",
+                TURN_BRAKE_MIN_RANGE,
+            ),
+        ] {
+            let card_children = children_of(world, card);
+            assert_eq!(card_children.len(), 2, "滑杆卡片 = 标题行 + 滑杆");
+            let title_row = card_children[0];
+            assert_eq!(
+                children_of(world, title_row).len(),
+                2,
+                "标题行 = 名称 + 当前值"
+            );
+            let row_children = children_of(world, title_row);
+            let has_label = if slider_marker == "TurnBrakeStartSlider" {
+                world.get::<TurnBrakeStartLabel>(row_children[1]).is_some()
+            } else {
+                world.get::<TurnBrakeMinLabel>(row_children[1]).is_some()
+            };
+            assert!(has_label, "{label_marker} 应该挂在当前值那一格上");
+            let slider_root = card_children[1];
+            assert!(world.get::<Slider>(slider_root).is_some());
+            assert!(world.get::<SliderValue>(slider_root).is_some());
+            let has_slider = if slider_marker == "TurnBrakeStartSlider" {
+                world.get::<TurnBrakeStartSlider>(slider_root).is_some()
+            } else {
+                world.get::<TurnBrakeMinSlider>(slider_root).is_some()
+            };
+            assert!(has_slider, "{slider_marker} 应该挂在滑杆上");
+            let range = world.get::<SliderRange>(slider_root).unwrap();
+            assert!(
+                (range.start() - expected_range.0).abs() < 1e-4
+                    && (range.end() - expected_range.1).abs() < 1e-4,
+                "{slider_marker} 的区间不对"
+            );
+        }
+
         // 脚部 IK 卡片：第一行是「标签 + 按钮」，下面一行是实时读数
-        let ik_card = cards[2];
+        let ik_card = cards[4];
         let ik_children = children_of(world, ik_card);
         assert_eq!(ik_children.len(), 2, "脚部 IK 卡片 = 开关行 + 读数行");
         let ik_row = ik_children[0];
@@ -715,7 +938,7 @@ mod tests {
 
         // 模拟端脚部 IK 卡片：同样的「开关行 + 读数行」结构，标记必须是独立的那一对，
         // 否则两个开关会互相改写对方的状态
-        let remote_card = cards[3];
+        let remote_card = cards[5];
         let remote_children = children_of(world, remote_card);
         assert_eq!(remote_children.len(), 2, "模拟端卡片 = 开关行 + 读数行");
         let remote_row = children_of(world, remote_children[0]);

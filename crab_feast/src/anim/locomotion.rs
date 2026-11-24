@@ -4,10 +4,13 @@
 //! 就让位（见每个系统开头的 `is_focused` 判断），所以预览拖滑杆不会被游戏状态顶掉。
 //! 反向的那一半是 [`sync_move_speed`]：角色的实际移动速度取当前姿态的等效地速。
 
+use avian3d::prelude::LinearVelocity;
 use bevy::prelude::*;
 
 use crate::camera::{CAMERA_PITCH_RANGE, CameraFacing};
-use crate::input::{FacingState, LocomotionIntent, MovementController, camera_view_yaw, wrap_pi};
+use crate::input::{
+    FacingState, LocomotionIntent, MovementController, PlanarMotion, camera_view_yaw, wrap_pi,
+};
 use crate::state::GameState;
 
 use super::AnimationSet;
@@ -42,24 +45,31 @@ impl Plugin for LocomotionPlugin {
 /// 这一步是「预览里看到的档位」与「游戏里跑出来的速度」对齐的关键：
 /// 走 / 跑 / 侧向的快慢全由剪辑自己的净步幅与时长决定，改采样点位置就等于改移速，
 /// 不需要在代码里再维护一套走路速度、跑步速度。
-fn sync_move_speed(driver: Res<PoseDriver>, mut controllers: Query<&mut MovementController>) {
+fn sync_move_speed(
+    driver: Res<PoseDriver>,
+    mut controllers: Query<&mut MovementController>,
+) {
     // 还没求值过（模型未就绪）就保留默认值；预览单条剪辑时混合空间仍然在求值，
     // 地速依旧新鲜，角色不会停在最后一个档位上滑走
     if !driver.evaluated {
         return;
     }
+    // 大转角时姿态档位被抬到 [`PIVOT_POSE_FLOOR`]，这里按补偿系数折算回真实档位：
+    // 腿摆得像样一点，但走多远一点不变。
+    //
+    // 联机角色不需要这个：它没有 [`MovementController`]（位置由服务端快照直接写），
+    // 这里有控制器的一定是单机角色，速度就是它的本地物理目标速度。
+    let speed = driver.ground_speed * driver.pose_gain;
     for mut controller in &mut controllers {
-        if (controller.speed - driver.ground_speed).abs() > 1e-3 {
-            controller.speed = driver.ground_speed;
+        if (controller.speed - speed).abs() > 1e-3 {
+            controller.speed = speed;
         }
     }
 }
 
 /// 移动意图 + 朝向误差 → `yaw` / `speed`。
 ///
-/// 走起来时 `yaw` 就是走位方向与脸向的夹角（混合空间的 yaw 轴本来就是
-/// 「相对角色正前方的偏角」，现在覆盖整圈 ±180°），侧向 / 反放的走跑剪辑
-/// 负责把脚带对方向。
+/// 走起来时只动 `speed` 轴：位移方向就是脸向，混合空间永远停在正前方那一列。
 ///
 /// 站着的时候一律回 `(0, 0)` 也就是 Idle：原地转身靠 [`FacingState`] 驱动的
 /// 身体旋转本身，不再往混合空间里送偏角。采样点布局里没有「原地转向」这一档
@@ -72,8 +82,14 @@ fn drive_locomotion(
     focus: Res<AnimFocus>,
     jump: Res<JumpAction>,
     time: Res<Time>,
-    avatars: Query<(&FacingState, &LocomotionIntent)>,
+    avatars: Query<(
+        &FacingState,
+        &LocomotionIntent,
+        Option<&LinearVelocity>,
+        Option<&PlanarMotion>,
+    )>,
     mut mixer: ResMut<LocomotionMixer>,
+    mut driver: ResMut<PoseDriver>,
 ) {
     if focus.is_focused(LocomotionMixer::ID) || !mixer.core().enabled {
         return;
@@ -84,16 +100,28 @@ fn drive_locomotion(
         return;
     }
 
-    let [yaw, speed] = params_for(avatars.iter().next().map(|(state, intent)| {
-        (
-            state.error_deg,
-            if intent.magnitude > 1e-3 {
-                intent.magnitude
-            } else {
-                0.0
-            },
-        )
-    }));
+    // 大转角时给姿态档位留一个下限：人还在以 0.75 m/s 慢慢平移，腿却已经塌成
+    // 「Idle + 半个走档」的半站姿，看起来就是那一下僵硬。抬档只改观感，
+    // 物理速度按 [`PoseDriver::pose_gain`] 折算回去。
+    let (error_deg, facing_yaw, honest, planar) = avatars
+        .iter()
+        .next()
+        .map(|(facing, intent, velocity, measured)| {
+            let planar = planar_displacement(velocity, measured);
+            (facing.error_deg, facing.yaw, blend_speed(intent), planar)
+        })
+        .unwrap_or((0.0, 0.0, 0.0, Vec2::ZERO));
+    let speed = pose_axis(honest, error_deg);
+    driver.pose_gain = if speed > 1e-4 { honest / speed } else { 1.0 };
+    // 偏角取**实测位移**，不是输入方向：刹车那半秒速度还朝原方向，姿态就该
+    // 还是正前方的跑，不能提前切成倒退剪辑。速度太小没有方向可言，回正前方。
+    let yaw_deg = if planar.length() > 0.05 {
+        wrap_pi(planar.x.atan2(planar.y) - facing_yaw).to_degrees()
+    } else {
+        0.0
+    };
+
+    let [yaw, speed] = params_for(Some(speed), yaw_deg);
 
     // 参数轴限速：参数一跳，权重就跟着跳，姿态就是一帧台阶。yaw 现在覆盖整圈，
     // 所以限速要按**最短弧**走，否则 180° 附近抖一下会让参数绕一整圈。
@@ -115,9 +143,24 @@ fn drive_locomotion(
     write_params(core, values);
 }
 
+/// 本帧「实测平面位移」：位移方向与大小的唯一口径。
+///
+/// 联机角色由服务端快照搬位置，物理线速度恒为 0（`Kinematic` 的组件 Avian 不写），
+/// 所以有 [`PlanarMotion`] 就以它为准；单机角色没有这个组件，照旧读物理速度。
+fn planar_displacement(
+    velocity: Option<&LinearVelocity>,
+    measured: Option<&PlanarMotion>,
+) -> Vec2 {
+    match measured {
+        Some(measured) => measured.0,
+        None => velocity
+            .map(|velocity| Vec2::new(velocity.0.x, velocity.0.z))
+            .unwrap_or(Vec2::ZERO),
+    }
+}
+
 /// 角度归一到 (-180, 180]
-fn wrap_deg(deg: f32) -> f32 {
-    (deg + 180.0).rem_euclid(360.0) - 180.0
+fn wrap_deg(deg: f32) -> f32 {    (deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
 /// 按最短弧限速：跨 ±180 时不绕远路
@@ -135,20 +178,57 @@ fn slew(current: f32, target: f32, max_step: f32) -> f32 {
     }
 }
 
-/// 朝向误差 + 移动幅度 → `yaw` / `speed`（未经限速的原始目标）。
+/// 混合空间的 `speed` 轴值：玩家推了多少杆 × 转身降速。
 ///
-/// `error_deg` 是「还需绕 +Y 转多少」，左转为正；混合空间的 yaw 右正左负，所以取反。
-/// 就这么直给：yaw 覆盖整圈 ±180°，速度恒为正，转身时参数沿圆周连续滑动，
-/// 不需要折回、不需要给速度翻符号。
-fn params_for(avatar: Option<(f32, f32)>) -> [f32; 2] {
-    let Some((error_deg, magnitude)) = avatar else {
-        return [0.0, 0.0];
-    };
-    if magnitude <= 1e-3 {
-        // 站住不动：没有移动方向可言，偏角也别送，直接站姿
-        return [0.0, 0.0];
+/// 转身降速乘在这里而不是 `magnitude` 上：`magnitude` 还要给 `facing_system`
+/// 判断「该不该继续追方向」，压成 0 会让身体停在原地干等，180° 永远转不过来。
+/// 一路乘到 `speed` 轴，误差到 150° 时整行落到 Idle，两套腿不再同时有权重。
+fn blend_speed(intent: &LocomotionIntent) -> f32 {
+    if intent.magnitude > 1e-3 {
+        intent.magnitude * intent.speed_scale
+    } else {
+        0.0
     }
-    [-error_deg, magnitude]
+}
+
+/// 大转角期间姿态档位的下限（1.0 = 跑档）。
+///
+/// 转身降速把档位压到 0.25 时，混合空间落在 Idle 与走档中间：腿几乎不摆，
+/// 人却在以 0.75 m/s 平移，观感是「僵住然后被拧着转」。抬到 0.35 让腿一直在摆。
+const PIVOT_POSE_FLOOR: f32 = 0.35;
+
+/// 下限的启用区间（度）：`START` 以下完全不抬，`END` 以上吃满，中间线性过渡，
+/// 免得夹角跨过阈值时档位跳一格。
+const PIVOT_FLOOR_RAMP: (f32, f32) = (45.0, 75.0);
+
+/// 真实档位 + 朝向误差 → 送进混合空间的档位。
+fn pose_axis(honest: f32, error_deg: f32) -> f32 {
+    if honest >= PIVOT_POSE_FLOOR {
+        // 本来就跑得比下限快（正常跑、小减速）：一个字都不动
+        return honest;
+    }
+    if honest <= 1e-3 {
+        // 站住不动：就是 Idle，别硬抬成走路
+        return honest;
+    }
+    // 从「真实档位」往 0.35 抬，而不是从 0 抬：夹角跨过 45° 时档位是连续的
+    let t = ((error_deg.abs() - PIVOT_FLOOR_RAMP.0) / (PIVOT_FLOOR_RAMP.1 - PIVOT_FLOOR_RAMP.0))
+        .clamp(0.0, 1.0);
+    honest + (PIVOT_POSE_FLOOR - honest) * t
+}
+
+/// 位移方向相对脸向的偏角 + 档位 → `yaw` / `speed`（未经限速的原始目标）。
+///
+/// `yaw_deg` 是**位移方向**相对脸向的偏角（左转为正）；混合空间的 yaw 是右正
+/// 左负，所以送进去取反。位移和朝向是两条独立的时间轴：甩头时人先减速、再倒着
+/// 往回走，身体慢慢转过去，这期间偏角从 180° 沿圆周滑到 0°，由反放 / 横移剪辑
+/// 接力，不需要折回、也不需要给速度翻符号。
+fn params_for(magnitude: Option<f32>, yaw_deg: f32) -> [f32; 2] {
+    match magnitude {
+        Some(value) if value > 1e-3 => [-yaw_deg, value],
+        // 站住不动：没有移动方向可言，直接站姿
+        _ => [0.0, 0.0],
+    }
 }
 
 /// 参数轴每帧最大变化量（`yaw` 度/秒，`speed` 单位/秒），顺序同空间定义的轴。
@@ -197,49 +277,97 @@ mod tests {
 
     #[test]
     fn idle_sends_no_direction() {
-        assert_eq!(params_for(None), [0.0, 0.0]);
-        assert_eq!(params_for(Some((120.0, 0.0))), [0.0, 0.0]);
+        assert_eq!(params_for(None, 120.0), [0.0, 0.0]);
+        assert_eq!(params_for(Some(0.0), 120.0), [0.0, 0.0]);
+    }
+
+    /// 联机角色的实测位移走 `PlanarMotion`，不走物理速度（Kinematic 上恒为 0）。
+    #[test]
+    fn planar_displacement_prefers_measured_motion() {
+        // 单机：没有 `PlanarMotion`，读物理速度
+        let velocity = LinearVelocity(Vec3::new(0.6, 0.0, 0.8));
+        assert_eq!(
+            planar_displacement(Some(&velocity), None),
+            Vec2::new(0.6, 0.8)
+        );
+
+        // 联机：物理速度是 0，但有 `PlanarMotion` 就听它的
+        let still = LinearVelocity(Vec3::ZERO);
+        let measured = PlanarMotion(Vec2::new(0.0, -1.2));
+        assert_eq!(
+            planar_displacement(Some(&still), Some(&measured)),
+            Vec2::new(0.0, -1.2)
+        );
+
+        // 什么都没挂：没有位移
+        assert_eq!(planar_displacement(None, None), Vec2::ZERO);
     }
 
     #[test]
     fn forward_keeps_full_speed() {
-        let [yaw, speed] = params_for(Some((0.0, 1.0)));
+        let [yaw, speed] = params_for(Some(1.0), 0.0);
         assert_eq!(yaw, 0.0);
         assert!((speed - 1.0).abs() < 1e-6);
     }
 
+    /// 位移方向相对脸向的偏角要真的送进混合空间：倒着走（180°）选中反放剪辑，
+    /// 侧向走（±90°）选中横移剪辑。右正左负和空间约定一致，所以要取反。
     #[test]
-    fn sideways_keeps_full_speed() {
-        // 侧向走和正走同速：转身是身体的事，不该把地速一起拽下来
-        let [yaw, speed] = params_for(Some((-90.0, 0.5)));
-        assert!((yaw - 90.0).abs() < 1e-6);
-        assert!((speed - 0.5).abs() < 1e-6, "{speed}");
+    fn yaw_axis_follows_the_movement_direction() {
+        // 正后方：±180 那一列（反放）
+        assert!((params_for(Some(1.0), 180.0)[0] + 180.0).abs() < 1e-6);
+        // 往左走（位移偏在左，左转正）：空间里是 -90
+        assert!((params_for(Some(1.0), 90.0)[0] + 90.0).abs() < 1e-6);
+        // 往右走：空间里是 +90
+        assert!((params_for(Some(1.0), -90.0)[0] - 90.0).abs() < 1e-6);
+    }
+
+    /// 大转角抬档只抬「腿摆得起来」，不抬站立、也不动小角度变向
+    #[test]
+    fn pivot_floor_only_lifts_the_pose_on_big_turns() {
+        // 站住不动：Idle 就是 Idle
+        assert_eq!(pose_axis(0.0, 170.0), 0.0);
+        // 甩头压到 0.25 时抬到 0.35（否则 Idle 占一半权重，腿不摆）
+        assert!((pose_axis(0.25, 170.0) - PIVOT_POSE_FLOOR).abs() < 1e-6);
+        // 满速本来就高于下限，一列不动
+        assert!((pose_axis(1.0, 170.0) - 1.0).abs() < 1e-6);
+        // 小角度变向不碰
+        assert!((pose_axis(0.25, 20.0) - 0.25).abs() < 1e-6);
+        // 阈值区间内线性过渡，跨过 45° 时档位不跳
+        let mid = pose_axis(0.25, 60.0);
+        assert!(mid > 0.25 && mid < PIVOT_POSE_FLOOR, "{mid}");
+        // 抬档后物理速度要按 gain 折回真实档位
+        let gain = 0.25 / pose_axis(0.25, 170.0);
+        assert!(
+            (PIVOT_POSE_FLOOR * gain - 0.25).abs() < 1e-6,
+            "补偿后速度变了"
+        );
     }
 
     #[test]
-    fn any_direction_keeps_speed_positive() {
-        // 整圈都不给速度翻符号：翻符号必然经过 speed=0，而那里只有 Idle，
-        // 转身时腿就会闪一下。这是 A 方案要守住的不变量。
-        for error in [
-            0.0, 45.0, 90.0, 91.0, 120.0, 150.0, 179.0, 180.0, -45.0, -91.0, -150.0, -180.0,
-        ] {
-            let [yaw, speed] = params_for(Some((error, 0.8)));
-            assert!((speed - 0.8).abs() < 1e-6, "error {error} speed {speed}");
-            assert!((yaw + error).abs() < 1e-6, "error {error} yaw {yaw}");
-        }
-    }
-
-    #[test]
-    fn yaw_sweeps_the_whole_circle_monotonically() {
-        // 身体从正后方转到正前方：yaw 一路 -180 → 0，中途没有回折、没有翻符号
-        let mut last = params_for(Some((180.0, 1.0)))[0];
-        assert!((last + 180.0).abs() < 1e-6, "{last}");
-        for deg in (0..=179).rev() {
-            let yaw = params_for(Some((deg as f32, 1.0)))[0];
-            assert!(yaw >= last - 1e-6, "deg {deg}: {yaw} < {last}");
-            last = yaw;
-        }
-        assert!(last.abs() < 1e-6, "{last}");
+    fn turn_brake_scales_the_speed_axis() {
+        // 满速、没降速：档位原样进混合空间
+        let cruising = LocomotionIntent {
+            magnitude: 1.0,
+            speed_scale: 1.0,
+            ..LocomotionIntent::default()
+        };
+        assert!((blend_speed(&cruising) - 1.0).abs() < 1e-6);
+        // 180° 甩头时服务端/客户端都把 scale 压到 0：整行落到 Idle，脚不再交叉
+        let pivoting = LocomotionIntent {
+            speed_scale: 0.0,
+            ..cruising
+        };
+        assert_eq!(blend_speed(&pivoting), 0.0);
+        // 半档 + 0.5：档位和降速是相乘，不是相加
+        let half = LocomotionIntent {
+            magnitude: 0.5,
+            speed_scale: 0.5,
+            ..LocomotionIntent::default()
+        };
+        assert!((blend_speed(&half) - 0.25).abs() < 1e-6);
+        // 松手（magnitude 0）不论 scale 多少都该是 0
+        assert_eq!(blend_speed(&LocomotionIntent::default()), 0.0);
     }
 
     #[test]

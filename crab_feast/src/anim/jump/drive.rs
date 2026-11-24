@@ -49,6 +49,16 @@ pub(super) fn latch_jump_request(input: Res<JumpInput>, mut action: ResMut<JumpA
     }
 }
 
+/// 本地角色查询：实体 + 移动意向。
+///
+/// 意向并进这条查询是为了压住系统参数上限（Bevy 最多 16 个参数）。
+type LocalAvatarQuery<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, Option<&'static LocomotionIntent>),
+    With<Avatar>,
+>;
+
 /// 状态机 + 时间轴 + 垂直位移。跑在 `AnimationSet::Drive`，晚于移动/朝向。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn drive_jump(
@@ -62,11 +72,10 @@ pub(super) fn drive_jump(
     clip_assets: Res<Assets<AnimationClip>>,
     tunings: Res<JumpTunings>,
     mut action: ResMut<JumpAction>,
-    avatar_entities: Query<Entity, With<Avatar>>,
+    avatar_entities: LocalAvatarQuery,
     mut velocities: Query<&mut LinearVelocity>,
     rigid_bodies: Query<&RigidBody>,
     transforms: Query<&Transform, With<Avatar>>,
-    intents: Query<&LocomotionIntent, With<Avatar>>,
     spatial: SpatialQuery,
 ) {
     let dt = time.delta_secs();
@@ -112,25 +121,27 @@ pub(super) fn drive_jump(
             );
         }
 
-        let Ok(avatar) = avatar_entities.single() else {
+        let Ok((avatar, intent)) = avatar_entities.single() else {
             return;
         };
+        let intent = intent.copied().unwrap_or_default();
         let filter = SpatialQueryFilter::from_excluded_entities([avatar]);
         let transform = transforms.single().ok().copied();
-        let intent = intents.single().copied().unwrap_or_default();
         let kind = transform
             .map(|t| probe_kind(&spatial, &filter, &t, &intent))
             .unwrap_or_default();
         // 大类 + 地速 → 调参档。四档各一套参数（跑 / 站 / 上 / 下），
         // 之后所有手感旋钮都只从这一次查表结果里取，不再读全局常量。
-        let profile = JumpProfile::for_jump(kind, driver.ground_speed);
+        //
+        let ground_speed = driver.ground_speed;
+        let profile = JumpProfile::for_jump(kind, ground_speed);
         // 起跳那一帧脚底距地：联网时这具身体由服务端抬升，这里能看出客户端的
         // 动作是不是比服务端的离地晚（值 > AIR_LIFT_DIST 就是「已经在空中了」）。
         let gd_begin = transform.and_then(|t| foot_ground_dist(&spatial, &filter, &t));
         let tuning = tunings.get(profile);
         let clip = resolve_clip(
             kind,
-            driver.ground_speed,
+            ground_speed,
             support_from_contacts(driver.contacts),
             // 连跳轮换：第 n 跳用第 n 套奔跑跳（1 → 2 → 3 → 1 …），
             // 站着跳 / 上跳 / 下跳都只有一套，传什么都会退到第一套。
@@ -144,7 +155,10 @@ pub(super) fn drive_jump(
         // 让动画的离地帧落在根位置真正开始上升的那一刻。
         // 时长取**这一档自己的**，不再按地速借用平地那两档。
         let kinematic = rigid_bodies.get(avatar).is_ok_and(|rb| rb.is_kinematic());
-        let take_secs = kinematic.then_some(tuning.take_secs).flatten();
+        // 联网角色是 Kinematic：身体由服务端 `NetPos` 抬升，蓄力时长要按服务端那一档
+        // 对齐，动画的离地帧才会落在根位置真正开始上升的那一刻
+        let net_mode = kinematic;
+        let take_secs = net_mode.then_some(tuning.take_secs).flatten();
         if !begin(
             &mut action,
             &driver,
@@ -168,7 +182,7 @@ pub(super) fn drive_jump(
             action.timeline.take_secs,
             action.timeline.takeoff,
             action.crouch_low,
-            driver.ground_speed,
+            ground_speed,
             driver.contacts[0],
             driver.contacts[1],
             driver
@@ -177,7 +191,7 @@ pub(super) fn drive_jump(
                 .copied()
                 .unwrap_or(-1.0),
             gd_begin.unwrap_or(-1.0),
-            if kinematic {
+            if net_mode {
                 format!("{:.2} m/s（联网）", tuning.net_launch_vy)
             } else {
                 format!("{:.2} m/s（本地）", tuning.launch_vy)
@@ -195,7 +209,7 @@ pub(super) fn drive_jump(
     // 脚下接地探测（排除自身胶囊）。Air 是否结束看物理是否落地，
     // 而不是剪辑空中段是否播完——物理滞空通常比剪辑空中段长。
     // 落地要脚底距地足够近；Dynamic 还要求残余上升速度归零，排除蹬升初期贴地误判。
-    let Some(avatar) = avatar_entities.single().ok() else {
+    let Ok((avatar, _)) = avatar_entities.single() else {
         return;
     };
     let transform = transforms.get(avatar).ok().copied();
@@ -345,13 +359,19 @@ pub(super) fn drive_jump(
             if previous != JumpState::Air {
                 let measured = vy.unwrap_or(0.0);
                 let kinematic = rigid_bodies.get(avatar).is_ok_and(|rb| rb.is_kinematic());
+                let net_mode = kinematic;
                 // 实测速度只用来「抬高」：贴地时接触求解会留下 ±0.2 m/s 的噪声，
                 // 按它起跳只能升两三厘米，表现就是「按了跳、人只抬了一下」。
-                let launch = launch_speed(measured, action.tuning);
+                // 联网 / 预测端直接用服务端同一份离地速度，不能按实测抬（会越抬越高）。
+                let launch = if net_mode {
+                    action.tuning.net_launch_vy
+                } else {
+                    launch_speed(measured, action.tuning)
+                };
                 action.launch_vy = launch;
                 // Kinematic 位置由服务端同步、本地速度组件失真，按**这一档的联网起跳速度**预测；
                 // Dynamic 按本地实测（或兜底）速度预测。两边取值都来自同一份档位表。
-                let predict_vy = if kinematic {
+                let predict_vy = if net_mode {
                     action.tuning.net_launch_vy
                 } else {
                     launch
@@ -361,6 +381,7 @@ pub(super) fn drive_jump(
                 action.slow =
                     (timeline.air_secs / predicted_air).clamp(action.tuning.slow_min, 1.0);
                 // 只给本地 Dynamic 写入一次起跳初速度；Kinematic 速度组件不参与积分，不写失真值。
+                // 预测端是 Dynamic，这里写的就是上面取的联网起跳速度。
                 if !kinematic && let Ok(mut velocity) = velocities.get_mut(avatar) {
                     velocity.0.y = launch;
                 }

@@ -157,9 +157,7 @@ impl JumpPose {
         };
         rows(variant)
             .find(|def| def.support == support)
-            .or_else(|| {
-                rows(variant).find(|def| def.support == SupportFoot::Any)
-            })
+            .or_else(|| rows(variant).find(|def| def.support == SupportFoot::Any))
             .or_else(|| rows(variant).next())
             .or_else(|| {
                 // 套别越界（或者这一档还没有派生套）：退回这一档的第一套
@@ -171,11 +169,15 @@ impl JumpPose {
                 })
             })
             .or_else(|| {
-                POSES.iter().find(|def| {
-                    def.kind == kind && def.profile == profile && def.variant == 0
-                })
+                POSES
+                    .iter()
+                    .find(|def| def.kind == kind && def.profile == profile && def.variant == 0)
             })
-            .or_else(|| POSES.iter().find(|def| def.kind == kind && def.profile == profile))
+            .or_else(|| {
+                POSES
+                    .iter()
+                    .find(|def| def.kind == kind && def.profile == profile)
+            })
             .map(|def| def.pose)
             .unwrap_or(JumpPose::Stand)
     }
@@ -637,18 +639,17 @@ mod tests {
                 pose.clip()
             );
         }
-        for pose in [
-            JumpPose::Run1Left,
-            JumpPose::Run2Right,
-            JumpPose::Run3Left,
-        ] {
+        for pose in [JumpPose::Run1Left, JumpPose::Run2Right, JumpPose::Run3Left] {
             // 镜像片退到自己的源片，不会横跳到别的套
-            assert_eq!(pose.fallback(), Some(match pose {
-                JumpPose::Run1Left => JumpPose::Run1,
-                JumpPose::Run2Right => JumpPose::Run2,
-                JumpPose::Run3Left => JumpPose::Run3,
-                other => panic!("{other:?} 不在镜像片列表里"),
-            }));
+            assert_eq!(
+                pose.fallback(),
+                Some(match pose {
+                    JumpPose::Run1Left => JumpPose::Run1,
+                    JumpPose::Run2Right => JumpPose::Run2,
+                    JumpPose::Run3Left => JumpPose::Run3,
+                    other => panic!("{other:?} 不在镜像片列表里"),
+                })
+            );
         }
         for pose in [JumpPose::Run2, JumpPose::Run3] {
             assert_eq!(pose.fallback(), Some(JumpPose::Run1));
@@ -682,7 +683,12 @@ mod tests {
                 "第 {variant} 套左脚"
             );
             assert_eq!(
-                JumpPose::select(JumpKind::Flat, JumpProfile::Run, SupportFoot::Right, variant),
+                JumpPose::select(
+                    JumpKind::Flat,
+                    JumpProfile::Run,
+                    SupportFoot::Right,
+                    variant
+                ),
                 right,
                 "第 {variant} 套右脚"
             );
@@ -698,7 +704,12 @@ mod tests {
             JumpPose::Stand
         );
         assert_eq!(
-            JumpPose::select(JumpKind::Flat, JumpProfile::Run, SupportFoot::Any, RUN_VARIANTS),
+            JumpPose::select(
+                JumpKind::Flat,
+                JumpProfile::Run,
+                SupportFoot::Any,
+                RUN_VARIANTS
+            ),
             JumpPose::Run1
         );
     }

@@ -10,10 +10,10 @@ use std::net::SocketAddr;
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 
+use crate::BUILD_TAG;
 use crate::GameState;
 use crate::state::{AbortSession, LobbyNotice, NetDiagnostics, SessionMode, SessionReady};
 use crate::ui::font::font_scope;
-use crate::BUILD_TAG;
 
 const BACKDROP: Color = Color::srgb(0.035, 0.045, 0.065);
 const PANEL: Color = Color::srgba(0.09, 0.11, 0.16, 0.95);
@@ -97,14 +97,8 @@ impl Plugin for LobbyUiPlugin {
             )
             .add_systems(OnEnter(GameState::Game), setup_preparing_overlay)
             .add_systems(OnExit(GameState::Game), cleanup_preparing_overlay)
-            .add_systems(
-                Update,
-                apply_selection.run_if(in_state(GameState::Lobby)),
-            )
-            .add_systems(
-                Update,
-                hide_preparing.run_if(in_state(GameState::Game)),
-            );
+            .add_systems(Update, apply_selection.run_if(in_state(GameState::Lobby)))
+            .add_systems(Update, hide_preparing.run_if(in_state(GameState::Game)));
 
         #[cfg(feature = "net")]
         app.add_systems(
@@ -663,7 +657,11 @@ fn setup_preparing_overlay(mut commands: Commands, asset_server: Res<AssetServer
 }
 
 /// 角色模型与动画图都挂上之后撤掉遮罩，同时输入 UI 才会被 `InputPlugin` 生成。
-fn hide_preparing(mut commands: Commands, ready: Res<SessionReady>, roots: Query<Entity, With<PreparingOverlay>>) {
+fn hide_preparing(
+    mut commands: Commands,
+    ready: Res<SessionReady>,
+    roots: Query<Entity, With<PreparingOverlay>>,
+) {
     if !ready.0 {
         return;
     }
@@ -709,12 +707,20 @@ mod tests {
         app.update();
 
         assert_eq!(
-            app.world().entity(first_button).get::<Node>().unwrap().display,
+            app.world()
+                .entity(first_button)
+                .get::<Node>()
+                .unwrap()
+                .display,
             Display::Flex,
             "被选中的服务器应露出「加入」"
         );
         assert_eq!(
-            app.world().entity(second_button).get::<Node>().unwrap().display,
+            app.world()
+                .entity(second_button)
+                .get::<Node>()
+                .unwrap()
+                .display,
             Display::None,
             "其它服务器保持收起"
         );
@@ -723,11 +729,19 @@ mod tests {
         app.update();
 
         assert_eq!(
-            app.world().entity(first_button).get::<Node>().unwrap().display,
+            app.world()
+                .entity(first_button)
+                .get::<Node>()
+                .unwrap()
+                .display,
             Display::None
         );
         assert_eq!(
-            app.world().entity(second_button).get::<Node>().unwrap().display,
+            app.world()
+                .entity(second_button)
+                .get::<Node>()
+                .unwrap()
+                .display,
             Display::Flex
         );
     }

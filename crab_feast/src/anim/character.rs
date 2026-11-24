@@ -12,7 +12,7 @@ use std::{
 
 use super::core::{ClipMeta, ClipSet};
 use super::driver::PoseDriver;
-use crate::{GameState, scene::Avatar};
+use crate::{GameState, scene::{Avatar, AvatarYaw}};
 use bevy::{app::AnimationSystems, prelude::*, transform::TransformSystems};
 
 pub struct CharacterPlugin;
@@ -118,6 +118,9 @@ pub(crate) struct AnimModelRoot;
 pub struct AnimRuntime {
     /// 当前的模型实体
     pub(crate) model: Option<Entity>,
+    /// 本地角色的朝向子节点（`AvatarYaw`）：模型挂在它下面。
+    /// `None` 表示远端角色（走 `RemotePose`），没有这层朝向节点。
+    pub(crate) yaw: Option<Entity>,
     /// 当前角色的剪辑句柄（按剪辑名索引，供动画图编辑器采样）
     pub(crate) clips: HashMap<String, Handle<AnimationClip>>,
     /// 动画图与 AnimationPlayer 所在实体
@@ -177,6 +180,7 @@ impl AnimRuntime {
     /// `request_character` 会判 `up_to_date` 直接返回，角色模型永远不再生成。
     pub(crate) fn reset_for_new_session(&mut self) {
         self.model = None;
+        self.yaw = None;
         self.player = None;
         self.spawned_character = None;
         self.playing_animation = None;
@@ -501,6 +505,7 @@ fn apply_character_when_loaded(
     mut clips: ResMut<ClipSet>,
     mut driver: ResMut<PoseDriver>,
     avatars: Query<Entity, With<Avatar>>,
+    yaw_nodes: Query<(Entity, &ChildOf), With<AvatarYaw>>,
 ) {
     let Some(index) = runtime.pending_character else {
         return;
@@ -533,12 +538,21 @@ fn apply_character_when_loaded(
         commands.entity(old).try_despawn();
     }
 
+    // 本地角色：模型挂在朝向节点 `AvatarYaw` 下，继承 yaw；远端角色没有这层，
+    // 回退挂本体。朝向节点句柄存进 runtime，供根运动换算取世界旋转。
+    let yaw = yaw_nodes
+        .iter()
+        .find(|(_, child_of)| child_of.parent() == avatar)
+        .map(|(yaw, _)| yaw);
+    let parent = yaw.unwrap_or(avatar);
+    runtime.yaw = yaw;
+
     let model = commands
         .spawn((
             WorldAssetRoot(rig),
             Transform::from_translation(MODEL_BASE),
             AnimModelRoot,
-            ChildOf(avatar),
+            ChildOf(parent),
         ))
         .id();
 
@@ -798,11 +812,19 @@ fn apply_root_motion(
         .and_then(|child_of| globals.get(child_of.parent()).ok())
         .map(|global| global.rotation())
         .unwrap_or(Quat::IDENTITY);
-    let avatar_rotation = avatars
-        .single()
-        .ok()
-        .and_then(|avatar| globals.get(avatar).ok())
+    // 本地角色朝向在子节点 `AvatarYaw` 上，本体世界旋转是单位；优先取朝向节点，
+    // 远端角色没有该节点，回退本体。
+    let avatar_rotation = runtime
+        .yaw
+        .and_then(|yaw| globals.get(yaw).ok())
         .map(|global| global.rotation())
+        .or_else(|| {
+            avatars
+                .single()
+                .ok()
+                .and_then(|avatar| globals.get(avatar).ok())
+                .map(|global| global.rotation())
+        })
         .unwrap_or(Quat::IDENTITY);
     let avatar_delta = avatar_rotation.inverse() * (hip_parent_rotation * local_delta);
 

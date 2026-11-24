@@ -11,6 +11,8 @@ use crate::anim::core::ClipSet;
 use crate::ground::GROUND_CONTACT_DIST;
 use crate::input::LocomotionIntent;
 
+#[cfg(feature = "net")]
+use super::air::ABORT_BLEND_SECS;
 use super::air::{AIR_GRACE_SECS, GRAVITY, REMOTE_JUMP_DETECT_VY};
 use super::resources::{JumpPose, RUN_VARIANTS};
 use super::selection::{pick_clip, probe_kind};
@@ -66,6 +68,15 @@ pub struct RemoteJump {
     pub(super) vy: f32,
     pub(super) last_y: f32,
     pub(super) primed: bool,
+    /// 已经接过的最新一跳序号（`NetJump.seq`）
+    #[cfg(feature = "net")]
+    pub(super) net_seq: u8,
+    /// 是否已经见过第一条跳跃状态
+    #[cfg(feature = "net")]
+    pub(super) net_primed: bool,
+    /// 上一帧见过的阶段编码，用来打排障日志（`CRAB_LOG_NET_JUMP`）
+    #[cfg(feature = "net")]
+    pub(super) net_phase: u8,
 }
 
 impl Default for RemoteJump {
@@ -87,6 +98,12 @@ impl Default for RemoteJump {
             vy: 0.0,
             last_y: 0.0,
             primed: false,
+            #[cfg(feature = "net")]
+            net_seq: 0,
+            #[cfg(feature = "net")]
+            net_primed: false,
+            #[cfg(feature = "net")]
+            net_phase: 0,
         }
     }
 }
@@ -202,6 +219,162 @@ impl RemoteJump {
         }
     }
 
+    /// 按服务端复制的跳跃状态推进（`NetJump`）。
+    ///
+    /// 与 [`Self::observe`] 相比，起跳与触地时刻来自服务端，不再靠「位置差 + 竖直速度」
+    /// 猜：阶段里的 `ticks` 直接映射到剪辑时间轴，动作包晚到（RTT）也落在正确相位；
+    /// `seq` 变化就是新的一跳，剪辑轮换也不再依赖「自己数到几次离地」。
+    #[cfg(feature = "net")]
+    pub fn drive_net(
+        &mut self,
+        dt: f32,
+        net: &crab_feast_library::net::NetJump,
+        setup: impl FnOnce(u8) -> Option<RemoteJumpSetup>,
+    ) {
+        use crab_feast_library::net::{TICK_HZ, jump_phase};
+
+        let phase = net.phase;
+        // 阶段内已过 tick → 秒；直接当剪辑时间轴的锚点用
+        let ticks = net.ticks as f32 / TICK_HZ as f32;
+        let fresh = phase != jump_phase::GROUND && (net.seq != self.net_seq || !self.net_primed);
+        self.net_primed = true;
+        if std::env::var("CRAB_LOG_NET_JUMP").is_ok() && phase != self.net_phase {
+            info!(
+                "remote jump: seq={} phase {}→{} ticks={}",
+                net.seq, self.net_phase, phase, net.ticks
+            );
+        }
+        self.net_phase = phase;
+
+        if fresh {
+            self.net_seq = net.seq;
+            let variant = self.variant;
+            self.variant = (self.variant + 1) % RUN_VARIANTS;
+            if let Some(entry) = setup(variant) {
+                self.clip = entry.clip;
+                self.timeline = entry.timeline;
+                self.takeoff_hips = entry.takeoff_hips;
+                self.tuning = entry.tuning;
+                self.state = match phase {
+                    jump_phase::CHARGE => JumpState::Takeoff,
+                    jump_phase::AIR => JumpState::Air,
+                    jump_phase::LAND => JumpState::Land,
+                    _ => JumpState::Ground,
+                };
+                self.elapsed = 0.0;
+                self.weight = 0.0;
+                self.air_time = ticks;
+                self.land_time = ticks;
+                if self.state == JumpState::Air {
+                    let predicted = (2.0 * self.tuning.net_launch_vy / GRAVITY
+                        * self.tuning.air_predict)
+                        .clamp(self.timeline.air_secs.max(0.01), self.tuning.max_air_hold);
+                    self.slow =
+                        (self.timeline.air_secs / predicted).clamp(self.tuning.slow_min, 1.0);
+                }
+                self.clip_time = match self.state {
+                    JumpState::Takeoff => {
+                        self.timeline
+                            .clip_time(JumpState::Takeoff, ticks, 0.0, 0.0, 1.0)
+                    }
+                    JumpState::Air => self.air_clip_time(),
+                    JumpState::Land => self.timeline.clip_time(
+                        JumpState::Land,
+                        self.elapsed,
+                        0.0,
+                        self.land_time,
+                        self.slow,
+                    ),
+                    _ => 0.0,
+                };
+            } else {
+                // 剪辑没解析出来（角色/资产还没就绪）：这一跳先不演，等下一跳
+                self.state = JumpState::Ground;
+                self.weight = 0.0;
+            }
+        }
+
+        match phase {
+            jump_phase::CHARGE => {
+                if self.state == JumpState::Takeoff {
+                    self.elapsed += dt;
+                    self.clip_time =
+                        self.timeline
+                            .clip_time(JumpState::Takeoff, ticks, 0.0, 0.0, 1.0);
+                    self.weight = self.timeline.weight(JumpState::Takeoff, self.elapsed, 0.0);
+                }
+            }
+            jump_phase::AIR => {
+                if self.state != JumpState::Ground {
+                    if self.state != JumpState::Air {
+                        // 蓄力段在中途直接收到「已离地」：切到滞空，时间按服务端 tick 落位
+                        self.state = JumpState::Air;
+                        let predicted = (2.0 * self.tuning.net_launch_vy / GRAVITY
+                            * self.tuning.air_predict)
+                            .clamp(self.timeline.air_secs.max(0.01), self.tuning.max_air_hold);
+                        self.slow =
+                            (self.timeline.air_secs / predicted).clamp(self.tuning.slow_min, 1.0);
+                    }
+                    self.elapsed += dt;
+                    self.air_time = ticks;
+                    self.clip_time = self.air_clip_time();
+                    self.weight = self.timeline.weight(JumpState::Air, self.elapsed, 0.0);
+                }
+            }
+            jump_phase::LAND => {
+                if self.state != JumpState::Ground {
+                    if self.state != JumpState::Land {
+                        self.state = JumpState::Land;
+                    }
+                    self.elapsed += dt;
+                    self.land_time = ticks;
+                    self.clip_time = self.timeline.clip_time(
+                        JumpState::Land,
+                        self.elapsed,
+                        0.0,
+                        self.land_time,
+                        self.slow,
+                    );
+                    self.weight =
+                        self.timeline
+                            .weight(JumpState::Land, self.elapsed, self.land_time);
+                    if self.land_time >= self.timeline.recover_secs {
+                        self.state = JumpState::Ground;
+                        self.weight = 0.0;
+                    }
+                }
+            }
+            _ => match self.state {
+                // 服务端落地段比剪辑恢复段短：剩下的一段按本地时间播完，不硬切
+                JumpState::Land => {
+                    self.land_time += dt;
+                    let recover = self.timeline.recover_secs.max(f32::EPSILON);
+                    let k = (self.land_time / recover).clamp(0.0, 1.0);
+                    self.clip_time =
+                        self.timeline.land + k * (self.timeline.end - self.timeline.land);
+                    self.weight = (1.0 - k).clamp(0.0, 1.0);
+                    if self.land_time >= self.timeline.recover_secs {
+                        self.state = JumpState::Ground;
+                        self.weight = 0.0;
+                    }
+                }
+                // 蓄力被服务端取消（被推离地面 / 起跳被物理吃掉）：定格淡出
+                JumpState::Takeoff => {
+                    self.weight = (self.weight - dt / ABORT_BLEND_SECS).max(0.0);
+                    if self.weight <= 0.0 {
+                        self.state = JumpState::Ground;
+                    }
+                }
+                // 空中被直接判回地面：按落地恢复段收尾
+                JumpState::Air => {
+                    self.state = JumpState::Land;
+                    self.land_time = 0.0;
+                }
+                _ => self.weight = 0.0,
+            },
+        }
+    }
+
     fn air_clip_time(&self) -> f32 {
         let air = self.timeline.air_secs;
         if air <= f32::EPSILON {
@@ -233,12 +406,19 @@ pub fn remote_jump_setup(
     let intent = LocomotionIntent {
         direction,
         magnitude: speed,
+        // 远端挑跳跃剪辑只看方向与档位，转身降速不参与
+        speed_scale: 1.0,
     };
     let kind = probe_kind(spatial, filter, transform, &intent);
     let clip = pick_clip(kind, speed, phase, gait, variant, clips);
     let asset = assets.get(clips.handle(clip)?)?;
-    let (timeline, curve, step) = analyze_clip(clip, asset, hips);
+    let (mut timeline, curve, step) = analyze_clip(clip, asset, hips);
     let tuning = tunings.get(JumpProfile::for_jump(kind, speed));
+    // 与本地联网路径同一条规则：蓄力段按档位表的时长，和服务端 `charge_secs` 对齐。
+    // 不覆盖的话远端按剪辑自带的蓄力长度播，服务端却按表里的时长起跳，离地帧会错开。
+    if let Some(secs) = tuning.take_secs {
+        timeline.set_take_secs(secs);
+    }
     Some(RemoteJumpSetup {
         clip,
         timeline,

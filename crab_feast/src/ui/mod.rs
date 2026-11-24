@@ -1,10 +1,14 @@
 use bevy::app::{App, Plugin};
 
 mod blendspace;
+mod camera_settings;
 pub(crate) mod debug;
+mod diagnose;
 mod font;
 mod game_settings;
 mod input_layer;
+mod jump_settings;
+mod lighting_settings;
 mod loading;
 mod lobby;
 pub(crate) mod menu;
@@ -22,8 +26,12 @@ impl Plugin for UiPlugin {
             .add_plugins(menu::GameMenuPlugin)
             .add_plugins(preview::AnimationPreviewPlugin)
             .add_plugins(movement::MovementSettingsPlugin)
+            .add_plugins(jump_settings::JumpSettingsPlugin)
+            .add_plugins(camera_settings::CameraSettingsPlugin)
+            .add_plugins(lighting_settings::LightingSettingsPlugin)
             .add_plugins(game_settings::GameSettingsPlugin)
             .add_plugins(blendspace::BlendSpaceEditorPlugin)
-            .add_plugins(debug::DebugSettingsPlugin);
+            .add_plugins(debug::DebugSettingsPlugin)
+            .add_plugins(diagnose::DiagnoseUiPlugin);
     }
 }

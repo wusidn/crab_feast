@@ -6,14 +6,15 @@
 //! 3. 服务端收到 Join 才分配 `player_id`、生成角色实体、回 `Welcome`；
 //! 4. 客户端收到 `Welcome` → 进 `Game` 建场景，复制下来的那个实体被认领成 [`Avatar`]。
 //!
-//! 渲染取舍：
+//! 渲染取舍（最基础的一层：权威快照 + 直接写位置）：
 //! - 角色实体一律由服务端复制，客户端不本地生成，避免"两个人在同一个角色上写 Transform"；
+//! - **所有玩家（含本地）都是 `Kinematic`**：位置/朝向每帧直接由 `NetPos` / `NetYaw` 赋值
+//!   （见 `net_pose.rs`），客户端不做预测、不做插值、不做残差修正；
 //! - 本地角色挂 `Avatar`，交给动画系统那套单实例管线（混合空间 / 脚部 IK）；
 //! - 管线要的动画参数（[`LocomotionIntent`] / [`FacingState`]）在联网模式下没有本地物理
 //!   去写，由 `drive_net_animation` 每帧从复制下来的 `NetMotion` / `NetYaw` 翻译过来——
 //!   漏了这步，角色会以 Idle 姿态在地面上滑行；
-//! - 其他玩家按 `PlayerModelAssets` 各自实例化一份模型 + 简易剪辑动画（Idle/Walk/Run 按
-//!   `NetMotion.speed` 切），胶囊只当"模型还没加载完"的占位。
+//! - 其他玩家按 `PlayerModelAssets` 各自实例化一份模型，姿态同样由混合空间求值。
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
@@ -25,7 +26,7 @@ use bevy::{
     window::WindowOccluded,
 };
 use crab_feast_library::net::{
-    ControlChannel, CrabProtocolPlugin, JoinRequest, MOVE_SPEED_MPS, MoveInput, NetMotion,
+    ControlChannel, CrabProtocolPlugin, JoinRequest, MOVE_SPEED_MPS, MoveInput, NetJump, NetMotion,
     NetPlayerId, NetPos, NetTimeScale, NetYaw, TICK_HZ, TimeScaleRequest, Welcome,
 };
 use lightyear::netcode::prelude::{
@@ -34,21 +35,24 @@ use lightyear::netcode::prelude::{
 };
 use lightyear::prelude::{client::*, *};
 
-use crate::{BUILD_TAG, GameState};
 use crate::anim::core::{SpaceEvalContext, evaluate_space};
 use crate::anim::jump::{
     JumpTunings, RemoteJump, blend_clip_pose, remote_jump_setup, uplink_jump_level,
 };
 use crate::anim::{
-    AnimCatalog, AnimSelection, AnimationSet, ClipSet, FootIk, FootIkSet, JumpAction, MixerCache,
-    Skeleton, build_skeleton,
+    AnimCatalog, AnimSelection, AnimationSet, ClipSet, FootIk, FootIkSet, JumpAction, JumpSettings,
+    MixerCache, Skeleton, build_skeleton,
 };
 use crate::camera::CameraFacing;
 use crate::ground::foot_ground_dist;
-use crate::input::{ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, wrap_pi};
+use crate::input::{
+    ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, PlanarMotion, wrap_pi,
+};
+use crate::net_pose::{apply_authoritative_pose, drive_net_animation};
 use crate::scene::Avatar;
 use crate::state::{AbortSession, AutoJoin, LobbyNotice, NetDiagnostics, SessionMode};
 use crate::ui::debug::{DebugTimeScale, TimeScaleChanged};
+use crate::{BUILD_TAG, GameState};
 
 /// 服务器地址，由 launcher 通过 `--server` 写入。
 #[derive(Resource, Debug, Clone, Copy)]
@@ -181,7 +185,9 @@ impl Plugin for NetPlugin {
                 (
                     on_welcome,
                     claim_local_avatar,
-                    apply_net_transform,
+                    // 复制状态直接落地：位置/朝向全部取服务端快照，再把 `NetMotion`
+                    // 翻译成本地动画参数。没有插值、预测、和解——只有这一条路径
+                    apply_authoritative_pose,
                     drive_net_animation,
                 )
                     .chain()
@@ -513,11 +519,10 @@ fn resume_reconnect(
 ///
 /// 同时把角色放进客户端物理世界：静态场景两端各自构建（见
 /// [`crate::level::spawn_static_level`]），所以这里挂的碰撞体有真实
-/// 几何可解 —— 射线、接触查询、将来的本地预测都靠它。
+/// 几何可解 —— 射线、接触查询都靠它。
 ///
-/// 刚体是**运动学**的：位移仍由服务器的 `NetPos` 写，物理只负责扫掠与查询，
-/// 不反过来积分位置。要变成"客户端自己跑角色物理"，把这里换成 `Dynamic` +
-/// lightyear 的预测/回滚即可，静态场景这一层已经就位。
+/// 刚体是**运动学**的：位移由服务器的 `NetPos` 直接写（见 `net_pose.rs`），
+/// 物理只负责扫掠与查询，不反过来积分位置。本地玩家也是这一档，认领时不再换刚体类型。
 fn spawn_remote_visual(
     trigger: On<Add<NetPos>>,
     mut commands: Commands,
@@ -622,6 +627,10 @@ fn on_welcome(
 }
 
 /// 认领「哪个复制下来的实体是我」：给它挂 `Avatar` 标记，相机就会跟它。
+///
+/// 刚体保持 `Kinematic`：位置与朝向都由 `NetPos` / `NetYaw` 直接写（`net_pose.rs`），
+/// 客户端不做本地模拟。动画参数由 `drive_net_animation` 从 `NetMotion` 翻译，
+/// 所以这里只补 `LocomotionIntent` / `FacingState` 两个组件，不挂朝向控制器。
 fn claim_local_avatar(
     local: Option<Res<LocalPlayer>>,
     avatars: Query<(Entity, &NetPlayerId, Option<&Children>), Without<Avatar>>,
@@ -649,10 +658,13 @@ fn claim_local_avatar(
             .entity(entity)
             .insert((
                 Avatar,
-                // 动画驱动的输入。联网模式下角色的位移由服务器算，这两个组件
-                // 没有被本地物理/输入写的来源，改由 `drive_net_animation` 从复制状态维护
+                // 动画驱动的输入。联网模式下角色的位移由服务器算，这三个组件
+                // 没有被本地物理/输入写的来源，改由 `drive_net_animation` 从复制状态维护。
+                // `PlanarMotion` 是混合空间 `yaw` 轴的实测位移来源：联机角色是
+                // `Kinematic`、物理速度恒为 0，不补这一份转身时腿会继续朝正前方迈
                 LocomotionIntent::default(),
                 FacingState::default(),
+                PlanarMotion::default(),
             ))
             .remove::<ClipBody>()
             .remove::<Mesh3d>()
@@ -867,14 +879,6 @@ fn lock_remote_hips(models: Query<&RemoteHips>, mut transforms: Query<&mut Trans
     }
 }
 
-/// 复制下来的状态 → 本地 Transform。
-fn apply_net_transform(mut remotes: Query<(&NetPos, &NetYaw, &mut Transform)>) {
-    for (pos, yaw, mut transform) in remotes.iter_mut() {
-        transform.translation = Vec3::from_array(pos.0);
-        transform.rotation = Quat::from_rotation_y(yaw.0);
-    }
-}
-
 /// 广度优先收集所有满足条件的后代。
 fn find_all_descendants(
     root: Entity,
@@ -912,47 +916,6 @@ fn find_descendant(
     None
 }
 
-/// 联网模式下本地角色的表现层：动画想定与朝向一律由服务端下发的状态驱动。
-///
-/// 位移由服务器算，本地不再有「摇杆 → `LocomotionIntent`」的来源；不接管的话
-/// 认领来的角色会一直停在默认想定（站着），看起来就是「联网后本地角色没有动画」。
-/// `dir` 是服务端的**意向方向**，`speed` 是**实测**速度，两者分开下发正是为了
-/// 顶墙/被推时不把「想走」退化成「不动」。
-fn drive_net_animation(
-    local: Option<Res<LocalPlayer>>,
-    mut avatars: Query<(
-        &NetPlayerId,
-        &NetMotion,
-        &NetYaw,
-        &mut LocomotionIntent,
-        &mut FacingState,
-    )>,
-) {
-    let Some(local) = local else {
-        return;
-    };
-    for (id, motion, facing, mut intent, mut state) in avatars.iter_mut() {
-        if id.0 != local.0 {
-            continue;
-        }
-        let planar = Vec3::new(motion.dir[0], 0.0, motion.dir[1]);
-        // 主动度是「这一帧有没有自己的输入」：被人推着滑、被平台带走时它是 0，
-        // 想定必须清零回到 Idle。只看实测速度的话，人会被搬走的同时原地跑步
-        if motion.intent > 1e-3 && planar.length_squared() > 1e-6 {
-            intent.direction = planar.normalize();
-            intent.magnitude = (motion.speed / MOVE_SPEED_MPS).clamp(0.0, 1.0);
-            let target = planar.x.atan2(planar.z);
-            state.error_deg = wrap_pi(target - facing.0).to_degrees();
-        } else {
-            intent.direction = Vec3::ZERO;
-            intent.magnitude = 0.0;
-            state.error_deg = 0.0;
-        }
-        state.yaw = facing.0;
-        state.yaw_rate = 0.0;
-    }
-}
-
 /// 远端角色也用混合空间驱动姿态：方向差 → `yaw`，实测速度 → `speed`。
 ///
 /// 每具骨架各有一份映射与相位，求值函数和本地角色完全相同，所以「斜着走」「倒退」
@@ -964,6 +927,8 @@ fn drive_net_animation(
 struct RemotePoseJump<'w, 's> {
     tunings: Res<'w, JumpTunings>,
     mismatched: Local<'s, bool>,
+    /// 服务端复制的跳跃阶段（`NetJump`）：有它就不再用位置差观察
+    jumps: Query<'w, 's, &'static NetJump>,
 }
 
 /// 远端姿态系统的前置条件。
@@ -979,7 +944,11 @@ fn remote_pose_ready(
     catalog: Option<Res<AnimCatalog>>,
     selection: Option<Res<AnimSelection>>,
 ) -> bool {
-    models.is_some() && cache.is_some() && clips.is_some() && catalog.is_some() && selection.is_some()
+    models.is_some()
+        && cache.is_some()
+        && clips.is_some()
+        && catalog.is_some()
+        && selection.is_some()
 }
 
 fn drive_remote_pose(
@@ -1109,29 +1078,37 @@ fn drive_remote_pose(
             .character(selection.character)
             .and_then(|def| def.gaits.get("Running"));
         let filter = SpatialQueryFilter::from_excluded_entities([owner.0]);
-        jump.observe(
-            raw_dt,
-            player_transform.map(|t| t.translation.y).unwrap_or(0.0),
-            jump_height,
-            |variant| {
-                let transform = player_transform?;
-                let hips = hips_id?;
-                remote_jump_setup(
-                    &spatial,
-                    &filter,
-                    &transform,
-                    jump_speed,
-                    jump_dir,
-                    Some(phase_now),
-                    gait,
-                    variant,
-                    hips,
-                    &clips,
-                    &clip_assets,
-                    &jump_cfg.tunings,
-                )
-            },
-        );
+        let setup = |variant| {
+            let transform = player_transform?;
+            let hips = hips_id?;
+            remote_jump_setup(
+                &spatial,
+                &filter,
+                &transform,
+                jump_speed,
+                jump_dir,
+                Some(phase_now),
+                gait,
+                variant,
+                hips,
+                &clips,
+                &clip_assets,
+                &jump_cfg.tunings,
+            )
+        };
+        // 有复制的跳跃状态就按服务端阶段排剪辑（起跳/触地时刻权威）；
+        // 老版本服务端没这个组件时退回观察式，至少不会不演
+        if let Ok(net_jump) = jump_cfg.jumps.get(owner.0) {
+            let net_jump = *net_jump;
+            jump.drive_net(raw_dt, &net_jump, setup);
+        } else {
+            jump.observe(
+                raw_dt,
+                player_transform.map(|t| t.translation.y).unwrap_or(0.0),
+                jump_height,
+                setup,
+            );
+        }
 
         let mut context = SpaceEvalContext {
             params,
@@ -1256,6 +1233,12 @@ fn send_input(
     time: Res<Time>,
     auto_walk: Option<ResMut<AutoWalk>>,
     action: Option<Res<JumpAction>>,
+    jump_settings: Option<Res<JumpSettings>>,
+    movement_settings: Option<Res<crate::input::MovementSettings>>,
+    // 生效的摇杆输入（含「扫过摇杆中心」的保持）。
+    // 必须发它而不是原始摇杆：拇指从一边扫到另一边时那几帧原始值 ≈ 0，
+    // 服务端会当成没输入、把人当场停住，客户端却还在跑，两端立刻错开。
+    effective_move: Option<Res<crate::input::EffectiveMove>>,
 ) {
     let mut auto_walk = auto_walk;
     if let Some(walk) = auto_walk.as_mut()
@@ -1269,13 +1252,18 @@ fn send_input(
         .unwrap_or(false);
 
     let (local, force) = if auto {
-        // 朝 -Z 的开放地面跑：关卡里的方块在 +Z，正着跑会一路顶着方块面摩擦，
-        // 人卡在墙面就走不出步态、也跳不起来（起跳速度被接触吃掉）。
-        (Vec2::new(0.0, 1.0), 1.0)
+        // 摇杆 y 轴与键盘同约定：W/上推 = -Vec2::Y（前向，朝相机视线方向）。
+        // 与本地 `auto_walk_diag` 注入的方向必须一致，否则上行把人往后推、
+        // 本地预测往前跑，两端位置反向分叉，和解系统只能反复硬吸附往回拽。
+        (Vec2::new(0.0, -1.0), 1.0)
     } else {
-        match *input {
-            MovementInput::Idle => (Vec2::ZERO, 0.0),
-            MovementInput::Activated { direction, force } => (direction, force),
+        match effective_move.as_deref() {
+            Some(effective) if effective.is_active() => (effective.local_stick(), effective.force),
+            Some(_) => (Vec2::ZERO, 0.0),
+            None => match *input {
+                MovementInput::Idle => (Vec2::ZERO, 0.0),
+                MovementInput::Activated { direction, force } => (direction, force),
+            },
         }
     };
     let jump_pressed = matches!(*jump, JumpInput::Activated);
@@ -1308,7 +1296,13 @@ fn send_input(
     let forward = facing.view_forward();
     let right = Vec3::new(-forward.z, 0.0, forward.x);
     let world = right * local.x + forward * (-local.y);
+    if std::env::var("CRAB_LOG_YAW").is_ok() {
+        info!("uplink: auto={} local=({:.2},{:.2}) world=({:.2},{:.2}) fwd=({:.2},{:.2})", auto, local.x, local.y, world.x, world.z, forward.x, forward.z);
+    }
     let message = MoveInput {
+        // 0 = 没有本地 tick 时间轴，服务端「到达即生效」。
+        // 回到最基础的同步后客户端不再跑预测仿真，也就没有可对齐的 tick。
+        tick: 0,
         dir: [world.x, world.z],
         force,
         jump,
@@ -1320,6 +1314,21 @@ fn send_input(
             .map(|action| action.kind.code())
             .unwrap_or(0),
         jump_seq: action.as_ref().map(|action| action.jump_seq()).unwrap_or(0),
+        // 跳跃手感也随每条快照上行：服务端拿同一组数推人，空中转多快、跳多高
+        // 两端必须同源。玩家在对局中拖滑杆，下一条快照就带过去，不必重连。
+        //
+        // 缺席时发 0：服务端把 0 当作「用我自己的默认值」，老客户端不会把服务端
+        // 的起跳速度当成 0 而跳不起来。
+        jump_vy: jump_settings.as_ref().map_or(0.0, |s| s.launch_vy),
+        air_accel: jump_settings.as_ref().map_or(0.0, |s| s.air_accel),
+        air_steer_secs: jump_settings.as_ref().map_or(0.0, |s| s.air_steer_secs),
+        // 转身降速的两个旋钮同理：服务端按同一组数算地速，预测端才不会被拽
+        turn_brake_start_deg: movement_settings
+            .as_ref()
+            .map_or(0.0, |s| s.turn_brake_start_deg),
+        turn_brake_min_scale: movement_settings
+            .as_ref()
+            .map_or(0.0, |s| s.turn_brake_min_scale),
     };
     for mut sender in senders.iter_mut() {
         sender.send::<ControlChannel>(message);

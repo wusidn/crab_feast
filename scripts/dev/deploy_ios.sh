@@ -2,8 +2,8 @@
 # 一键构建并安装到已连接 / 已配对的 iPhone，然后直接启动看效果。
 #
 # 用法:
-#   scripts/dev/deploy_ios.sh                 # Debug 构建 + 安装 + 启动
-#   scripts/dev/deploy_ios.sh --release       # Release 构建（体积小、装得快）
+#   scripts/dev/deploy_ios.sh                 # Release 构建 + 安装 + 启动（默认，60fps 稳）
+#   scripts/dev/deploy_ios.sh --debug         # Debug 构建（帧率会掉到 35fps，只在排障时用）
 #   scripts/dev/deploy_ios.sh --build-only    # 只构建
 #   scripts/dev/deploy_ios.sh --no-launch     # 装完不启动
 #   scripts/dev/deploy_ios.sh --udid <id>     # 指定设备
@@ -25,7 +25,9 @@ IOS_DIR="launcher/mobile/ios"
 SCHEME="crab_feast_mobile"
 BUNDLE_ID="org.crab.feast"
 TEAM_ID="${IOS_TEAM_ID:-7JRXM77YNL}"
-CONFIG="Debug"
+# Debug 构建在 iPhone 上只能勉强 60fps，场景一复杂就掉到 20~33ms（实测抖得厉害），
+# 所以默认走 Release；需要符号/断点时显式 --debug。
+CONFIG="Release"
 
 DO_BUILD=1
 DO_LAUNCH=1
@@ -35,11 +37,12 @@ UDID="${IOS_UDID:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release) CONFIG="Release" ;;
+    --debug) CONFIG="Debug" ;;
     --build-only) DO_LAUNCH=0 ;;
     --no-launch) DO_LAUNCH=0 ;;
     --list) DO_LIST=1 ;;
     --udid) UDID="${2:?--udid 需要参数}"; shift ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "error: 未知参数 $1" >&2; exit 1 ;;
   esac
   shift

@@ -64,7 +64,7 @@ impl AnimFocus {
 }
 
 /// 当前角色的骨架与最近一次求值结果（供 UI 显示）
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct PoseDriver {
     pub(crate) skeleton: Option<Skeleton>,
     /// 每个混合器各自的归一化相位
@@ -77,10 +77,30 @@ pub struct PoseDriver {
     /// 当前混合输出的两只脚支撑权重 `[左, 右]`（0 = 空中，1 = 踩实），
     /// 脚部 IK 用它决定什么时候把脚钉在地上
     pub contacts: [f32; 2],
+    /// 姿态档位被「大转角下限」抬起来后的补偿系数：`真实档位 / 显示档位`。
+    /// 物理速度按它折算回去，抬档只改观感、不改走多远。
+    pub pose_gain: f32,
     /// 本帧是否求值过混合空间（权重与地速这些数值可用）
     pub evaluated: bool,
     /// 上一帧是否真的由混合空间写了姿态（单条剪辑的根运动要让位）
     pub active: bool,
+}
+
+impl Default for PoseDriver {
+    fn default() -> Self {
+        Self {
+            skeleton: None,
+            phases: HashMap::default(),
+            weights: Vec::new(),
+            issues: Vec::new(),
+            point: [0.0; 2],
+            ground_speed: 0.0,
+            contacts: [0.0; 2],
+            pose_gain: 1.0,
+            evaluated: false,
+            active: false,
+        }
+    }
 }
 
 pub(crate) struct Skeleton {
@@ -135,6 +155,8 @@ pub(crate) fn drive_pose(
         point,
         ground_speed,
         contacts,
+        // 只读：补偿系数由 `drive_locomotion` 写，姿态求值本身不动它
+        pose_gain: _,
         evaluated,
         active,
     } = &mut *driver;

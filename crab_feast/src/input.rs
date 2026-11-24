@@ -1,8 +1,11 @@
-use avian3d::prelude::LinearVelocity;
+use avian3d::prelude::{LinearVelocity, Position};
+use bevy::picking::pointer::PointerId;
+use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
+use crab_feast_library::air::{air_steer_active, air_steer_velocity};
 use serde::{Deserialize, Serialize};
 
-use crate::anim::{JumpAction, PoseDriver};
+use crate::anim::{JumpAction, JumpSettings, PoseDriver};
 use crate::camera::CameraFacing;
 
 /// 控制链的执行顺序。
@@ -31,6 +34,20 @@ pub enum MovementInput {
 
 #[derive(Event)]
 pub struct LookInput(pub Vec2);
+
+/// 这几根指头**不转视角**：摇杆按住的那根、左半屏按下的那根。
+///
+/// 由 UI 输入层写（摇杆激活 / 左半屏落点），双指缩放也读它——
+/// 「左手走路 + 右手看路」时相机距离不能跟着变。
+#[derive(Resource, Debug, Default)]
+pub struct LookInputIgnorePointers(pub(crate) HashSet<PointerId>);
+
+impl LookInputIgnorePointers {
+    /// 这根指头是否归摇杆 / 左半屏管
+    pub(crate) fn contains(&self, pointer: PointerId) -> bool {
+        self.0.contains(&pointer)
+    }
+}
 
 #[derive(Resource, Debug, Clone, Copy, Reflect, Default)]
 pub enum JumpInput {
@@ -159,15 +176,43 @@ impl Default for MoveGait {
     }
 }
 
-/// 本帧的移动意图：世界空间单位方向 + 档位量级（0..1）。
+/// 本帧的移动意图：世界空间单位方向 + 档位量级（0..1）+ 转身降速系数（0..1）。
 ///
 /// 摇杆给的是「相对相机」的输入，这里已经换算成世界方向；
 /// 朝向系统与动画系统都读它，不再各自解释一遍摇杆坐标。
-#[derive(Component, Default, Clone, Copy)]
+///
+/// `speed_scale` 是「转身降速」：朝向误差大时按
+/// [`crab_feast_library::tuning::turn_speed_scale`] 压到 0。它**不**进
+/// `magnitude`——`magnitude` 是玩家推了多少杆，朝向系统靠它判断「还要不要转」，
+/// 压成 0 会让身体停止追方向，180° 就永远转不过来了。地速与动画档位用的都是
+/// `magnitude * speed_scale`。
+#[derive(Component, Clone, Copy, Debug)]
 pub struct LocomotionIntent {
     pub direction: Vec3,
     pub magnitude: f32,
+    pub speed_scale: f32,
 }
+
+impl Default for LocomotionIntent {
+    fn default() -> Self {
+        Self {
+            direction: Vec3::ZERO,
+            magnitude: 0.0,
+            // 没有输入时地速本来就是 0，降速系数保持中性
+            speed_scale: 1.0,
+        }
+    }
+}
+
+/// 本帧**实测**的平面位移速度（世界系，米/秒）。
+///
+/// 混合空间 `yaw` 轴要的是「人实际往哪挪」而不是「玩家想往哪推」，单机角色从物理
+/// [`LinearVelocity`] 就能读到。联机角色的位置由服务端快照直接写进 `Transform`，
+/// 又是 `Kinematic`（Avian 不碰非动态刚体的组件），物理速度恒为 0——不补这一份，
+/// 混合空间永远停在 `yaw = 0` 的正前方那一列：身体在转、腿还在往前跑，支撑脚只能
+/// 靠脚掌偏航锁硬扛，看起来就是「转向时一只脚往外拐」。
+#[derive(Component, Default, Clone, Copy, Debug)]
+pub struct PlanarMotion(pub Vec2);
 
 /// 角色朝向三件套：挂上就进入「相机先转、角色限速追」这套控制。
 ///
@@ -181,6 +226,23 @@ pub struct Facing {
     pub intent: LocomotionIntent,
 }
 
+/// 「转身降速」的斜坡状态（比例/秒限幅）。
+///
+/// 夹角是**瞬时**的：摇杆一甩，误差当场就是 180°，直接拿曲线乘速度会一帧掉到
+/// 下限，观感是被拉住而不是被惯性带走。这里按
+/// [`crab_feast_library::tuning::ramp_turn_brake`] 把它滑下去、再滑回来，
+/// 单机 / 预测端 / 服务端每 tick 推同一格，落点才不会各走一条。
+///
+/// 放资源而不是组件：客户端只有本机一个受控角色（单机一份、联机一份预测体）。
+#[derive(Resource)]
+pub struct TurnBrakeRamp(pub f32);
+
+impl Default for TurnBrakeRamp {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
 /// 输入平滑的跨帧状态：对**移动输入的朝向**（键盘 WASD / 摇杆）做一阶滞后。
 ///
 /// 系数本身来自 [`MovementSettings`]，这里只存「上一次平滑到哪儿了」，
@@ -189,10 +251,69 @@ pub struct Facing {
 pub struct InputSmoothing {
     /// 上一帧平滑后的输入方向（弧度，相对相机）。`None` = 还没历史，第一次直接取目标
     pub local_angle: Option<f32>,
+    /// 摇杆扫过中心时要沿用的上一段输入（见 [`StickHold`]）
+    pub hold: Option<StickHold>,
 }
 
 /// 平滑系数下限：0 时 alpha=0，输入会冻在上一帧的值上（推杆后像卡住不动）
 pub const SMOOTHING_MIN: f32 = 0.05;
+
+/// 摇杆量级低于这个，就当「手还按着、但正从一边扫到另一边」。
+///
+/// 手机上是虚拟摇杆：想掉头只能把拇指从一边拖到另一边，中间必然经过圆心。
+/// 那几帧的量级会掉到 0（甚至正好落在圆心），如果照「没输入」处理，人会先
+/// 站一拍、再瞬间切到反方向跑，脚步就全乱。所以这个区间沿用上一段的朝向与
+/// 量级，最多 [`STICK_SWEEP_SECS`]。
+const STICK_SWEEP_MAG: f32 = 0.35;
+
+/// 扫过中心的保持窗口（秒）。正常一次拖过圆心是 60~120ms，给到 0.25s 足够；
+/// 停这么久的「停在中间」仍然会被当成没在走。
+const STICK_SWEEP_SECS: f32 = 0.25;
+
+/// 到底算不算「在走」的量级下限：低于它且不在保持窗口里 → 停下
+const STICK_REST_MAG: f32 = 0.05;
+
+/// 扫过摇杆中心时沿用的上一段输入（朝向 + 摇杆偏转 + force + 已经保持了多久）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StickHold {
+    angle: f32,
+    /// 摇杆偏转量（`direction.length()`，0~1）
+    deflection: f32,
+    force: f32,
+    age: f32,
+}
+
+/// 这一帧**生效**的移动输入（摇杆扫过中心的保持已经算完了）。
+///
+/// `movement_system` 与上行发包都读它，不能各自再读原始摇杆：
+/// 拇指扫过圆心那几帧客户端还在跑，服务端若按「原始摇杆 ≈ 0」处理就会当成没输入，
+/// 两端立刻错开一整段减速——这正是要避免的抖。
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct EffectiveMove {
+    /// 屏幕空间单位方向；零 = 没在走
+    pub direction: Vec2,
+    /// 摇杆偏转量（0~1）
+    pub deflection: f32,
+    /// 摇杆 force（和偏转一起决定动画量级与上行语义）
+    pub force: f32,
+}
+
+impl EffectiveMove {
+    /// 这一帧到底在不在走
+    pub fn is_active(&self) -> bool {
+        self.magnitude() > STICK_REST_MAG
+    }
+
+    /// 动画量级（混合空间的 speed 轴）= 偏转 × force
+    pub fn magnitude(&self) -> f32 {
+        (self.deflection * self.force).clamp(0.0, 1.0)
+    }
+
+    /// 上行用的屏幕空间摇杆向量（长度 = 偏转量），与服务端 `MoveInput.dir/force` 同义
+    pub fn local_stick(&self) -> Vec2 {
+        self.direction * self.deflection
+    }
+}
 
 /// 移动设置：控制输入平滑的开启/关闭及参数
 ///
@@ -204,12 +325,24 @@ pub struct MovementSettings {
     pub smoothing_enabled: bool,
     /// 平滑系数（0.05~1），越小越平滑，响应越慢
     pub smoothing_factor: f32,
+    /// 转身降速起点（度）：朝向误差小于它时地速不受影响
+    pub turn_brake_start_deg: f32,
+    /// 转身降速下限（0~1）：误差到 180° 时保留的地速比例，1.0 = 完全不降速
+    pub turn_brake_min_scale: f32,
 }
 
 impl MovementSettings {
     /// 把系数夹回可用区间：0 会让看向彻底冻住（alpha=0），所以下限留一点
     pub fn sanitized(mut self) -> Self {
         self.smoothing_factor = self.smoothing_factor.clamp(SMOOTHING_MIN, 1.0);
+        self.turn_brake_start_deg = self.turn_brake_start_deg.clamp(
+            crab_feast_library::tuning::TURN_BRAKE_START_RANGE.0,
+            crab_feast_library::tuning::TURN_BRAKE_START_RANGE.1,
+        );
+        self.turn_brake_min_scale = self.turn_brake_min_scale.clamp(
+            crab_feast_library::tuning::TURN_BRAKE_MIN_RANGE.0,
+            crab_feast_library::tuning::TURN_BRAKE_MIN_RANGE.1,
+        );
         self
     }
 }
@@ -219,6 +352,8 @@ impl Default for MovementSettings {
         Self {
             smoothing_enabled: false,
             smoothing_factor: 0.5,
+            turn_brake_start_deg: crab_feast_library::tuning::TURN_BRAKE_START_DEG_DEFAULT,
+            turn_brake_min_scale: crab_feast_library::tuning::TURN_BRAKE_MIN_SCALE_DEFAULT,
         }
     }
 }
@@ -228,10 +363,10 @@ impl Default for MovementSettings {
 /// 不是 Bevy 默认的 -Z：本作的 Mixamo 模型面向 +Z。实测依据（`assets/characters`）：
 /// Walking / Running 的髛部净位移沿 +Z，LeftToe_End 落在 +X（即右侧是 -X），
 /// RightStrafe 往 -X 走 —— 三者自洽。
-const FORWARD_LOCAL: Vec3 = Vec3::Z;
+pub(crate) const FORWARD_LOCAL: Vec3 = Vec3::Z;
 
 /// 世界方向 → 绕 Y 的偏航角，满足 `Quat::from_rotation_y(yaw) * FORWARD_LOCAL == direction`。
-fn yaw_of(direction: Vec3) -> f32 {
+pub(crate) fn yaw_of(direction: Vec3) -> f32 {
     // v' = v·cosθ + (ŷ×v)·sinθ（水平向量），把 FORWARD_LOCAL 和它的右手垂线当正交基
     let forward = FORWARD_LOCAL;
     let right = Vec3::Y.cross(forward);
@@ -287,13 +422,39 @@ impl Plugin for ControlInputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MovementInput>()
             .init_resource::<JumpInput>()
+            // 空中操控的力度/窗口是移动系统的入参，所以在这里也要保证资源存在
+            // （正常流程里 `JumpPlugin` 也会 init，重复初始化是幂等的）
+            .init_resource::<JumpSettings>()
             .init_resource::<InputSmoothing>()
+            .init_resource::<EffectiveMove>()
+            .init_resource::<TurnBrakeRamp>()
+            // 哪些指头不许转视角：UI 输入层写，触摸缩放读
+            .init_resource::<LookInputIgnorePointers>()
             // 三个集合的先后顺序在 ScenePlugin 里配：相机系统属于 Camera 段，
             // 整条链还要接着排到动画驱动之前，放在接线处比在这里声明一半清楚
+            // 先把原始摇杆折算成「这一帧生效的输入」（扫过中心的保持在这里做），
+            // 移动系统和上行发包都读它
+            .add_systems(Update, steady_stick.before(ControlSet::Move))
             .add_systems(Update, movement_system.in_set(ControlSet::Move))
             .add_systems(Update, facing_system.in_set(ControlSet::Facing))
             .add_systems(Update, jump_keyboard.in_set(ControlSet::Move))
             .add_observer(look_system);
+
+        // TEMP 诊断：`CRAB_AUTO_TURN=<秒>` 自己每 N 秒把摇杆方向翻 180°，
+        // 用来在 PC / 手机上复现「连续甩头 → 两端位置漂移」。不设环境变量就不装。
+        if std::env::var("CRAB_AUTO_TURN").is_ok() {
+            app.init_resource::<AutoTurnDiag>()
+                .add_systems(Update, auto_turn_diag.before(steady_stick));
+        }
+        if std::env::var("CRAB_AUTO_WALK").is_ok() {
+            app.init_resource::<AutoWalkDiag>()
+                .add_systems(Update, auto_walk_diag.before(steady_stick));
+        }
+        // 帧时间注入抖动，单独一个开关：不依赖自动直线跑，也能配合手搓输入用。
+        if std::env::var("CRAB_FRAME_JITTER").is_ok() {
+            app.init_resource::<FrameJitterDiag>()
+                .add_systems(Last, frame_jitter_diag);
+        }
     }
 }
 
@@ -314,36 +475,60 @@ fn movement_system(
         &mut LinearVelocity,
         &MovementController,
         &mut LocomotionIntent,
+        // 转身降速要看「身体还差多少没转过来」。没有朝向状态的实体（编辑器预览、
+        // 单测最小 App）按 1.0 放行，不强行拦住人
+        Option<&FacingState>,
+        Option<&Position>,
     )>,
-    input: Res<MovementInput>,
     camera: Res<CameraFacing>,
     settings: Res<MovementSettings>,
     time: Res<Time>,
     jump: Option<Res<JumpAction>>,
+    jump_settings: Res<JumpSettings>,
     mut smoothing: ResMut<InputSmoothing>,
+    // 转身降速的斜坡：刹得住惯性、也要能自己爬回来
+    mut turn_brake: ResMut<TurnBrakeRamp>,
+    // 这一帧生效的摇杆输入（扫过中心的保持已经在 `steady_stick` 里算过）
+    effective: Res<EffectiveMove>,
 ) {
-    // 滞空期不接管水平速度：没有地面反力，起跳瞬间的速度原样保留到落地。
-    // 落地那一帧状态已经回到 Land，下一帧就由输入重新决定档位。
-    if jump.as_ref().is_some_and(|jump| jump.is_airborne()) {
-        return;
+    // 滞空期不再「只改朝向」：完全锁死落点太苛刻（起跳角差 10° 就差出半个方块），
+    // 但也不能给满。折中成**保动量、限转向**：
+    //
+    // - 松手：不刹车，起跳那一帧的水平动量原样留到落地（绝不把落点往前拽）；
+    // - 推杆：以有限加速度把水平速度**转**向输入方向，速度大小不变（不加速、不减速），
+    //   落点只是被有限地挪动；
+    // - 起跳后 `air_steer_secs` 一过就彻底不接管，最后 0.2 秒落点定死
+    //   （否则触地判定的位置会被输入抖动带偏）。
+    //
+    // 这条规则单机、预测端、服务端三处必须完全一致（服务端见
+    // `launcher/server/src/main.rs` 的 `drive_avatars`，两边共用
+    // `crab_feast_library::net::air_steer_velocity`）：任何一端多给一点空中控制，
+    // 预测和服务端就会各落一处，和解系统只好一直往回拽人。
+    let airborne = jump.as_ref().is_some_and(|jump| jump.is_airborne());
+    let air_elapsed = jump.as_ref().map_or(0.0, |jump| jump.air_elapsed());
+    let dt = time.delta_secs();
+    let effective = *effective;
+    if std::env::var("CRAB_LOG_SPEED").is_ok() {
+        info!("speed/frame: active={} airborne={} dt={:.3}",
+            effective.is_active(), airborne, dt);
     }
-    let local = match input.as_ref() {
-        MovementInput::Activated { direction, force } => {
-            Some((*direction, *force)).filter(|(local, _)| local.length_squared() > 1e-6)
-        }
-        // 松手
-        MovementInput::Idle => None,
-    };
-    let Some((local, force)) = local else {
+    let Some((target_angle, magnitude)) = effective
+        .is_active()
+        .then(|| (effective.direction.to_angle(), effective.magnitude()))
+    else {
         // 没有有效输入就停下：不能只靠线性阻尼慢慢漂，否则动画已经切回 Idle 了人还在滑。
         // 方向状态一并清掉，免得下次推杆还从上一次的角度慢慢摆过来
         smoothing.local_angle = None;
-        for (_, _, mut intent) in movers.iter_mut() {
+        // 松手：降速斜坡自己回满，下次起步不必从「还在刹车」的格子里开始
+        turn_brake.0 = crab_feast_library::tuning::ramp_turn_brake(turn_brake.0, 1.0, 0.0, dt);
+        for (mut velocity, _, mut intent, _, _) in movers.iter_mut() {
+            // 空中松手：意向归零（身体不再追任何方向），水平动量留到落地。
+            // 这里绝不能顺手把速度写成 0：那等于在空中把落点往回拽
             *intent = LocomotionIntent::default();
-        }
-        for (mut velocity, _, _) in movers.iter_mut() {
-            velocity.0.x = 0.0;
-            velocity.0.z = 0.0;
+            if !airborne {
+                velocity.0.x = 0.0;
+                velocity.0.z = 0.0;
+            }
         }
         return;
     };
@@ -356,7 +541,6 @@ fn movement_system(
     );
 
     // 方向低通走最短弧：从「前」摆到「后」不会绕一圈
-    let target_angle = local.to_angle();
     let angle = match smoothing.local_angle {
         Some(prev) => approach_yaw(prev, target_angle, alpha),
         // 第一次有输入时没有历史，直接对齐，免得一推杆角色先向某个固定方向偏一下
@@ -371,19 +555,272 @@ fn movement_system(
     let forward = camera.view_forward();
     let right = forward.cross(Vec3::Y);
     let direction = (right * smoothed_local.x + forward * -smoothed_local.y).normalize_or_zero();
+    if std::env::var("CRAB_LOG_YAW").is_ok() {
+        info!(
+            "dir-input: cam_yaw={:.1} fwd=({:.2},{:.2},{:.2}) stick=({:.2},{:.2}) world=({:.2},{:.2},{:.2})",
+            camera.yaw.to_degrees(), forward.x, forward.y, forward.z,
+            smoothed_local.x, smoothed_local.y, direction.x, direction.y, direction.z
+        );
+    }
     // 档位量级**不过滤波器**：它是「起步加速」的手感，和转向是两个旋钮，
     // 混在一起会让调系数的人分不清自己改的是转身还是加速。
-    // 它与混合空间的 speed 轴同义：推满为 1
-    let magnitude = (local.length() * force).clamp(0.0, 1.0);
+    // 它与混合空间的 speed 轴同义：推满为 1。量级在上面已经算好（含扫中心的保持）
 
-    for (mut velocity, movement_controller, mut intent) in movers.iter_mut() {
+    // 转身降速：读**上一帧**的朝向误差（`facing_system` 在 ControlSet::Facing 跑，
+    // 排在移动之后）。16ms 的滞后在 90°/s 的转速下是 1.5°，对曲线没有影响。
+    // 单机、预测端、服务端用同一个函数（服务端见 `launcher/server/src/main.rs`），
+    // 一端降速另一端不降，和解系统会一直把预测位置往回拽。
+    for (mut velocity, movement_controller, mut intent, facing, pos) in movers.iter_mut() {
+        // 意向先写：空中也照样写，身体朝向由 `facing_system` 按它转
+        // （空中转速已经被 `AIR_TURN` 压过，能转但转不快）
         intent.direction = direction;
         intent.magnitude = magnitude;
-        let target = direction * movement_controller.speed;
-        // LinearVelocity 是 newtype，内部直接是 Vec3
-        velocity.0.x = target.x;
-        velocity.0.z = target.z;
+        // 目标比例只看夹角，实际比例按时间斜坡逼近：甩头时先被惯性带走、慢慢刹到
+        // 下限，转回来再慢慢提速。斜坡是纯时间的函数（每 tick 推一格），帧率不影响落点。
+        let (target, turn_rate) = facing.map_or((1.0, 0.0), |f| {
+            (
+                crab_feast_library::tuning::turn_speed_scale_with(
+                    f.error_deg,
+                    settings.turn_brake_start_deg,
+                    settings.turn_brake_min_scale,
+                ),
+                // 刹车力按本帧的转速给：身体还没转起来的那几帧不许刹
+                f.yaw_rate,
+            )
+        });
+        turn_brake.0 = crab_feast_library::tuning::ramp_turn_brake(
+            turn_brake.0,
+            target,
+            turn_rate,
+            time.delta_secs(),
+        );
+        intent.speed_scale = turn_brake.0;
+        if airborne {
+            // 空中：不写目标速度，只把**当前**水平速度转向输入方向——速度大小原样保留，
+            // 所以「保动量」；转多快由空中操控加速度卡住，所以「限转向」。
+            // 加速度按摇杆量级缩放：轻推摇杆转得慢，推满才是设置的满力度。
+            if air_steer_active(air_elapsed, jump_settings.air_steer_secs) {
+                let steered = air_steer_velocity(
+                    [velocity.0.x, velocity.0.z],
+                    [direction.x, direction.z],
+                    jump_settings.air_accel * magnitude,
+                    time.delta_secs(),
+                );
+                velocity.0.x = steered[0];
+                velocity.0.z = steered[1];
+            }
+            continue;
+        }
+        // 地速方向取**这一帧的输入方向**，不是身体朝向：甩头 180° 时人是
+        // 「刹住 → 倒退走 → 再转身」，不是沿一条弧把身体带过去。朝向和位移是
+        // 两条独立的时间轴（朝向 90°/s 追，位移另有各套剪辑负责）。
+        //
+        // 反向那一下交给 `ground_velocity_step` 按有限加速度掰：先沿原方向
+        // 刹到 0、再过零反向加速，所以看到的是惯性减速，不是一帧把速度翻过去。
+        #[allow(unused_mut)]
+        let mut target = direction * movement_controller.speed;
+        if std::env::var("CRAB_LOG_SPEED").is_ok() {
+            let err = facing.map_or(0.0, |f| f.error_deg);
+            let yaw = facing.map_or(0.0, |f| f.yaw.to_degrees());
+            let py = pos.map_or(0.0, |p| p.0.y);
+            info!("speed: yaw={:.1}° ctrl={:.2} ramp={:.2} err={:.1} y={:.3} vy={:.2} target=({:.2},{:.2}) vel=({:.2},{:.2})",
+                yaw, movement_controller.speed, turn_brake.0, err, py, velocity.0.y, target.x, target.z, velocity.0.x, velocity.0.z);
+        }
+        let stepped = crab_feast_library::tuning::ground_velocity_step(
+            [velocity.0.x, velocity.0.z],
+            [target.x, target.z],
+            crab_feast_library::tuning::REVERSE_ACCEL_MPS2,
+            time.delta_secs(),
+        );
+        velocity.0.x = stepped[0];
+        velocity.0.z = stepped[1];
     }
+}
+
+/// TEMP 诊断：连续甩头用的摇杆替身
+#[derive(Resource)]
+struct AutoTurnDiag {
+    period: f32,
+    elapsed: f32,
+    flip: bool,
+}
+
+impl Default for AutoTurnDiag {
+    fn default() -> Self {
+        let period = std::env::var("CRAB_AUTO_TURN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.6);
+        Self {
+            period,
+            elapsed: 0.0,
+            flip: true,
+        }
+    }
+}
+
+fn auto_turn_diag(
+    time: Res<Time>,
+    mut state: ResMut<AutoTurnDiag>,
+    mut input: ResMut<MovementInput>,
+) {
+    // `CRAB_AUTO_TURN_MODE=pulse`：推 → 松手 → 反向推 → 松手，
+    // 复现「频繁停下再起步、每次起步都掉头」这一种输入节奏
+    let pulse = std::env::var("CRAB_AUTO_TURN_MODE").is_ok_and(|v| v == "pulse");
+    state.elapsed += time.delta_secs();
+    if state.elapsed >= state.period {
+        state.elapsed = 0.0;
+        state.flip = !state.flip;
+        info!(
+            "auto-turn: flip={} t={:.1}s",
+            state.flip,
+            time.elapsed_secs()
+        );
+    }
+    if pulse && state.flip {
+        *input = MovementInput::Idle;
+        return;
+    }
+    let direction = if state.flip { Vec2::Y } else { Vec2::NEG_Y };
+    *input = MovementInput::Activated {
+        direction,
+        force: 1.0,
+    };
+}
+
+/// TEMP 诊断：`CRAB_AUTO_WALK=<秒>` 一直往前推摇杆，用来在手机上复现
+/// 「直线跑动时的抖动」——不发这个变量就不装。
+#[derive(Resource, Default)]
+struct AutoWalkDiag {
+    left: f32,
+    armed: bool,
+}
+
+fn auto_walk_diag(
+    time: Res<Time>,
+    mut state: ResMut<AutoWalkDiag>,
+    mut input: ResMut<MovementInput>,
+) {
+    if !state.armed {
+        state.armed = true;
+        state.left = std::env::var("CRAB_AUTO_WALK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6.0);
+    }
+    if state.left <= 0.0 {
+        return;
+    }
+    state.left -= time.delta_secs();
+    // TEMP 抓帧：朝 -Z 开阔地走（相机默认朝 +Z，摇杆 -Y 反向），避开 +Z 出生挡墙。
+    *input = MovementInput::Activated {
+        direction: Vec2::new(0.0, -1.0),
+        force: 1.0,
+    };
+}
+
+/// 临时诊断：给每帧注入随机延时，用来验证「画面位置与帧时间解耦」。
+/// `CRAB_FRAME_JITTER=<毫秒上限>` 开了才装，用来在桌面上复现「帧时间忽长忽短」。
+#[derive(Resource)]
+struct FrameJitterDiag {
+    max_us: u64,
+    armed: bool,
+    seed: u64,
+}
+
+impl Default for FrameJitterDiag {
+    fn default() -> Self {
+        Self {
+            max_us: 0,
+            armed: false,
+            // xorshift 的种子不能是 0，否则一直吐 0
+            seed: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+}
+
+fn frame_jitter_diag(mut state: ResMut<FrameJitterDiag>, mut frames: Local<u64>) {
+    if !state.armed {
+        state.armed = true;
+        state.max_us = std::env::var("CRAB_FRAME_JITTER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|ms| (ms.max(0.0) * 1000.0) as u64)
+            .unwrap_or(0);
+    }
+    if state.max_us == 0 {
+        return;
+    }
+    *frames += 1;
+    // xorshift：够随机，不引入依赖
+    state.seed ^= state.seed << 13;
+    state.seed ^= state.seed >> 7;
+    state.seed ^= state.seed << 17;
+    let extra = state.seed % state.max_us.max(1);
+    std::thread::sleep(std::time::Duration::from_micros(extra));
+}
+
+/// 原始摇杆 → 这一帧**生效**的输入（[`EffectiveMove`]）。
+///
+/// 只处理一件事：拇指从一边扫到另一边时会经过圆心，那几帧量级 ≈ 0。
+/// 这不是「没在走」，而是「正在换方向」——所以低量级时沿用上一段的朝向/偏转/force，
+/// 最多 [`STICK_SWEEP_SECS`]；真松手（`MovementInput::Idle`）不在此列，立刻停。
+///
+/// 这个结果同时给移动系统和上行发包（`net::send_input`）用：两端必须看到同一条
+/// 输入，否则客户端还在跑、服务端已经当成没输入停住，和解只能把人往回拽。
+fn steady_stick(
+    time: Res<Time>,
+    input: Res<MovementInput>,
+    mut smoothing: ResMut<InputSmoothing>,
+    mut effective: ResMut<EffectiveMove>,
+) {
+    let dt = time.delta_secs();
+    let (local, force) = match input.as_ref() {
+        MovementInput::Idle => {
+            smoothing.hold = None;
+            *effective = EffectiveMove::default();
+            return;
+        }
+        MovementInput::Activated { direction, force } => (*direction, *force),
+    };
+    let deflection = local.length().clamp(0.0, 1.0);
+    // 只看「摇杆 + force」合成的量级：轻推摇杆（偏转小、force 也给得小）不该被判成扫中心
+    let magnitude = (deflection * force).clamp(0.0, 1.0);
+    if magnitude >= STICK_SWEEP_MAG {
+        // 正常推杆：记下这一段，供扫过中心时沿用
+        smoothing.hold = Some(StickHold {
+            angle: local.to_angle(),
+            deflection,
+            force,
+            age: 0.0,
+        });
+    } else if smoothing
+        .hold
+        .as_ref()
+        .is_some_and(|hold| hold.age + dt <= STICK_SWEEP_SECS)
+    {
+        // 手还按着、量级掉了：沿用上一段，别让人在中间站一下
+        let hold = smoothing.hold.as_mut().expect("上一行刚检查过");
+        hold.age += dt;
+        *effective = EffectiveMove {
+            direction: Vec2::from_angle(hold.angle),
+            deflection: hold.deflection,
+            force: hold.force,
+        };
+        return;
+    } else {
+        smoothing.hold = None;
+    }
+    *effective = if magnitude > STICK_REST_MAG {
+        EffectiveMove {
+            direction: local.normalize_or_zero(),
+            deflection,
+            force,
+        }
+    } else {
+        // 在圆心停太久：确实没在走
+        EffectiveMove::default()
+    };
 }
 
 /// 角色朝向：追着目标偏航转过去，角速度受限，所以看起来比相机慢半拍。
@@ -399,17 +836,32 @@ fn movement_system(
 /// 全来自支撑期，所以这里把转速压到 [`AIR_TURN`] 的份上，落地那个支撑段再补回来。
 fn facing_system(
     mut avatars: Query<(
-        &mut Transform,
+        Entity,
         &FacingController,
         &LocomotionIntent,
         &mut FacingState,
     )>,
+    yaw_nodes: Query<(Entity, &ChildOf), With<crate::scene::AvatarYaw>>,
+    mut yaw_transforms: Query<&mut Transform, With<crate::scene::AvatarYaw>>,
+    mut body_transforms: Query<&mut Transform, Without<crate::scene::AvatarYaw>>,
     time: Res<Time>,
     driver: Option<Res<PoseDriver>>,
+    jump: Option<Res<JumpAction>>,
 ) {
-    for (mut transform, controller, intent, mut state) in avatars.iter_mut() {
-        // 朝向由 Avatar 根节点控制
-        let current = yaw_of(transform.rotation * FORWARD_LOCAL);
+    // 滞空段没有任何地面反力：转向一律按腾空算。不看 `contacts` 是因为动作层
+    // 接管期间它已经被清零，而「松手时意向量为 0」那条捷径会让 `foot_support`
+    // 误判成踩实，空中就按满速拧身子。蓄力 / 落地恢复段人还在地上，照常算踩实。
+    let airborne = jump.as_ref().is_some_and(|jump| jump.is_airborne());
+    for (entity, controller, intent, mut state) in avatars.iter_mut() {
+        // 朝向节点只挂在本地角色身上；预测体（联机）没有，回退写本体。
+        let yaw_entity = yaw_nodes
+            .iter()
+            .find(|(_, child_of)| child_of.parent() == entity)
+            .map(|(yaw, _)| yaw);
+
+        // 当前朝向直接取状态里的 yaw：本体旋转不再被 facing 写入（本地角色），
+        // 也不能再从本体 Transform 反推。
+        let current = state.yaw;
         let target = if intent.magnitude > 1e-3 {
             yaw_of(intent.direction)
         } else {
@@ -425,7 +877,7 @@ fn facing_system(
         // 0.19~0.21s，16ms 的滞后不影响门控落在哪一段；这里也不能挪到 `PostUpdate`，
         // 因为 `solve_foot_ik` 是直接拿 Transform 自己乘世界矩阵的，必须看到本帧的
         // root 旋转，而 root 旋转就是这里写进去的
-        let support_now = foot_support(driver.as_deref(), intent);
+        let support_now = foot_support(driver.as_deref(), intent, airborne);
         let dt = time.delta_secs();
         state.support += (support_now - state.support) * support_smoothing(dt);
         let support = state.support;
@@ -450,9 +902,26 @@ fn facing_system(
         // 才不会在角色已经对准时还压满转向剪辑
         state.error_deg = wrap_pi(target - state.yaw).to_degrees();
 
-        // Avatar 的 rotation 由物理锁定，这里直接修改它（会覆盖但不生效于物理）
-        // 模型是 Avatar 的子节点，继承 Avatar 的旋转
-        transform.rotation = Quat::from_rotation_y(state.yaw);
+        if std::env::var("CRAB_LOG_YAW").is_ok() {
+            info!(
+                "yaw-step: cur={:.1}° tgt={:.1}° err={:.1}° rate={:.1}°/s",
+                current.to_degrees(),
+                target.to_degrees(),
+                state.error_deg,
+                state.yaw_rate.to_degrees()
+            );
+        }
+
+        // 朝向写到朝向子节点（本地角色）；本体只承担物理与平移插值，绝不写它的
+        // rotation，否则插值库会把这次改动判成「手动传送」，连平移两格 easing 一起清空。
+        let facing_quat = Quat::from_rotation_y(state.yaw);
+        if let Some(yaw_entity) = yaw_entity {
+            if let Ok(mut yaw_transform) = yaw_transforms.get_mut(yaw_entity) {
+                yaw_transform.rotation = facing_quat;
+            }
+        } else if let Ok(mut body_transform) = body_transforms.get_mut(entity) {
+            body_transform.rotation = facing_quat;
+        }
     }
 }
 
@@ -488,7 +957,12 @@ const SUPPORT_SMOOTH_SECS: f32 = 0.08;
 /// - Idle / LeftTurn / RightTurn 这些剪辑只有触地事件、没有离地事件，
 ///   `support_window` 需要成对事件才给值，于是恒为 0；
 /// - 刚起步（地速 < 0.5 m/s）还谈不上步态，加速段不该被压住。
-fn foot_support(driver: Option<&PoseDriver>, intent: &LocomotionIntent) -> f32 {
+///
+/// 例外是跳跃动作接管期间（`airborne`）：那时上面三条都不成立，人是真的离地。
+fn foot_support(driver: Option<&PoseDriver>, intent: &LocomotionIntent, airborne: bool) -> f32 {
+    if airborne {
+        return 0.0;
+    }
     let Some(driver) = driver else {
         return 1.0;
     };
@@ -656,22 +1130,53 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(Time::<()>::default())
             .init_resource::<InputSmoothing>()
+            .init_resource::<EffectiveMove>()
+            .init_resource::<TurnBrakeRamp>()
             .insert_resource(MovementSettings {
                 smoothing_enabled: enabled,
                 smoothing_factor: factor,
+                ..MovementSettings::default()
             })
+            .init_resource::<crate::anim::JumpSettings>()
             .insert_resource(CameraFacing::default())
             .insert_resource(MovementInput::Activated {
                 direction,
                 force: 1.0,
             })
-            .add_systems(Update, movement_system);
+            .add_systems(Update, (steady_stick, movement_system).chain());
         app.world_mut().spawn((
             LinearVelocity(Vec3::ZERO),
             MovementController::default(),
             LocomotionIntent::default(),
+            FacingState::default(),
         ));
         app
+    }
+
+    /// 从静止跑到满速。起步走的是有限加速度（20 m/s²，约 0.15 秒），
+    /// 所以测试里不能再「一帧就满速」，先跑够这一小段。
+    fn run_to_cruise(app: &mut App) {
+        for _ in 0..14 {
+            step(app, 1.0 / 60.0);
+        }
+    }
+
+    /// 把朝向误差摆到某个角度（降速读的就是这个值）
+    fn set_facing_error(app: &mut App, error_deg: f32) {
+        let world = app.world_mut();
+        let mut query = world.query::<&mut FacingState>();
+        let mut state = query.iter_mut(world).next().expect("角色实体");
+        state.error_deg = error_deg;
+        // 夹角这么大，身体必然正在按顶速转——刹车力按转速给，这里必须一起摆上
+        state.yaw_rate = -error_deg.signum() * 90.0;
+    }
+
+    /// 把身体朝向掰到某个世界角度（地速方向取的就是它）
+    fn set_facing_yaw(app: &mut App, yaw: f32) {
+        let world = app.world_mut();
+        let mut query = world.query::<&mut FacingState>();
+        let mut state = query.iter_mut(world).next().expect("角色实体");
+        state.yaw = yaw;
     }
 
     fn step(app: &mut App, seconds: f32) {
@@ -687,6 +1192,312 @@ mod tests {
         let intents: Vec<_> = query.iter(world).copied().collect();
         assert_eq!(intents.len(), 1);
         intents[0]
+    }
+
+    fn velocity_of(app: &mut App) -> Vec3 {
+        let world = app.world_mut();
+        let mut query = world.query::<&LinearVelocity>();
+        let mut velocities: Vec<_> = query.iter(world).copied().collect();
+        assert_eq!(velocities.len(), 1);
+        velocities.remove(0).0
+    }
+
+    /// 把动作层摆成「已经在滞空」
+    fn take_off(app: &mut App) {
+        app.insert_resource(JumpAction::in_air_for_test());
+    }
+
+    /// 180° 甩头：地速该被压到下限（不是 0），档位本身必须留着——
+    /// 朝向系统靠 `magnitude > 0` 判断「还要不要追方向」，压成 0 就永远转不过来
+    #[test]
+    fn reversal_brakes_speed_but_keeps_turning() {
+        let mut app = movement_app(false, 1.0, -Vec2::Y);
+        step(&mut app, 1.0 / 60.0);
+        let floor = crab_feast_library::tuning::TURN_BRAKE_MIN_SCALE_DEFAULT;
+
+        set_facing_error(&mut app, 180.0);
+        step(&mut app, 1.0 / 60.0);
+        let first = intent_of(&mut app).speed_scale;
+        assert!(first > 0.9, "第一帧就掉到 {first}，没有惯性刹车的过程");
+
+        // 约 0.35 秒刹到下限，然后一直稳在下限（整段转弯都在低速折线里）
+        for _ in 0..30 {
+            step(&mut app, 1.0 / 60.0);
+        }
+        let intent = intent_of(&mut app);
+        assert!(
+            (intent.speed_scale - floor).abs() < 1e-4,
+            "180° 应稳在下限 {floor}，实测 {}",
+            intent.speed_scale
+        );
+        assert!(
+            (intent.magnitude - 1.0).abs() < 1e-6,
+            "档位被一起压掉了，身体会停止转身：{}",
+            intent.magnitude
+        );
+
+        // 转身完成后（夹角收敛到 0）斜坡把速度提回满速，且比刹车慢
+        set_facing_error(&mut app, 0.0);
+        let mut ticks = 0;
+        while intent_of(&mut app).speed_scale < 1.0 - 1e-4 && ticks < 200 {
+            step(&mut app, 1.0 / 60.0);
+            ticks += 1;
+        }
+        assert!(ticks > 30, "提速不该比刹车快：{ticks} tick");
+        assert!(ticks < 60, "提速拖了 {ticks} tick，转完半天还上不来");
+
+        // 小角度：30° 以内完全不碰
+        set_facing_error(&mut app, 25.0);
+        step(&mut app, 1.0 / 60.0);
+        assert!(
+            (intent_of(&mut app).speed_scale - 1.0).abs() < 1e-6,
+            "小角度不该降速"
+        );
+    }
+
+    /// 拇指扫过圆心（摇杆回中那几帧）：绝不能当成「没输入」，
+    /// 否则人会先站一拍、速度被写成 0，再瞬间切到反方向跑，脚步全乱
+    #[test]
+    fn sweeping_through_the_center_keeps_running() {
+        let mut app = movement_app(false, 1.0, -Vec2::Y);
+        run_to_cruise(&mut app);
+        let cruise = velocity_of(&mut app);
+        assert!(cruise.z > 2.5, "先要跑起来：{cruise:?}");
+
+        // 正从一边拖到另一边：手还按着，量级掉到 0（正好落在圆心）
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Activated {
+            direction: Vec2::ZERO,
+            force: 0.0,
+        };
+        for _ in 0..8 {
+            step(&mut app, 1.0 / 60.0);
+            let v = velocity_of(&mut app);
+            assert!(
+                (v - cruise).length() < 0.2,
+                "扫过中心时速度被抽走了：{cruise:?} → {v:?}"
+            );
+            assert_eq!(intent_of(&mut app).magnitude, 1.0, "量级不该掉到 0");
+        }
+
+        // 落到另一边：一条直线反向，不横着偏
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Activated {
+            direction: Vec2::Y,
+            force: 1.0,
+        };
+        for _ in 0..12 {
+            step(&mut app, 1.0 / 60.0);
+            let v = velocity_of(&mut app);
+            assert!(v.x.abs() < 1e-3, "反向过程横向偏出去了：{v:?}");
+        }
+        let braking = velocity_of(&mut app);
+        assert!(
+            braking.z < cruise.z - 0.5,
+            "落到另一边之后应该开始减速：{braking:?}"
+        );
+    }
+
+    /// 真的松手（手抬起来）仍然是立刻停，不给「扫过中心」的保持
+    #[test]
+    fn release_stops_without_the_sweep_hold() {
+        let mut app = movement_app(false, 1.0, -Vec2::Y);
+        run_to_cruise(&mut app);
+        assert!(velocity_of(&mut app).z > 2.5, "先要跑起来");
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Idle;
+        step(&mut app, 1.0 / 60.0);
+        let v = velocity_of(&mut app);
+        assert!(v.x.abs() < 1e-6 && v.z.abs() < 1e-6, "松手该立刻停：{v:?}");
+    }
+
+    /// 拇指停在圆心不动超过保持窗口：确实不走，允许停下
+    #[test]
+    fn resting_at_the_center_stops_after_the_window() {
+        let mut app = movement_app(false, 1.0, -Vec2::Y);
+        run_to_cruise(&mut app);
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Activated {
+            direction: Vec2::ZERO,
+            force: 0.0,
+        };
+        // 0.25s 窗口：前 0.2s 保持，之后才允许掉到 0
+        for _ in 0..30 {
+            step(&mut app, 1.0 / 60.0);
+        }
+        let v = velocity_of(&mut app);
+        assert!(v.length() < 0.1, "停在圆心这么久应该停下：{v:?}");
+        assert_eq!(intent_of(&mut app).magnitude, 0.0, "量级该归零");
+    }
+
+    /// 90° 以内的变向是贴地控制：几 tick 就跟上，不做成拖泥带水的惯性
+    #[test]
+    fn shallow_changes_apply_instantly() {
+        let mut app = movement_app(false, 1.0, -Vec2::Y);
+        // 脸朝 +X（yaw = 90°），摇杆推向世界 +Z：夹角 90°，不算「反向」
+        set_facing_yaw(&mut app, std::f32::consts::FRAC_PI_2);
+        for _ in 0..14 {
+            step(&mut app, 1.0 / 60.0);
+        }
+
+        let velocity = velocity_of(&mut app);
+        // 90° 夹角已经吃满转身降速（下限 0.4×），只验方向不再沿旧轴、纵向已成主分量
+        assert!(velocity.z > 1.0, "90° 变向该跟上：{velocity:?}");
+        assert!(velocity.x.abs() < 1e-3, "不该还沿旧方向跑：{velocity:?}");
+    }
+
+    /// 180° 甩头：先在原方向上刹到 0、再反向加速，全程**一条直线**。
+    ///
+    /// 之前速度方向取身体朝向，位移会被身体拖着划出一道圆弧（实测横向偏出 1.6 m），
+    /// 观感就是「绕一个圈转回来」。现在方向取输入、惯性在速度层给。
+    #[test]
+    fn reversal_brakes_on_a_straight_line() {
+        let mut app = movement_app(false, 1.0, -Vec2::Y);
+        run_to_cruise(&mut app);
+        let cruise = velocity_of(&mut app);
+        assert!(cruise.z > 2.5, "先要跑起来：{cruise:?}");
+
+        // 摇杆推向后方（local +Y → 世界 -Z）
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Activated {
+            direction: Vec2::Y,
+            force: 1.0,
+        };
+        // 0.2 秒：还没刹完，速度仍朝原方向、但已经在掉
+        for _ in 0..12 {
+            step(&mut app, 1.0 / 60.0);
+            let v = velocity_of(&mut app);
+            assert!(v.x.abs() < 1e-3, "反向过程横向偏出去了：{v:?}");
+        }
+        let braking = velocity_of(&mut app);
+        assert!(
+            braking.z > 0.5 && braking.z < cruise.z,
+            "应该正在沿原方向减速：{braking:?}"
+        );
+
+        // 0.8 秒：已经反向，仍然没有横向
+        for _ in 0..36 {
+            step(&mut app, 1.0 / 60.0);
+        }
+        let back = velocity_of(&mut app);
+        assert!(back.z < -0.2, "该倒着往回走了：{back:?}");
+        assert!(back.x.abs() < 1e-3, "反向之后横向偏出去了：{back:?}");
+    }
+
+    /// 空中松手：水平动量必须原样留到落地，落点不能被输入抽走
+    #[test]
+    fn airborne_release_keeps_horizontal_momentum() {
+        let mut app = movement_app(true, 1.0, -Vec2::Y);
+        run_to_cruise(&mut app);
+        let cruise = velocity_of(&mut app);
+        assert!(cruise.x.abs() + cruise.z.abs() > 1.0, "先要跑起来");
+
+        take_off(&mut app);
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Idle;
+        step(&mut app, 1.0 / 60.0);
+
+        let after = velocity_of(&mut app);
+        assert!(
+            (after - cruise).length() < 1e-6,
+            "空中松手改掉了水平速度：{cruise:?} → {after:?}"
+        );
+        assert_eq!(intent_of(&mut app).magnitude, 0.0, "松手后身体不该再追方向");
+    }
+
+    /// 空中推杆：速度**只能**限速转向，一 tick 挪不到一个加速度步长
+    ///
+    /// 这条同时守住两件事：一是转向不能瞬移（否则推杆当场改落点），
+    /// 二是转向不能改速度大小（否则空中等于多给一格推进）。
+    #[test]
+    fn airborne_input_steers_slowly_without_changing_speed() {
+        let mut app = movement_app(true, 1.0, -Vec2::Y);
+        run_to_cruise(&mut app);
+        let cruise = velocity_of(&mut app);
+
+        take_off(&mut app);
+        // 90° 换向：往 +X 推
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Activated {
+            direction: Vec2::X,
+            force: 1.0,
+        };
+        let settings = *app.world().resource::<JumpSettings>();
+        step(&mut app, 1.0 / 60.0);
+        let after = velocity_of(&mut app);
+
+        let moved = (after - cruise).length();
+        let step_len = settings.air_accel / 60.0;
+        assert!(
+            (moved - step_len).abs() < 1e-3,
+            "空中一 tick 应该正好挪一个加速度步长 {step_len}，实际 {moved}"
+        );
+        let before_speed = cruise.x.hypot(cruise.z);
+        let after_speed = after.x.hypot(after.z);
+        assert!(
+            after_speed <= before_speed + 1e-4,
+            "空中转向不该加速：{before_speed} → {after_speed}"
+        );
+        let intent = intent_of(&mut app);
+        assert!(
+            intent.direction.x.abs() > 0.5,
+            "意向应当已经转向新方向（朝向不受限速影响）：{intent:?}"
+        );
+    }
+
+    /// 起跳后过了 `air_steer_secs`：水平速度彻底锁死，推杆只转朝向
+    #[test]
+    fn airborne_steering_locks_after_the_window() {
+        let mut app = movement_app(true, 1.0, -Vec2::Y);
+        step(&mut app, 1.0 / 60.0);
+        let cruise = velocity_of(&mut app);
+
+        let settings = *app.world().resource::<JumpSettings>();
+        let mut action = JumpAction::in_air_for_test();
+        action.set_air_elapsed_for_test(settings.air_steer_secs + 0.01);
+        app.insert_resource(action);
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Activated {
+            direction: Vec2::X,
+            force: 1.0,
+        };
+        step(&mut app, 1.0 / 60.0);
+
+        let after = velocity_of(&mut app);
+        assert!(
+            (after - cruise).length() < 1e-6,
+            "接管窗口过了还在改落点：{cruise:?} → {after:?}"
+        );
+        assert!(
+            intent_of(&mut app).direction.x.abs() > 0.5,
+            "朝向仍然该跟着输入转"
+        );
+    }
+
+    /// 空中操控力度滑到 0：退回「完全锁死落点」，推杆一个字都不动速度
+    #[test]
+    fn zero_air_accel_locks_the_trajectory() {
+        let mut app = movement_app(true, 1.0, -Vec2::Y);
+        step(&mut app, 1.0 / 60.0);
+        let cruise = velocity_of(&mut app);
+
+        app.insert_resource(JumpSettings {
+            air_accel: 0.0,
+            ..*app.world().resource::<JumpSettings>()
+        });
+        take_off(&mut app);
+        *app.world_mut().resource_mut::<MovementInput>() = MovementInput::Activated {
+            direction: Vec2::X,
+            force: 1.0,
+        };
+        step(&mut app, 1.0 / 60.0);
+
+        let after = velocity_of(&mut app);
+        assert!(
+            (after - cruise).length() < 1e-6,
+            "力度为 0 还改了落点：{cruise:?} → {after:?}"
+        );
+    }
+
+    /// 起跳接管期间一律按腾空算转向权重，松手（意向量 0）也不例外
+    #[test]
+    fn air_facing_is_gated_even_without_intent() {
+        assert_eq!(
+            foot_support(Some(&empty_driver(3.0)), &idle_intent(), true),
+            0.0
+        );
     }
 
     /// 档位量级不过滤波器：系数压到底也是同一帧满档，起步加速手感不受这个旋钮影响
@@ -750,6 +1561,7 @@ mod tests {
             *world.resource_mut::<MovementSettings>() = MovementSettings {
                 smoothing_enabled: true,
                 smoothing_factor: SMOOTHING_MIN,
+                ..MovementSettings::default()
             };
         }
         step(&mut app, 1.0 / 60.0);
@@ -796,6 +1608,7 @@ mod tests {
             app.insert_resource(MovementSettings {
                 smoothing_enabled: enabled,
                 smoothing_factor: factor,
+                ..MovementSettings::default()
             })
             .add_observer(look_system);
             app.world_mut()
@@ -837,6 +1650,7 @@ mod tests {
             LocomotionIntent {
                 direction: Quat::from_rotation_y(target) * FORWARD_LOCAL,
                 magnitude: 1.0,
+                ..LocomotionIntent::default()
             },
             FacingState::default(),
         ));
@@ -986,18 +1800,22 @@ mod tests {
         );
         let want = FacingController::default().turn_speed * AIR_TURN;
         assert!(
-            (35.0..=55.0).contains(&previous),
+            (previous - want).abs() < want * 0.25,
             "腾空 0.2s 后应贴近 {want:.1}°/s，实际 {previous:.1}°/s"
         );
 
-        // 落地后要能把欠的转速补回来
+        // 落地后要能把欠的转速补回来：比的是「腾空时被压下去的那一档」，
+        // 不是绝对顶速——顶速调快以后人可能已经转到目标、转速本来该收尾
+        let air_rate = previous;
         app.world_mut().resource_mut::<PoseDriver>().contacts = [1.0, 1.0];
+        let mut best = 0.0_f32;
         for _ in 0..30 {
             step(&mut app, 1.0 / 60.0);
+            best = best.max(facing_state(&mut app).yaw_rate.abs());
         }
         assert!(
-            facing_state(&mut app).yaw_rate.abs() > 85.0,
-            "落地 0.5s 还没回到顶速"
+            best > air_rate * 1.2,
+            "落地没能把转速补回来：{best:.1}°/s（腾空时 {air_rate:.1}°/s）"
         );
     }
 
@@ -1017,15 +1835,18 @@ mod tests {
             "地速为 0 时应按踩实算：{}",
             facing_state(&mut app).support
         );
-        assert_eq!(foot_support(Some(&empty_driver(3.0)), &idle_intent()), 1.0);
         assert_eq!(
-            foot_support(Some(&empty_driver(0.0)), &moving_intent()),
+            foot_support(Some(&empty_driver(3.0)), &idle_intent(), false),
+            1.0
+        );
+        assert_eq!(
+            foot_support(Some(&empty_driver(0.0)), &moving_intent(), false),
             1.0
         );
         // 真有步态时取两只脚里更强的那只
         let mut driver = empty_driver(3.0);
         driver.contacts = [0.2, 0.7];
-        assert!((foot_support(Some(&driver), &moving_intent()) - 0.7).abs() < 1e-6);
+        assert!((foot_support(Some(&driver), &moving_intent(), false) - 0.7).abs() < 1e-6);
     }
 
     fn empty_driver(ground_speed: f32) -> PoseDriver {
@@ -1039,6 +1860,7 @@ mod tests {
         LocomotionIntent {
             direction: FORWARD_LOCAL,
             magnitude: 1.0,
+            ..LocomotionIntent::default()
         }
     }
 

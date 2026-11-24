@@ -11,6 +11,7 @@ net = ["crab_feast_library/net", "dep:lightyear", "dep:socket2"]
 [dependencies]
 bevy.workspace                  = true
 avian3d.workspace               = true
+bevy_transform_interpolation.workspace = true
 crab_feast_library = { path = "../crab_feast_library" }
 crab_feast_ui_joysticks = { path = "../crab_feast_ui/joysticks" }
 bevy_animation.workspace      = true

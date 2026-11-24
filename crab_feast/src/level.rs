@@ -25,6 +25,13 @@ pub const GROUND_HALF: f32 = 30.0;
 pub const GROUND_THICKNESS: f32 = 0.2;
 /// 方块边长（米）。
 pub const CUBE_SIZE: f32 = 1.0;
+/// 角色胶囊的半高（含两端半球）：`Collider::capsule(0.2, 1.0)` = 1.0 / 2 + 0.2。
+pub const PLAYER_CAPSULE_HALF_HEIGHT: f32 = 0.7;
+/// 角色出生高度：胶囊底面离地 2cm，落地没有可见下坠，也不会穿进地面。
+///
+/// 客户端本地局和服务端联机局都用它——以前本地写 2.0、服务端写 1.0，
+/// 一个掉 1.3m 一个掉 0.3m，看起来都像「一出生就在下坠」。
+pub const PLAYER_SPAWN_Y: f32 = PLAYER_CAPSULE_HALF_HEIGHT + 0.02;
 /// 方块中心位置。y 取边长一半，底面正好压在地面 `y = 0` 上。
 ///
 /// 别摆在出生列上：出生点是 `x = player_id * 1.5, z = 0`，胶囊半径 0.2，
@@ -40,20 +47,12 @@ pub const LEVEL: [LevelBlock; 3] = [
         look: LevelLook::Ground,
     },
     LevelBlock {
-        center: [
-            CUBE_CENTERS[0].x,
-            CUBE_CENTERS[0].y,
-            CUBE_CENTERS[0].z,
-        ],
+        center: [CUBE_CENTERS[0].x, CUBE_CENTERS[0].y, CUBE_CENTERS[0].z],
         size: [CUBE_SIZE, CUBE_SIZE, CUBE_SIZE],
         look: LevelLook::Cube,
     },
     LevelBlock {
-        center: [
-            CUBE_CENTERS[1].x,
-            CUBE_CENTERS[1].y,
-            CUBE_CENTERS[1].z,
-        ],
+        center: [CUBE_CENTERS[1].x, CUBE_CENTERS[1].y, CUBE_CENTERS[1].z],
         size: [CUBE_SIZE, CUBE_SIZE, CUBE_SIZE],
         look: LevelLook::Cube,
     },
@@ -93,10 +92,16 @@ pub enum LevelLook {
 /// 不带 `Replicate`：静态几何不复制，靠两端同一份 [`LEVEL`] 保持一致。
 pub fn spawn_static_level(commands: &mut Commands) {
     for block in LEVEL {
+        let center = Vec3::from_array(block.center);
         commands.spawn((
             RigidBody::Static,
             Collider::cuboid(block.size[0], block.size[1], block.size[2]),
-            Transform::from_translation(Vec3::from_array(block.center)),
+            Transform::from_translation(center),
+            // 物理 `Position` 必须显式挂：`transform_to_position` 在场景里被关掉
+            // （见 scene.rs），静态体不再由 Transform 回读同步。漏挂时 Position
+            // 停在原点，碰撞体被抬到地面 y=0 之上，角色一出生就深度穿透，被接触
+            // 求解器的穿透补正速度反复上推成悬浮，再被和解当成误差吸附拉回。
+            Position::from_xyz(center.x, center.y, center.z),
             block,
             Name::new(format!("level-{:?}", block.look)),
         ));
