@@ -71,7 +71,11 @@ pub fn server_name(addr: SocketAddr) -> String {
     format!("{host} · {}", addr.port())
 }
 
-pub fn broadcast(time: Res<Time>, mut beacon: ResMut<Beacon>, room: Res<Room>) {
+/// 计时走**真实时间**：电台是发现用途，不该被客户端拖动的世界时间速度牵着走
+/// （`apply_time_scale_requests` 会把服务端 `Time<Virtual>` 的 relative speed 改掉，
+/// 慢放到 ×0.42 时 2.0s 的广播周期会被拉成 4.8s，客户端那边就看着大厅条目
+/// 亮一下灭一下）。
+pub fn broadcast(time: Res<Time<bevy::time::Real>>, mut beacon: ResMut<Beacon>, room: Res<Room>) {
     if !beacon.timer.tick(time.delta()).just_finished() {
         return;
     }

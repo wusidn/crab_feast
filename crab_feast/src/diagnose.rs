@@ -752,8 +752,9 @@ fn apply_net_side(sample: &Sample, diag: &mut Diagnostics, dt: f32) {
         }
     }
 
-    // 网络快照：位置/朝向每帧直接写 `Transform`，这里量的是快照本身的节奏——
-    // 多久变一次、每次跳多远。没有插值、没有预测，也没有可以统计的残差。
+    // 网络快照：`Position` 每帧直接取快照，视觉 `Transform` 由 `PoseSmoothing`
+    // 在最近两份快照之间插值（固定滞后 1.25 个间隔）。这里量的是快照本身的节奏——
+    // 多久变一次、每次跳多远，有没有插值、预测都不影响这两个数。
     diag.net.observe(dt, sample.net_pos);
     let meter = diag.net.clone();
     let net_row = diag.row_mut(DiagnosticRowId::NetSnapshot);
@@ -791,7 +792,11 @@ fn apply_net_side(sample: &Sample, diag: &mut Diagnostics, dt: f32) {
             net_row.set(
                 status,
                 format!("{interval:.0} ms"),
-                format!("步长 {:.3} m · 直写 Transform", meter.step_m),
+                format!(
+                    "步长 {:.3} m · 视觉滞后 {:.0} ms",
+                    meter.step_m,
+                    crate::net_pose::PoseSmoothing::lag() * 1000.0
+                ),
                 reason,
             );
         }

@@ -14,10 +14,69 @@ use crate::input::{
 use crate::state::GameState;
 
 use super::AnimationSet;
+use super::character::AnimModelRoot;
 use super::core::{BlendMixer, MixerCore};
 use super::driver::{AnimFocus, PoseDriver, drive_pose};
 use super::jump::JumpAction;
 use super::mixers::{LocomotionMixer, LookMixer, RegisteredMixer};
+
+/// 模型根节点上的「视觉朝向」（世界，弧度，与 `FacingState.yaw` 同口径）。
+///
+/// 混合空间算 `yaw` 轴要的不是**逻辑**朝向，而是「这具身体看起来朝哪」：
+/// 联机预测端由 [`super::turn_visual`] 按支撑期一步步追上来写它；
+/// 单机根本没有这个组件（`AvatarYaw` 节点本身就是视觉朝向，见 `facing_system`）。
+/// 放在这里而不是 `turn_visual` 里，是因为读取方是本文件、而写入方只在联机有。
+// 后面几个字段全是联机跟随器的内部状态（`turn_visual` 独享）：单机编译时
+// 它们只会被读写于构造函数里，`dead_code` 会报一堆，这里显式豁免
+#[derive(Component, Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "net"), allow(dead_code))]
+pub struct VisualYaw {
+    /// 视觉世界朝向（弧度）
+    pub(crate) yaw: f32,
+    /// 本帧角速度（度/秒），用于加/减速
+    pub(crate) rate: f32,
+    /// 是否已经和本体对齐过：第一帧必须直接取本体朝向，不能从 0 追
+    pub(crate) init: bool,
+    /// 距离上次打日志过了多久
+    pub(crate) since_log: f32,
+    /// 上一帧的可见世界朝向 / 本体朝向（诊断用：抓「单帧跳一大下」是谁跳的）
+    pub(crate) last_world: f32,
+    pub(crate) last_body: f32,
+}
+
+impl Default for VisualYaw {
+    fn default() -> Self {
+        Self {
+            yaw: 0.0,
+            rate: 0.0,
+            init: false,
+            since_log: 0.0,
+            last_world: 0.0,
+            last_body: 0.0,
+        }
+    }
+}
+
+impl VisualYaw {
+    /// 当前的视觉朝向（世界，弧度）。见类型文档。
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+}
+
+/// 四元数里绕 Y 的偏航角。算式只有 `input::yaw_of` 那一份，
+/// 这里只是把「取前向量」这一步包一层，免得两个模块各抄一遍 `atan2(x, z)`。
+pub(crate) fn yaw_of(rotation: Quat) -> f32 {
+    crate::input::yaw_of(rotation * Vec3::Z)
+}
+
+/// 转身这条链路的诊断日志开关（`CRAB_LOG_TURN=1`）。
+///
+/// 之前排查「转一下」时默认常开，日志里每帧级别的东西不该在正式包里刷屏；
+/// 和 `CRAB_LOG_YAW` / `CRAB_LOG_JUMP` 同一套约定。
+pub(crate) fn log_turn() -> bool {
+    std::env::var("CRAB_LOG_TURN").is_ok()
+}
 
 pub struct LocomotionPlugin;
 
@@ -83,11 +142,18 @@ fn drive_locomotion(
     jump: Res<JumpAction>,
     time: Res<Time>,
     avatars: Query<(
+        Entity,
         &FacingState,
         &LocomotionIntent,
         Option<&LinearVelocity>,
         Option<&PlanarMotion>,
     )>,
+    // 「脸朝哪」的视觉参考：单机在 `AvatarYaw` 节点上，联机预测端在模型根节点上。
+    // 混合空间的 yaw 轴必须相对**视觉**朝向算，不能相对逻辑朝向
+    // （见下面 `yaw_deg` 的注释）
+    yaw_nodes: Query<(Entity, &ChildOf), With<crate::scene::AvatarYaw>>,
+    yaw_transforms: Query<&Transform, With<crate::scene::AvatarYaw>>,
+    looks: Query<(&ChildOf, &VisualYaw), With<AnimModelRoot>>,
     mut mixer: ResMut<LocomotionMixer>,
     mut driver: ResMut<PoseDriver>,
 ) {
@@ -103,28 +169,65 @@ fn drive_locomotion(
     // 大转角时给姿态档位留一个下限：人还在以 0.75 m/s 慢慢平移，腿却已经塌成
     // 「Idle + 半个走档」的半站姿，看起来就是那一下僵硬。抬档只改观感，
     // 物理速度按 [`PoseDriver::pose_gain`] 折算回去。
-    let (error_deg, facing_yaw, honest, planar) = avatars
+    let Some((avatar, facing, intent, velocity, measured)) = avatars.iter().next() else {
+        return;
+    };
+    let planar = planar_displacement(velocity, measured);
+    let honest = blend_speed(intent);
+    // 「脸朝哪」取**视觉**朝向：单机是 `AvatarYaw` 节点，联机预测端是模型根节点上的
+    // `VisualYaw`。这一条是「突然转一大下」的根治点——之前拿逻辑朝向当参考，
+    // 甩杆的瞬间位移方向相对脸向直接甩到 180°，混合空间切去放后腿/横移的剪辑，
+    // 姿态在 0.25 秒里翻过去一大块，然后等逻辑朝向慢慢追上来才「转正」。
+    // 用视觉朝向当参考，转身这段里这具身体看到的偏角就是「移动方向偏了几度」，
+    // 不会因为逻辑朝向已经跑到前面去而把整圈的偏角塞进混合空间。
+    let visual_yaw = looks
         .iter()
-        .next()
-        .map(|(facing, intent, velocity, measured)| {
-            let planar = planar_displacement(velocity, measured);
-            (facing.error_deg, facing.yaw, blend_speed(intent), planar)
+        .find(|(child_of, _)| child_of.parent() == avatar)
+        .map(|(_, look)| look.yaw())
+        .or_else(|| {
+            yaw_nodes
+                .iter()
+                .find(|(_, child_of)| child_of.parent() == avatar)
+                .and_then(|(node, _)| yaw_transforms.get(node).ok())
+                .map(|transform| yaw_of(transform.rotation))
         })
-        .unwrap_or((0.0, 0.0, 0.0, Vec2::ZERO));
-    let speed = pose_axis(honest, error_deg);
-    driver.pose_gain = if speed > 1e-4 { honest / speed } else { 1.0 };
+        .unwrap_or(facing.yaw);
     // 偏角取**实测位移**，不是输入方向：刹车那半秒速度还朝原方向，姿态就该
     // 还是正前方的跑，不能提前切成倒退剪辑。速度太小没有方向可言，回正前方。
-    let yaw_deg = if planar.length() > 0.05 {
-        wrap_pi(planar.x.atan2(planar.y) - facing_yaw).to_degrees()
+    //
+    // 还要按**位移大小**再压一道斜坡：掉头时刹车会把速度穿过 0 再反向，
+    // 跨过零点的前后两帧方向差 180°，而那时人几乎没在动（实测 0.27 m/s）。
+    // 不压它，混合空间就会在那一帧从"正前跑"切到"放后腿"，观感是姿态
+    // **突然翻一大块**（实机日志 `pose/yaw: +0.0° → +166.6°` 就是这一下）。
+    // 慢到没有方向可言时，姿态就回正前方，让脚去转，别让剪辑去翻。
+    let yaw_raw = if planar.length() > 0.05 {
+        wrap_pi(planar.x.atan2(planar.y) - visual_yaw).to_degrees()
     } else {
         0.0
     };
+    let dir_gate = ((planar.length() - DIR_GATE_LOW_MPS) / (DIR_GATE_HIGH_MPS - DIR_GATE_LOW_MPS))
+        .clamp(0.0, 1.0);
+    let error_deg = yaw_raw * dir_gate;
+    let speed = pose_axis(honest, error_deg);
+    driver.pose_gain = if speed > 1e-4 { honest / speed } else { 1.0 };
+    let yaw_deg = error_deg;
+    // 诊断：混合空间 yaw 轴单帧跳多少。姿态「突然翻一大块」就是这条轴在跳
+    if log_turn() && (yaw_deg - driver.last_pose_yaw).abs() > 30.0 && driver.pose_log_secs >= 0.5 {
+        driver.pose_log_secs = 0.0;
+        info!(
+            "pose/yaw: {:+.1}° → {:+.1}°（位移 {:.2} m/s，视觉参考）",
+            driver.last_pose_yaw,
+            yaw_deg,
+            planar.length()
+        );
+    }
+    driver.last_pose_yaw = yaw_deg;
 
     let [yaw, speed] = params_for(Some(speed), yaw_deg);
 
     // 参数轴限速：参数一跳，权重就跟着跳，姿态就是一帧台阶。yaw 现在覆盖整圈，
     // 所以限速要按**最短弧**走，否则 180° 附近抖一下会让参数绕一整圈。
+    driver.pose_log_secs += time.delta_secs();
     let dt = time.delta_secs();
     let axes = mixer.core().space.params.clone();
     let core = mixer.core_mut();
@@ -231,9 +334,24 @@ fn params_for(magnitude: Option<f32>, yaw_deg: f32) -> [f32; 2] {
     }
 }
 
+/// 「位移方向可信」的起点速度（米/秒）：低于它，姿态一律按正前方。
+///
+/// 掉头时刹车把速度压到 0.4×满速以下，还会穿过 0 再反向，那一瞬间方向本身
+/// 没有意义；不压这道斜坡，混合空间就会在那一帧从「正前跑」切到「放后腿」，
+/// 姿态一帧翻一百多度——实机日志 `pose/yaw: +0.0° → +166.6°`（位移 0.27 m/s）
+/// 就是这一下。取 0.7 是照着实测踩的：掉头跨零点那几帧速度就在 0.5~0.6 m/s，
+/// 0.35 的起点留下的 32° 残留（`+0.0° → +32.4°`）还在肉眼里
+const DIR_GATE_LOW_MPS: f32 = 0.7;
+/// 到这个速度，位移方向全额参与混合（米/秒）
+const DIR_GATE_HIGH_MPS: f32 = 1.2;
+
 /// 参数轴每帧最大变化量（`yaw` 度/秒，`speed` 单位/秒），顺序同空间定义的轴。
 /// 只用来消台阶，别当成滤波：正常操作下这一项几乎不生效。
-const PARAM_SLEW: [f32; 2] = [700.0, 20.0];
+///
+/// `yaw` 从 700 收到 400：掉头时这条轴还是有可能一次性变一百多度（速度穿过 0
+/// 那一帧的方向翻转，见 `DIR_GATE_*`），700°/s 只需要 0.24s 扫完，看着就是
+/// 「一下翻过去」；400°/s 摊到 0.4s 以上，中间还有位移大小那道斜坡压着
+const PARAM_SLEW: [f32; 2] = [400.0, 20.0];
 
 /// 相机与角色的朝向差 → `yaw` / `pitch`。
 ///

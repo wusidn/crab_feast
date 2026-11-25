@@ -77,6 +77,9 @@ pub(super) fn drive_jump(
     rigid_bodies: Query<&RigidBody>,
     transforms: Query<&Transform, With<Avatar>>,
     spatial: SpatialQuery,
+    // 联机模式（含预测端）：离地速度必须用服务端同一份 `net_launch_vy`，
+    // 不能按本地实测抬升，否则两端跳起来的高度不同
+    mode: Option<Res<crate::state::SessionMode>>,
 ) {
     let dt = time.delta_secs();
     if dt <= f32::EPSILON {
@@ -359,7 +362,12 @@ pub(super) fn drive_jump(
             if previous != JumpState::Air {
                 let measured = vy.unwrap_or(0.0);
                 let kinematic = rigid_bodies.get(avatar).is_ok_and(|rb| rb.is_kinematic());
-                let net_mode = kinematic;
+                // 预测端的刚体是 Dynamic（自己积分），但它同样属于联机：起跳速度
+                // 仍要取服务端那一档，否则客户端跳得比服务端高一截
+                let net_mode = kinematic
+                    || mode
+                        .as_deref()
+                        .is_some_and(|mode| matches!(mode, crate::state::SessionMode::Online { .. }));
                 // 实测速度只用来「抬高」：贴地时接触求解会留下 ±0.2 m/s 的噪声，
                 // 按它起跳只能升两三厘米，表现就是「按了跳、人只抬了一下」。
                 // 联网 / 预测端直接用服务端同一份离地速度，不能按实测抬（会越抬越高）。

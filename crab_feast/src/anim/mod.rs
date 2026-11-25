@@ -23,6 +23,11 @@ pub mod mixers;
 pub(crate) mod driver;
 mod foot_ik;
 mod spaces;
+/// 视觉转身：把根节点的硬转摊到支撑期。**只服务联机预测端**——单机由
+/// `input::facing_system` 直接按支撑期写 `AvatarYaw` 节点，没有这一层。
+/// 「视觉朝向」组件本身在 [`locomotion`] 里（单机也要读）。
+#[cfg(feature = "net")]
+pub mod turn_visual;
 
 use bevy::prelude::*;
 

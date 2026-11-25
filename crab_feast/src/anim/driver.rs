@@ -84,6 +84,10 @@ pub struct PoseDriver {
     pub evaluated: bool,
     /// 上一帧是否真的由混合空间写了姿态（单条剪辑的根运动要让位）
     pub active: bool,
+    /// 诊断：上一帧送进混合空间的 yaw 轴值（抓"姿态突然翻一大块"）
+    pub last_pose_yaw: f32,
+    /// 诊断：距离上次打姿态日志过了多久
+    pub pose_log_secs: f32,
 }
 
 impl Default for PoseDriver {
@@ -99,6 +103,8 @@ impl Default for PoseDriver {
             pose_gain: 1.0,
             evaluated: false,
             active: false,
+            last_pose_yaw: 0.0,
+            pose_log_secs: 0.0,
         }
     }
 }
@@ -159,6 +165,8 @@ pub(crate) fn drive_pose(
         pose_gain: _,
         evaluated,
         active,
+        last_pose_yaw: _,
+        pose_log_secs: _,
     } = &mut *driver;
 
     // 预览单条剪辑时只求值不写骨骼：地速与权重照旧新鲜，姿态归 AnimationPlayer

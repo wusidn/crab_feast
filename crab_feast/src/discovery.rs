@@ -35,7 +35,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// 一条广播多久没再收到就从「局域网来源」里消失。
 ///
 /// 广播间隔 2 秒，留两倍余量：丢一两个包不至于让服务器在列表里闪烁。
-const STALE_AFTER: Duration = Duration::from_secs(4);
+///
+/// 广播是 2 秒一条，留够 3 条的空间。之前是 4 秒（正好 2 条），漏掉一条就过期，
+/// 于是列表里那台服务器每 4.8 秒掉一次又回来，大厅跟着闪
+const STALE_AFTER: Duration = Duration::from_secs(10);
 
 /// 注册中心轮询间隔。5 秒足够让大厅「点开就有」，也不会把注册中心打疼。
 const REGISTRY_POLL: Duration = Duration::from_secs(5);

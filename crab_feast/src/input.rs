@@ -381,9 +381,10 @@ pub fn camera_view_yaw(camera: &CameraFacing) -> f32 {
 }
 
 /// 把角度折到 (-π, π]，用于求「最短转向」的带符号误差。
-pub fn wrap_pi(angle: f32) -> f32 {
-    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
-}
+///
+/// 实现只有一份（[`crab_feast_library::tuning::wrap_pi`]）：服务端、预测端、
+/// 单机的转向算式都从这里取，任何一处自己抄一份就可能差一个边界值。
+pub use crab_feast_library::tuning::wrap_pi;
 
 #[allow(dead_code)]
 pub enum LookAxis {
@@ -959,7 +960,11 @@ const SUPPORT_SMOOTH_SECS: f32 = 0.08;
 /// - 刚起步（地速 < 0.5 m/s）还谈不上步态，加速段不该被压住。
 ///
 /// 例外是跳跃动作接管期间（`airborne`）：那时上面三条都不成立，人是真的离地。
-fn foot_support(driver: Option<&PoseDriver>, intent: &LocomotionIntent, airborne: bool) -> f32 {
+pub(crate) fn foot_support(
+    driver: Option<&PoseDriver>,
+    intent: &LocomotionIntent,
+    airborne: bool,
+) -> f32 {
     if airborne {
         return 0.0;
     }
@@ -982,14 +987,8 @@ fn support_smoothing(dt: f32) -> f32 {
 }
 
 /// 带限速的趋近：每帧最多走 `max_delta`，到不了就停在目标上。
-fn approach(current: f32, target: f32, max_delta: f32) -> f32 {
-    let delta = target - current;
-    if delta.abs() <= max_delta {
-        target
-    } else {
-        current + delta.signum() * max_delta
-    }
-}
+/// 与 [`crab_feast_library::tuning::approach`] 是同一份（转向算式两端必须同源）。
+use crab_feast_library::tuning::approach;
 
 /// 平滑系数 → 与帧率无关的单帧跟随权重。
 ///

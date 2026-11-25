@@ -20,7 +20,7 @@ pub const MOVE_SPEED_MPS: f32 = 3.0;
 /// 成「转身时人像在原地打转、看着抖」——真机每帧都在转、但用户几乎转两秒才到位，
 /// 中间还压着降速地板，看起来就是原地打摆子。调快顶速后转身一次到位，抖动消失。
 /// 30°/s、120°/s² → 6.1 秒（太沉，已否决）；450°/s、3000°/s² → 0.63 秒（观感偏假）。
-pub const TURN_SPEED_DEG_PER_SEC: f32 = 180.0;
+pub const TURN_SPEED_DEG_PER_SEC: f32 = 90.0;
 
 /// 最大转向角加速度（度/秒²）。
 ///
@@ -203,6 +203,51 @@ pub fn ground_velocity_step(current: [f32; 2], target: [f32; 2], accel: f32, dt:
     [
         current[0] + dx / len * max_step,
         current[1] + dz / len * max_step,
+    ]
+}
+
+/// 本 tick 的**目标**转身降速比例：只看夹角，不含时间斜坡。
+///
+/// `dir` 是输入的世界方向（`[x, z]`，长度 0 = 松手），`yaw` 是当前朝向（弧度，
+/// `atan2(x, z)` 约定）。夹角只按最小弧算，往左甩 180° 和往右甩 180° 一样。
+/// 单机、预测端、服务端共用：任一端差一个旋钮，甩头那一 tick 的速度就不同。
+pub fn ground_brake_target(
+    dir: [f32; 2],
+    yaw: f32,
+    turn_start_deg: f32,
+    turn_min_scale: f32,
+) -> f32 {
+    if dir[0] * dir[0] + dir[1] * dir[1] <= 1e-6 {
+        // 松手：目标就是满速，斜坡自己往回爬
+        return 1.0;
+    }
+    let goal = dir[0].atan2(dir[1]);
+    // 0 表示「没带这组旋钮」：退回默认值，不至于被当成满速
+    let start = if turn_start_deg > 0.0 {
+        turn_start_deg
+    } else {
+        TURN_BRAKE_START_DEG_DEFAULT
+    };
+    let floor = if turn_min_scale > 0.0 {
+        turn_min_scale
+    } else {
+        TURN_BRAKE_MIN_SCALE_DEFAULT
+    };
+    turn_speed_scale_with(wrap_pi(goal - yaw).to_degrees(), start, floor)
+}
+
+/// 地面速度的目标：方向取**输入方向**（不是身体朝向），大小 = 满速 × 斜坡。
+///
+/// 朝向和位移是两条独立的时间轴：甩头时人先刹住、再倒退走，身体慢慢转过去。
+/// 方向若跟着脸向，位移就会被身体带着划出一道大圆弧——实测被否掉的观感。
+pub fn ground_velocity(dir: [f32; 2], brake: f32) -> [f32; 2] {
+    let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+    if len <= 1e-6 {
+        return [0.0, 0.0];
+    }
+    [
+        dir[0] / len * MOVE_SPEED_MPS * brake,
+        dir[1] / len * MOVE_SPEED_MPS * brake,
     ]
 }
 

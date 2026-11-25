@@ -6,10 +6,13 @@
 //! 3. 服务端收到 Join 才分配 `player_id`、生成角色实体、回 `Welcome`；
 //! 4. 客户端收到 `Welcome` → 进 `Game` 建场景，复制下来的那个实体被认领成 [`Avatar`]。
 //!
-//! 渲染取舍（最基础的一层：权威快照 + 直接写位置）：
+//! 渲染取舍（权威快照 + 直接写位置，外加一层纯视觉插值）：
 //! - 角色实体一律由服务端复制，客户端不本地生成，避免"两个人在同一个角色上写 Transform"；
-//! - **所有玩家（含本地）都是 `Kinematic`**：位置/朝向每帧直接由 `NetPos` / `NetYaw` 赋值
-//!   （见 `net_pose.rs`），客户端不做预测、不做插值、不做残差修正；
+//! - **所有玩家（含本地）都是 `Kinematic`**：`Position` / `Rotation` 每帧直接由
+//!   `NetPos` / `NetYaw` 赋值（见 `net_pose.rs`），客户端不做预测、不做残差修正；
+//! - `Transform` 只有一份是插值出来的（[`PoseSmoothing`]）：在两份快照之间推进，
+//!   固定落后 1.25 个快照间隔。它不预测、不外推、不回写物理，只为把 60 Hz 采样
+//!   落在显示器帧上产生的台阶铺平；
 //! - 本地角色挂 `Avatar`，交给动画系统那套单实例管线（混合空间 / 脚部 IK）；
 //! - 管线要的动画参数（[`LocomotionIntent`] / [`FacingState`]）在联网模式下没有本地物理
 //!   去写，由 `drive_net_animation` 每帧从复制下来的 `NetMotion` / `NetYaw` 翻译过来——
@@ -46,9 +49,12 @@ use crate::anim::{
 use crate::camera::CameraFacing;
 use crate::ground::foot_ground_dist;
 use crate::input::{
-    ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, PlanarMotion, wrap_pi,
+    ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, wrap_pi,
 };
-use crate::net_pose::{apply_authoritative_pose, drive_net_animation};
+use crate::net_pose::{PoseSmoothing, apply_authoritative_pose, drive_net_animation, smooth_avatar_pose};
+use crate::predict::{
+    PredClock, Prediction, anchor_clock, pred_reconcile, pred_record, pred_render, pred_velocity,
+};
 use crate::scene::Avatar;
 use crate::state::{AbortSession, AutoJoin, LobbyNotice, NetDiagnostics, SessionMode};
 use crate::ui::debug::{DebugTimeScale, TimeScaleChanged};
@@ -122,6 +128,8 @@ impl Plugin for NetPlugin {
         // 时间粒度上演算；步长不一致时，同一段位移在两侧会解出不同的接触结果
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .init_resource::<NetConfig>()
+        // 本地预测的时间轴：上锚后每个定步长 +1
+        .init_resource::<PredClock>()
         .init_resource::<LoginPhase>()
         .init_resource::<SuspendState>()
         // 世界时间速度上行：拖动滑杆 → 节流发包；服务端复制回来的值 → 写回资源
@@ -177,6 +185,18 @@ impl Plugin for NetPlugin {
                 // 会直接 abort。资产就绪之前让这两个系统整个让路。
                 .run_if(remote_pose_ready),
         )
+        // 预测端每个定步长跑一遍：先按输入推速度（物理在 `FixedPostUpdate` 积分），
+        // 积分完再把结果记进轨迹环并推进 tick。顺序靠 `PhysicsSystems::Writeback` 保证。
+        // 视觉转身：把「根节点硬转」摊到支撑期。必须排在 `drive_pose` 之后
+        // （本帧的支撑权重已经写进 `FootIk`）、`FootIkSet` 之前（IK 要看到本帧的根朝向）
+        .add_systems(
+            PostUpdate,
+            crate::anim::turn_visual::follow_visual_yaw
+                .after(crate::anim::driver::drive_pose)
+                .before(FootIkSet),
+        )
+        .add_systems(FixedUpdate, pred_velocity)
+        .add_systems(FixedPostUpdate, pred_record.after(PhysicsSystems::Writeback))
         .add_systems(
             Update,
             (
@@ -185,9 +205,17 @@ impl Plugin for NetPlugin {
                 (
                     on_welcome,
                     claim_local_avatar,
-                    // 复制状态直接落地：位置/朝向全部取服务端快照，再把 `NetMotion`
-                    // 翻译成本地动画参数。没有插值、预测、和解——只有这一条路径
+                    // 本地预测：先上锚（第一份快照给出服务端 tick），再拿这一份快照和解。
+                    // 这两步只作用于挂 `Prediction` 的本地角色；远端玩家仍是下面的直写 + 插值。
+                    anchor_clock,
+                    pred_reconcile,
+                    // 远端：`Position` / `Rotation` 取服务端快照的权威值，
+                    // 再把 `NetMotion` 翻译成本地动画参数；最后只对**视觉** `Transform`
+                    // 做一层两快照之间的插值（不外推、不回写 `Position`）
                     apply_authoritative_pose,
+                    smooth_avatar_pose,
+                    // 本地：插值 + 视觉软偏移（校正差值在这里被慢慢吃掉）
+                    pred_render,
                     drive_net_animation,
                 )
                     .chain()
@@ -538,6 +566,8 @@ fn spawn_remote_visual(
         // Avian 0.8 的刚体只有 Dynamic / Static / Kinematic 三档：
         // Kinematic 不参与积分，组件由我们自己写，正好匹配"位置由服务器给"
         RigidBody::Kinematic,
+        // 视觉插值：远端玩家和本地玩家一样，60Hz 快照直写会一格一格跳
+        PoseSmoothing::default(),
     ));
 }
 
@@ -636,6 +666,8 @@ fn claim_local_avatar(
     avatars: Query<(Entity, &NetPlayerId, Option<&Children>), Without<Avatar>>,
     clip_roots: Query<(), With<ClipModelRoot>>,
     mut commands: Commands,
+    // 每认领一次都要重新上锚：上一局的 tick 时间轴跟这一局的服务器毫无关系
+    mut clock: ResMut<PredClock>,
 ) {
     let Some(local) = local else {
         return;
@@ -645,6 +677,7 @@ fn claim_local_avatar(
             continue;
         }
         info!("net: claiming local avatar {:?}", entity);
+        *clock = PredClock::default();
         // 本地角色交给动画系统：它自己会挂模型、跑混合空间与脚部 IK。
         // 之前先挂上的简易模型和占位胶囊都要撤掉，否则两套模型叠在一起
         if let Some(children) = children {
@@ -664,7 +697,20 @@ fn claim_local_avatar(
                 // `Kinematic`、物理速度恒为 0，不补这一份转身时腿会继续朝正前方迈
                 LocomotionIntent::default(),
                 FacingState::default(),
-                PlanarMotion::default(),
+                // 视觉插值的状态：认领前挂在远端路径上，这里保证本地角色也有一份
+                PoseSmoothing::default(),
+                // 本地预测核：自己按 60 Hz 推位移与朝向，快照只用来校正。
+                // `PlanarMotion` 不再挂——预测端有真实 `LinearVelocity`，
+                // 动画的 `yaw` 轴直接读实测位移，比服务端那份晚一个 RTT 的值更准。
+                Prediction::default(),
+                // 预测端要有真实物理：换成 Dynamic（服务端复制下来的默认是 Kinematic），
+                // 阻尼/锁定轴与单机角色同参数，手感才不会两边不一样。
+                RigidBody::Dynamic,
+                SleepingDisabled,
+                LinearDamping(0.3),
+                AngularDamping(0.3),
+                LockedAxes::ROTATION_LOCKED,
+                LinearVelocity::ZERO,
             ))
             .remove::<ClipBody>()
             .remove::<Mesh3d>()
@@ -1239,6 +1285,8 @@ fn send_input(
     // 必须发它而不是原始摇杆：拇指从一边扫到另一边时那几帧原始值 ≈ 0，
     // 服务端会当成没输入、把人当场停住，客户端却还在跑，两端立刻错开。
     effective_move: Option<Res<crate::input::EffectiveMove>>,
+    // 本地预测的时间轴：发出去的输入要带「它该在哪个 tick 生效」
+    clock: Option<Res<PredClock>>,
 ) {
     let mut auto_walk = auto_walk;
     if let Some(walk) = auto_walk.as_mut()
@@ -1299,10 +1347,15 @@ fn send_input(
     if std::env::var("CRAB_LOG_YAW").is_ok() {
         info!("uplink: auto={} local=({:.2},{:.2}) world=({:.2},{:.2}) fwd=({:.2},{:.2})", auto, local.x, local.y, world.x, world.z, forward.x, forward.z);
     }
+    // 没有预测核 / 还没上锚时发 0，服务端退回「到达即生效」。
+    // 上锚之后发的是**下一个要跑的 tick**：服务端把这条排进未来的那一 tick，
+    // 两端逐 tick 同源，不会因为「谁先收到包」整体错开一段相位。
+    let tick = match clock.as_deref() {
+        Some(clock) if clock.anchored => clock.tick,
+        _ => 0,
+    };
     let message = MoveInput {
-        // 0 = 没有本地 tick 时间轴，服务端「到达即生效」。
-        // 回到最基础的同步后客户端不再跑预测仿真，也就没有可对齐的 tick。
-        tick: 0,
+        tick,
         dir: [world.x, world.z],
         force,
         jump,

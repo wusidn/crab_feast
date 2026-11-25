@@ -255,7 +255,8 @@ fn apply_time_scale_requests(
 struct ExitAfter(Timer);
 
 fn exit_when_elapsed(
-    time: Res<Time>,
+    // 真实时间：`--exit-after` 是给 CI 的墙钟预算，别被慢放拉长
+    time: Res<Time<bevy::time::Real>>,
     mut timer: ResMut<ExitAfter>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -805,39 +806,19 @@ fn collect_inputs(
 /// `dir` 是输入的世界方向，`yaw` 是服务端权威朝向（弧度，0 = +Z，与客户端
 /// `yaw_of` 同一约定）。夹角只按最小弧算，往左甩 180° 和往右甩 180° 一样该停。
 ///
-/// 客户端 `movement_system` 是同一套语义（那边读 `FacingState.error_deg`），
-/// 差一个 tick 的误差只有 1.5°，预测不会被拉回去。
-/// 本 tick 的**目标**降速比例：只看夹角，不含时间斜坡。
+/// 本 tick 的**目标**降速比例（只算夹角，不含时间斜坡）。
 ///
-/// `dir` 是输入的世界方向，`yaw` 是服务端权威朝向（弧度，0 = +Z，与客户端
-/// `yaw_of` 同一约定）。夹角只按最小弧算，往左甩 180° 和往右甩 180° 一样。
+/// 同一份算式在 `crab_feast_library::tuning::ground_brake_target`，客户端预测端
+/// 每 tick 调一次，两端才能逐 tick 对齐。
 fn ground_brake_target(dir: Vec2, yaw: f32, turn_start_deg: f32, turn_min_scale: f32) -> f32 {
-    if dir.length_squared() <= 1e-6 {
-        // 松手：目标就是满速，斜坡自己往回爬
-        return 1.0;
-    }
-    let goal = dir.x.atan2(dir.y);
-    // 0 表示「客户端没带这组旋钮」：用服务端默认值，老客户端不至于被当成满速
-    let start = if turn_start_deg > 0.0 {
-        turn_start_deg
-    } else {
-        tuning::TURN_BRAKE_START_DEG_DEFAULT
-    };
-    let floor = if turn_min_scale > 0.0 {
-        turn_min_scale
-    } else {
-        tuning::TURN_BRAKE_MIN_SCALE_DEFAULT
-    };
-    tuning::turn_speed_scale_with(tuning::wrap_pi(goal - yaw).to_degrees(), start, floor)
+    tuning::ground_brake_target([dir.x, dir.y], yaw, turn_start_deg, turn_min_scale)
 }
 
-/// 地面速度的目标：方向取**输入方向**（不是身体朝向），大小 = 满速 × 斜坡。
-///
-/// 朝向和位移是两条独立的时间轴：甩头时人先刹住、再倒退走，身体用 90°/s 慢慢
-/// 转过去。方向若跟着脸向，位移就会被身体带着划出一道大圆弧——那是实测被否掉的
-/// 观感。惯性由 [`tuning::ground_velocity_step`] 在速度层给（反向走直线）。
+/// 地面速度目标（方向取输入方向，大小 = 满速 × 斜坡），见
+/// [`tuning::ground_velocity`]。
 fn ground_velocity(dir: Vec2, brake: f32) -> Vec2 {
-    dir.normalize_or_zero() * MOVE_SPEED_MPS * brake
+    let v = tuning::ground_velocity([dir.x, dir.y], brake);
+    Vec2::new(v[0], v[1])
 }
 
 /// 每个逻辑帧把最新输入写成速度，并推进宽限期。
