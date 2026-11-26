@@ -2,6 +2,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+#[cfg(feature = "inspector")]
 use bevy_inspector_egui::{bevy_egui::EguiPlugin, quick::WorldInspectorPlugin};
 use crab_feast::{AutoJoin, AutoJump, AutoWalk, NetConfig, NetPlugin, RegistryConfig, SessionMode};
 use crab_feast_launcher::{
@@ -31,8 +32,13 @@ fn main() {
     };
 
     let mut app = build_app(launch, move |app| {
+        // 世界检查器默认不挂（见 Cargo.toml 的 inspector feature），
+        // 否则每帧都要跑一遍 egui 面板，调试信息也没什么用。
+        #[cfg(feature = "inspector")]
         app.add_plugins(EguiPlugin::default())
-            .add_plugins(WorldInspectorPlugin::new())
+            .add_plugins(WorldInspectorPlugin::new());
+
+        app
             // 联网时窗口失焦不能让主循环停下来：lightyear 的 tick、收包、复制
             // 都跑在 Update 里，一旦进入低频模式，别人看到的就是你"卡住不动"
             .insert_resource(bevy::winit::WinitSettings {
