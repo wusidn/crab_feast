@@ -394,6 +394,15 @@ pub fn camera_view_yaw(camera: &CameraFacing) -> f32 {
     yaw_of(camera.view_forward())
 }
 
+/// 移动基准朝向（世界单位向量）：按住 Ctrl 时用冻结的偏航，否则跟相机。
+///
+/// 本地移动、客户端预测（`predict::pred_move`）、上行发包（`net::send_input`）
+/// 都必须从这里取「屏幕深处」，三端只要有一端读的是活动相机，位置就会分叉。
+pub fn movement_view_forward(camera: &CameraFacing, lock: Option<&OrbitLock>) -> Vec3 {
+    let yaw = lock.map_or(camera.yaw, |lock| lock.movement_yaw(camera.yaw));
+    Quat::from_rotation_y(yaw) * FORWARD_LOCAL
+}
+
 /// 把角度折到 (-π, π]，用于求「最短转向」的带符号误差。
 ///
 /// 实现只有一份（[`crab_feast_library::tuning::wrap_pi`]）：服务端、预测端、
@@ -431,6 +440,35 @@ impl Default for LookController {
     }
 }
 
+/// 「只转镜头」锁：按住 Ctrl 时相机照常绕，但移动的屏幕基准冻在按下那一刻。
+///
+/// 相机绕 90° 之后，按住 Ctrl 推摇杆仍然是「按下那一刻的屏幕深处」——转的
+/// 只是上半身（看向系统把镜头朝向往脊椎上摊），**身体的行进方向不变**。
+/// 松开 Ctrl 的那一帧基准立刻换回当前相机，角色按正常速度把朝向追过来。
+///
+/// 为什么要存一份冻结的偏航而不是「锁住输入」：移动系统、客户端预测、上行发包
+/// 三处都各自把摇杆折算成世界方向（见 [`movement_view_forward`]），只冻结其中
+/// 一处会让三端各跑一个方向。
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct OrbitLock {
+    /// 是否按住。上升沿那一刻把 `yaw` 写死，之后镜头怎么转都不再更新
+    pub(crate) held: bool,
+    /// 冻结的相机偏航（世界弧度）
+    pub(crate) yaw: f32,
+}
+
+impl OrbitLock {
+    /// 本帧给移动 / 转向用的「屏幕深处」偏航
+    pub fn movement_yaw(&self, camera_yaw: f32) -> f32 {
+        if self.held { self.yaw } else { camera_yaw }
+    }
+
+    /// 看向层此刻该不该驱动（看向镜头**朝向**的方向）
+    pub fn drives_look(&self) -> bool {
+        self.held
+    }
+}
+
 pub struct ControlInputPlugin;
 
 impl Plugin for ControlInputPlugin {
@@ -442,6 +480,8 @@ impl Plugin for ControlInputPlugin {
             .init_resource::<JumpSettings>()
             .init_resource::<InputSmoothing>()
             .init_resource::<EffectiveMove>()
+            // 按住 Ctrl 时冻结的移动基准（见 [`OrbitLock`]）
+            .init_resource::<OrbitLock>()
             // 哪些指头不许转视角：UI 输入层写，触摸缩放读
             .init_resource::<LookInputIgnorePointers>()
             // 三个集合的先后顺序在 ScenePlugin 里配：相机系统属于 Camera 段，
@@ -449,6 +489,14 @@ impl Plugin for ControlInputPlugin {
             // 先把原始摇杆折算成「这一帧生效的输入」（扫过中心的保持在这里做），
             // 移动系统和上行发包都读它
             .add_systems(Update, steady_stick.before(ControlSet::Move))
+            // 键盘锁必须读**本帧**的机位（`CameraSet::Place` 刚公布完 CameraFacing），
+            // 又要早于移动系统，所以挂在相机段里紧跟着摆机位
+            .add_systems(
+                Update,
+                orbit_lock_system
+                    .in_set(ControlSet::Camera)
+                    .after(crate::camera::CameraSet::Place),
+            )
             .add_systems(Update, movement_system.in_set(ControlSet::Move))
             .add_systems(Update, facing_system.in_set(ControlSet::Facing))
             .add_systems(Update, jump_keyboard.in_set(ControlSet::Move))
@@ -479,6 +527,58 @@ impl Plugin for ControlInputPlugin {
     }
 }
 
+/// 按住 Ctrl 时轨道角能绕多远（度，左右各一份）。160° 比上半身能看的
+/// 120° 多留一点余量：镜头还能再往外推 40°，让玩家看清「头已经到底了」。
+pub(crate) const ORBIT_HOLD_YAW_LIMIT_DEG: f32 = 160.0;
+
+/// 按住 Ctrl 时的轨道角夹取：直接取边界，不做软饱和、不做回弹。
+fn clamp_hold_yaw(yaw: f32, range: Option<(f32, f32)>) -> f32 {
+    range.map_or(yaw, |(low, high)| yaw.clamp(low, high))
+}
+
+/// Ctrl 按下 → 冻结这一帧的相机偏航，松开 → 解除。
+///
+/// 只做边沿锁存：按住期间相机继续绕（`look_system` 照旧积分），
+/// 但 [`OrbitLock::yaw`] 停在按下那一刻，供移动 / 预测 / 上行三处共用。
+///
+/// 同时给轨道角兜底一个 **±160°** 的限位：按住时镜头不再是 360° 无死角。
+/// 真正的夹取在 [`look_system`] 里做（积分处就夹，机位不会有任何一帧越界），
+/// 这里只是每帧再核一遍，防止别的代码绕过输入直写累计角。
+fn orbit_lock_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    camera: Res<CameraFacing>,
+    mut lock: ResMut<OrbitLock>,
+    mut rigs: Query<&mut LookController>,
+) {
+    let held = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    // 上升沿重写基准：第一次按下时锁的是「当时镜头在哪」，不是上一次的残值。
+    // 取镜头自己的累计角而不是 `CameraFacing`：后者是上一帧摆完机位公布的，
+    // 同一帧里 `look_system` 已经加过鼠标增量，用它会差出一个拖动量的基准。
+    if held && !lock.held {
+        lock.yaw = rigs
+            .iter_mut()
+            .next()
+            .map_or(camera.yaw, |look| look.accumulated_yaw);
+    }
+    lock.held = held;
+
+    if !held {
+        return;
+    }
+
+    // 硬夹而不是软饱和：玩家手里的是「方向盘」，到边界停住最直观；
+    // 松开 Ctrl 后再回到自由绕（限位不跟着走）。
+    let limit = ORBIT_HOLD_YAW_LIMIT_DEG.to_radians();
+    for mut look in &mut rigs {
+        let clamped = look
+            .accumulated_yaw
+            .clamp(lock.yaw - limit, lock.yaw + limit);
+        if (clamped - look.accumulated_yaw).abs() > f32::EPSILON {
+            look.accumulated_yaw = clamped;
+        }
+    }
+}
+
 /// 把「目标地速 + 输入方向」写成线速度。
 ///
 /// 摇杆方向现在是**相对相机**的：上 = 屏幕深处。绕世界 Y 旋到相机偏航就是世界方向，
@@ -504,6 +604,9 @@ fn movement_system(
         &mut TurnBrakeRamp,
     )>,
     camera: Res<CameraFacing>,
+    // Ctrl 锁：按住时这一帧的「屏幕深处」冻在按下那一刻
+    // （最小 App / 单测里没有输入插件，缺席就退化成纯相机驱动）
+    orbit_lock: Option<Res<OrbitLock>>,
     settings: Res<MovementSettings>,
     time: Res<Time>,
     jump: Option<Res<JumpAction>>,
@@ -572,8 +675,10 @@ fn movement_system(
     let smoothed_local = Vec2::from_angle(angle);
 
     // 摇杆的 y 是屏幕上下，不是世界的竖直轴：直接 extend 会把前后量丢到 Y 上，
-    // 于是只剩左右能动。这里拆成「屏幕深处 + 屏幕右」两个世界方向重组
-    let forward = camera.view_forward();
+    // 于是只剩左右能动。这里拆成「屏幕深处 + 屏幕右」两个世界方向重组。
+    // 「屏幕深处」走 [`movement_view_forward`]：按住 Ctrl 时它是冻结的，镜头绕到
+    // 侧面也不会把行进方向带走
+    let forward = movement_view_forward(&camera, orbit_lock.as_deref());
     let direction = Vec3::from_array(crab_feast_library::tuning::world_stick(
         forward.to_array(),
         [smoothed_local.x, smoothed_local.y],
@@ -1048,11 +1153,23 @@ fn approach_yaw(current: f32, target: f32, alpha: f32) -> f32 {
 /// 「输入平滑」只作用于移动输入（见 [`movement_system`]），两者互不干扰。
 fn look_system(
     trigger: On<LookInput>,
+    lock: Option<Res<OrbitLock>>,
     mut look_controllers: Query<(&mut Transform, &mut LookController)>,
 ) {
     // 每单位（视口宽度的比例）拖动转多少弧度
     let rotate_speed = 10.0;
     let max_pitch = std::f32::consts::FRAC_PI_2 - 0.1; // 防止翻转，限制在±85度
+
+    // 按住 Ctrl：在**积分的那一刻**就把累计角夹住（取 min/max），不是等一帧
+    // 之后再纠正。否则 `CameraSet::Place` 已经按越界值摆过机位，玩家会看到
+    // 「先冲过去、再被拽回来」的橡皮筋，而这里是一到边界就原地不动。
+    let hold_range = lock
+        .as_deref()
+        .filter(|lock| lock.held)
+        .map(|lock| {
+            let limit = ORBIT_HOLD_YAW_LIMIT_DEG.to_radians();
+            (lock.yaw - limit, lock.yaw + limit)
+        });
 
     look_controllers
         .iter_mut()
@@ -1061,7 +1178,8 @@ fn look_system(
 
             match look_controller.axis {
                 LookAxis::Yaw => {
-                    look_controller.accumulated_yaw -= input.x * rotate_speed;
+                    look_controller.accumulated_yaw =
+                        clamp_hold_yaw(look_controller.accumulated_yaw - input.x * rotate_speed, hold_range);
                 }
                 LookAxis::Pitch => {
                     look_controller.accumulated_pitch = (look_controller.accumulated_pitch
@@ -1069,7 +1187,8 @@ fn look_system(
                         .clamp(-max_pitch, max_pitch);
                 }
                 LookAxis::YawAndPitch => {
-                    look_controller.accumulated_yaw -= input.x * rotate_speed;
+                    look_controller.accumulated_yaw =
+                        clamp_hold_yaw(look_controller.accumulated_yaw - input.x * rotate_speed, hold_range);
                     look_controller.accumulated_pitch = (look_controller.accumulated_pitch
                         + input.y * rotate_speed)
                         .clamp(-max_pitch, max_pitch);
@@ -1967,6 +2086,208 @@ mod tests {
 
     fn idle_intent() -> LocomotionIntent {
         LocomotionIntent::default()
+    }
+
+    // ---- Ctrl 只转镜头：移动基准冻住，看向改成对镜头 ----
+
+    #[test]
+    fn orbit_lock_keeps_yaw_while_held_and_releases_afterwards() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<OrbitLock>()
+            .insert_resource(CameraFacing {
+                yaw: 0.35,
+                pitch: 0.0,
+            })
+            .add_systems(Update, orbit_lock_system);
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        app.update();
+        assert!(app.world().resource::<OrbitLock>().held);
+        assert!((app.world().resource::<OrbitLock>().yaw - 0.35).abs() < 1e-6);
+
+        // 按住期间镜头绕到 1.9：基准不动，世界方向也不跟着转
+        app.world_mut().resource_mut::<CameraFacing>().yaw = 1.9;
+        app.update();
+        let lock = *app.world().resource::<OrbitLock>();
+        assert!((lock.movement_yaw(1.9) - 0.35).abs() < 1e-6);
+        let frozen = movement_view_forward(&app.world().resource::<CameraFacing>(), Some(&lock));
+        let expected = Quat::from_rotation_y(0.35) * Vec3::Z;
+        assert!(
+            (frozen - expected).length() < 1e-5,
+            "前进方向被镜头带走了：{frozen:?}"
+        );
+        assert!(lock.drives_look());
+
+        // 松开：立刻换回当前镜头，之后镜头再转就跟着转
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::ControlLeft);
+        app.update();
+        let lock = *app.world().resource::<OrbitLock>();
+        assert!(!lock.held && !lock.drives_look());
+        assert!((lock.movement_yaw(1.9) - 1.9).abs() < 1e-6);
+    }
+
+    /// 每帧兜底：按住 Ctrl 时累计角不会停在 ±160° 之外。
+    #[test]
+    fn orbit_lock_keeps_yaw_inside_the_hold_limit() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<OrbitLock>()
+            .insert_resource(CameraFacing {
+                yaw: 0.0,
+                pitch: 0.0,
+            })
+            .add_systems(Update, orbit_lock_system);
+
+        let camera = app
+            .world_mut()
+            .spawn(LookController {
+                axis: LookAxis::YawAndPitch,
+                accumulated_yaw: 0.0,
+                accumulated_pitch: 0.0,
+            })
+            .id();
+
+        let set = |app: &mut App, yaw: f32| {
+            app.world_mut()
+                .get_mut::<LookController>(camera)
+                .unwrap()
+                .accumulated_yaw = yaw;
+        };
+        let get = |app: &App| app.world().get::<LookController>(camera).unwrap().accumulated_yaw;
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        app.update();
+        let limit = ORBIT_HOLD_YAW_LIMIT_DEG.to_radians();
+
+        // 界内（57°）：原样保留
+        set(&mut app, 1.0);
+        app.update();
+        assert!((get(&app) - 1.0).abs() < 1e-6, "界内被改动了：{}", get(&app));
+
+        // 往左拖过 160°：停在 160°
+        set(&mut app, 3.02); // ≈173°
+        app.update();
+        assert!(
+            (get(&app) - limit).abs() < 1e-5,
+            "左侧没有夹住：{}（上限 {limit}）",
+            get(&app)
+        );
+
+        // 往右拖过 160°：停在 -160°
+        set(&mut app, -3.02);
+        app.update();
+        assert!((get(&app) + limit).abs() < 1e-5, "右侧没有夹住：{}", get(&app));
+
+        // 松开 Ctrl：恢复自由绕，不再夹
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::ControlLeft);
+        set(&mut app, 3.02);
+        app.update();
+        assert!(
+            (get(&app) - 3.02).abs() < 1e-6,
+            "松开 Ctrl 后仍被夹住：{}",
+            get(&app)
+        );
+
+        // 再按下：基准取当前累计角，界内立刻就是新基准，不会瞬间跳回
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        app.update();
+        assert!((get(&app) - 3.02).abs() < 1e-6, "按下瞬间跳了：{}", get(&app));
+    }
+
+    /// 输入侧：一次拖动越界时，累计角**当场**就停在边界，不会先冲过去再被拽回。
+    #[test]
+    fn orbit_hold_clamps_at_the_limit_without_overshoot() {
+        let mut app = App::new();
+        app.init_resource::<OrbitLock>().add_observer(look_system);
+
+        let rig = app
+            .world_mut()
+            .spawn((Transform::default(), LookController::default()))
+            .id();
+        {
+            let mut lock = app.world_mut().resource_mut::<OrbitLock>();
+            lock.held = true;
+            lock.yaw = 0.0;
+        }
+        let limit = ORBIT_HOLD_YAW_LIMIT_DEG.to_radians();
+        let acc = |app: &App| {
+            app.world()
+                .get::<LookController>(rig)
+                .unwrap()
+                .accumulated_yaw
+        };
+
+        // 一次拖 1.0（10 rad，远超 160°）：当场停在边界
+        app.world_mut().trigger(LookInput(Vec2::new(1.0, 0.0)));
+        assert!(
+            (acc(&app) + limit).abs() < 1e-5,
+            "越界后没有停在边界：{}",
+            acc(&app)
+        );
+
+        // 继续往同方向拖：还在边界，不攒位移（否则反向时要先把欠账走回来）
+        app.world_mut().trigger(LookInput(Vec2::new(1.0, 0.0)));
+        assert!((acc(&app) + limit).abs() < 1e-5, "{}", acc(&app));
+
+        // 反向拖 0.5 rad：立刻从边界往回走，没有「弹回来」的那一下
+        app.world_mut().trigger(LookInput(Vec2::new(-0.05, 0.0)));
+        assert!(
+            (acc(&app) + (limit - 0.5)).abs() < 1e-4,
+            "反向起步不从边界算：{}",
+            acc(&app)
+        );
+
+        // 松开 Ctrl：同一方向再拖就不夹了（自由绕 360°）
+        app.world_mut().resource_mut::<OrbitLock>().held = false;
+        app.world_mut().trigger(LookInput(Vec2::new(1.0, 0.0)));
+        assert!(
+            (acc(&app) + (limit - 0.5 + 10.0)).abs() < 1e-4,
+            "松开 Ctrl 后仍被夹住：{}",
+            acc(&app)
+        );
+    }
+
+    #[test]
+    fn orbit_lock_captures_a_fresh_yaw_on_each_press() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<OrbitLock>()
+            .insert_resource(CameraFacing {
+                yaw: 0.2,
+                pitch: 0.0,
+            })
+            .add_systems(Update, orbit_lock_system);
+
+        let keys = |app: &mut App, press: bool| {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            if press {
+                keys.press(KeyCode::ControlLeft);
+            } else {
+                keys.release(KeyCode::ControlLeft);
+            }
+        };
+
+        keys(&mut app, true);
+        app.update();
+        // 松开、镜头转到 -1.1、再按下：锁的是新位置，不是上一次的残值
+        keys(&mut app, false);
+        app.update();
+        app.world_mut().resource_mut::<CameraFacing>().yaw = -1.1;
+        app.update();
+        keys(&mut app, true);
+        app.update();
+        assert!((app.world().resource::<OrbitLock>().yaw + 1.1).abs() < 1e-6);
     }
 }
 

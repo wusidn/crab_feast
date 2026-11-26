@@ -4,6 +4,8 @@
 //! - [`character`]：角色/剪辑清单、模型加载与挂点、单条剪辑播放与根运动位移；
 //! - [`mixers`]：各个混合系统资源（移动 / 看向 / 瞄准）、注册表与快照缓存、磁盘读写；
 //! - [`driver`]：把启用的混合系统求值成姿态并写到骨骼上；
+//! - [`look`]：看向，把偏航 / 俯仰按骨骼份额摊到脊椎链，动画姿态之上叠加；
+//!   相机驱动只在按住 Ctrl（只转镜头）时生效，平时不动上半身；
 //! - [`locomotion`]：玩家输入与真实地速 ↔ 「移动混合」的参数、角色的实际移动速度；
 //! - [`spaces`]：本作有哪些混合空间（参数轴 + 默认采样点），属于游戏内容。
 //!
@@ -17,6 +19,8 @@ pub mod character;
 /// 与具体作品无关的混合空间层（文档 / 采样权重 / 姿态求值），只给本作用。
 pub mod core;
 pub mod jump;
+/// 看向：把偏航 / 俯仰程序化地摊到脊椎链，叠在动画姿态之上。
+pub mod look;
 pub mod locomotion;
 pub mod mixers;
 
@@ -36,6 +40,7 @@ pub use driver::{AnimFocus, PoseDriver};
 pub use jump::JumpAction;
 /// 跳跃档位与调参表：服务端复用同一份（蓄力时长 / 离地速度两端必须同源）。
 pub use jump::{JumpKind, JumpPose, JumpProfile, JumpSettings, JumpTuning, JumpTunings};
+pub use look::{LookAt, LookSettings, LookState};
 // 联机远端姿态驱动要用（`net` 之外没有调用方）
 #[allow(unused_imports)]
 pub(crate) use driver::{Skeleton, build_skeleton};
@@ -76,6 +81,7 @@ impl Plugin for AnimPlugin {
             locomotion::LocomotionPlugin,
             jump::JumpPlugin,
             foot_ik::FootIkPlugin,
+            look::LookPlugin,
         ))
         .init_resource::<PoseDriver>()
         // 剪辑集合与步态元数据由动画系统持有，编辑器只负责往里改文档

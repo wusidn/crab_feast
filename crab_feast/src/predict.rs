@@ -25,7 +25,10 @@ use crab_feast_library::tuning;
 
 use crate::anim::{JumpAction, JumpSettings};
 use crate::camera::{CameraAnchor, CameraFacing};
-use crate::input::{EffectiveMove, FacingState, LocomotionIntent, MovementSettings, wrap_pi};
+use crate::input::{
+    EffectiveMove, FacingState, LocomotionIntent, MovementSettings, OrbitLock,
+    movement_view_forward, wrap_pi,
+};
 use crate::net_pose::PoseSmoothing;
 
 /// 本地预测的时间轴。
@@ -108,6 +111,9 @@ pub(crate) fn pred_velocity(
     // 不要为了一个可选输入把整个 App panic 掉
     effective: Option<Res<EffectiveMove>>,
     facing: Option<Res<CameraFacing>>,
+    // Ctrl 锁：预测和本地移动读同一个冻结基准，否则按住 Ctrl 时本地跑直线、
+    // 预测按新相机方向跑，和解每帧都在往回拽
+    orbit_lock: Option<Res<OrbitLock>>,
     settings: Option<Res<MovementSettings>>,
     jump_settings: Option<Res<JumpSettings>>,
     jump: Option<Res<JumpAction>>,
@@ -136,7 +142,7 @@ pub(crate) fn pred_velocity(
     let effective = *effective;
     let direction = if effective.is_active() {
         let local = effective.local_stick();
-        let forward = facing.view_forward();
+        let forward = movement_view_forward(&facing, orbit_lock.as_deref());
         let world = crab_feast_library::tuning::world_stick(
             forward.to_array(),
             [local.x, local.y],

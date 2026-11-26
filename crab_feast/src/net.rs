@@ -50,7 +50,8 @@ use crate::anim::{
 use crate::camera::CameraFacing;
 use crate::ground::foot_ground_dist;
 use crate::input::{
-    ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, wrap_pi,
+    ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, OrbitLock,
+    movement_view_forward, wrap_pi,
 };
 use crate::net_pose::{PoseSmoothing, apply_authoritative_pose, drive_net_animation, smooth_avatar_pose};
 use crate::predict::{
@@ -1280,6 +1281,8 @@ fn send_input(
     input: Res<MovementInput>,
     jump: Res<JumpInput>,
     facing: Res<CameraFacing>,
+    // Ctrl 锁：上行和本地移动用同一个冻结基准
+    orbit_lock: Option<Res<OrbitLock>>,
     time: Res<Time>,
     auto_walk: Option<ResMut<AutoWalk>>,
     action: Option<Res<JumpAction>>,
@@ -1344,8 +1347,9 @@ fn send_input(
         *last_level = jump;
     }
 
-    // 摇杆是相对相机的：往上推 = 屏幕深处 = 视线水平朝向
-    let forward = facing.view_forward();
+    // 摇杆是相对相机的：往上推 = 屏幕深处 = 视线水平朝向。
+    // 按住 Ctrl 时用冻结基准，和本地 `movement_system` 逐字一致
+    let forward = movement_view_forward(&facing, orbit_lock.as_deref());
     let world = Vec3::from_array(crab_feast_library::tuning::world_stick(
         forward.to_array(),
         [local.x, local.y],
