@@ -95,7 +95,10 @@ pub(crate) fn anchor_clock(
     };
     clock.tick = tick.0.wrapping_add(1);
     clock.anchored = true;
-    info!("predict: 上锚到服务端 tick {}，本地从 {} 开始", tick.0, clock.tick);
+    info!(
+        "predict: 上锚到服务端 tick {}，本地从 {} 开始",
+        tick.0, clock.tick
+    );
 }
 
 /// 每 tick 按输入推速度与朝向。
@@ -143,10 +146,7 @@ pub(crate) fn pred_velocity(
     let direction = if effective.is_active() {
         let local = effective.local_stick();
         let forward = movement_view_forward(&facing, orbit_lock.as_deref());
-        let world = crab_feast_library::tuning::world_stick(
-            forward.to_array(),
-            [local.x, local.y],
-        );
+        let world = crab_feast_library::tuning::world_stick(forward.to_array(), [local.x, local.y]);
         Vec2::new(world[0], world[2]).normalize_or_zero()
     } else {
         Vec2::ZERO
@@ -211,11 +211,8 @@ pub(crate) fn pred_velocity(
                 velocity.0.z = 0.0;
             } else {
                 // 档位同时进速度：只进动画不进速度，走档就是「腿在走、身子在冲刺」
-                let ground = tuning::ground_velocity_push(
-                    [direction.x, direction.y],
-                    pred.brake,
-                    push,
-                );
+                let ground =
+                    tuning::ground_velocity_push([direction.x, direction.y], pred.brake, push);
                 let stepped = tuning::ground_velocity_step(
                     [velocity.0.x, velocity.0.z],
                     ground,
@@ -225,7 +222,8 @@ pub(crate) fn pred_velocity(
                 velocity.0.x = stepped[0];
                 velocity.0.z = stepped[1];
             }
-        } else if air_steer_active(air_elapsed, air_steer_secs) && direction.length_squared() > 1e-6 {
+        } else if air_steer_active(air_elapsed, air_steer_secs) && direction.length_squared() > 1e-6
+        {
             // 滞空：保动量、限转向（同一份 `air_steer_velocity`，同一组旋钮）。
             // 加速度按档位缩放：单机用 `magnitude`、服务端用「dir 长度 × force」，
             // 这里是同一个量，轻推不会拿到满力度
@@ -281,7 +279,9 @@ pub(crate) fn pred_reconcile(
     )>,
 ) {
     let airborne = jump.as_ref().is_some_and(|jump| jump.is_airborne());
-    for (net_pos, net_tick, net_yaw, mut position, mut pred, mut smoothing, mut state) in &mut locals {
+    for (net_pos, net_tick, net_yaw, mut position, mut pred, mut smoothing, mut state) in
+        &mut locals
+    {
         if pred.seen && pred.last_tick == net_tick.0 {
             continue;
         }
@@ -366,7 +366,10 @@ mod tests {
         // 模拟 pred_reconcile 的软分支
         pred.vis = (pred.vis - delta).clamp_length_max(VIS_MAX);
         let shifted = before + delta;
-        assert!((shifted + pred.vis - before).length() < 1e-5, "校正那一帧画面被推动了");
+        assert!(
+            (shifted + pred.vis - before).length() < 1e-5,
+            "校正那一帧画面被推动了"
+        );
     }
 
     /// 预测端必须把「走档」原样带进动画轴，并且地速也跟着档位走。

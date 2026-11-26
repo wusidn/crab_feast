@@ -53,7 +53,9 @@ use crate::input::{
     ControlSet, FacingState, JumpInput, LocomotionIntent, MovementInput, OrbitLock,
     movement_view_forward, wrap_pi,
 };
-use crate::net_pose::{PoseSmoothing, apply_authoritative_pose, drive_net_animation, smooth_avatar_pose};
+use crate::net_pose::{
+    PoseSmoothing, apply_authoritative_pose, drive_net_animation, smooth_avatar_pose,
+};
 use crate::predict::{
     PredClock, Prediction, anchor_clock, pred_reconcile, pred_record, pred_render, pred_velocity,
 };
@@ -198,7 +200,10 @@ impl Plugin for NetPlugin {
                 .before(FootIkSet),
         )
         .add_systems(FixedUpdate, pred_velocity)
-        .add_systems(FixedPostUpdate, pred_record.after(PhysicsSystems::Writeback))
+        .add_systems(
+            FixedPostUpdate,
+            pred_record.after(PhysicsSystems::Writeback),
+        )
         .add_systems(
             Update,
             (
@@ -1355,7 +1360,10 @@ fn send_input(
         [local.x, local.y],
     ));
     if crab_feast_library::diag::log_enabled("CRAB_LOG_YAW") {
-        info!("uplink: auto={} local=({:.2},{:.2}) world=({:.2},{:.2}) fwd=({:.2},{:.2})", auto, local.x, local.y, world.x, world.z, forward.x, forward.z);
+        info!(
+            "uplink: auto={} local=({:.2},{:.2}) world=({:.2},{:.2}) fwd=({:.2},{:.2})",
+            auto, local.x, local.y, world.x, world.z, forward.x, forward.z
+        );
     }
     // 没有预测核 / 还没上锚时发 0，服务端退回「到达即生效」。
     // 上锚之后发的是**下一个要跑的 tick**：服务端把这条排进未来的那一 tick，

@@ -28,11 +28,11 @@ mod net;
 /// 复制快照的落地：位置直接对齐 + 本地动画参数。
 #[cfg(feature = "net")]
 mod net_pose;
+/// 移动端双指缩放：独立的触摸输入系统，只在触屏设备上跑。
+mod pinch;
 /// 本地预测核：60 Hz 自己推位移与朝向，快照只做校正。
 #[cfg(feature = "net")]
 mod predict;
-/// 移动端双指缩放：独立的触摸输入系统，只在触屏设备上跑。
-mod pinch;
 mod scene;
 mod session;
 mod settings;

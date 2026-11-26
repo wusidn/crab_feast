@@ -37,17 +37,15 @@ use crate::predict::Prediction;
 
 /// 踩实时允许的转速（度/秒）。
 ///
-/// **必须不小于本体的转身顶速**（`tuning::TURN_SPEED_DEG_PER_SEC = 90`）：小于它，
+/// **必须不小于本体的转身顶速**（`tuning::TURN_SPEED_DEG_PER_SEC = 120`）：小于它，
 /// 差值在支撑期里就会一路攒大，攒到 180° 时 `wrap_pi` 一翻就是「瞬间转一个大角度」，
 /// 再花一两秒慢慢追回来——这正是实机上看到的那个形状。
 ///
-/// 取 95 而不是 130：脚在支撑期里是钉在世界上的，本体每转一度，踝就要被拽着
-/// 走 `半径 × 1°`。130°/s × 0.3s × 身侧 12cm = 8.2cm 的弧，单机那条路径
-/// （`facing_system` 顶速 90°/s）只有 5.6cm —— 联机比单机多 44% 的拉拽，
-/// 这是「转弯时脚被拉扯 / 松手就滑步」的来源。95 只比本体快一点点，既能
-/// 永远跟住、不把差值攒到翻面，支撑期里的弧又回到单机的量级；真要更快，
+/// 取 125 而不是 180：脚在支撑期里是钉在世界上的，本体每转一度，踝就要被拽着
+/// 走 `半径 × 1°`。125°/s × 0.3s × 身侧 12cm ≈ 4.5cm 的弧，单机那条路径
+/// （`facing_system` 顶速 120°/s）是 4.3cm —— 两边基本持平。真要更快，
 /// 快的那一段交给抬脚窗口（[`SWING_DEG_PER_SEC`]）
-const PLANTED_DEG_PER_SEC: f32 = 95.0;
+const PLANTED_DEG_PER_SEC: f32 = 125.0;
 /// 有一只脚离地（换步窗口）允许的转速：把这一步该转的角度追回来
 const SWING_DEG_PER_SEC: f32 = 300.0;
 /// 腾空（跳跃）：没有地面反力，几乎不许转
@@ -103,15 +101,18 @@ pub(crate) fn follow_visual_yaw(
     // 支撑期的判据要 `LocomotionIntent`：它挂在**角色**身上（模型上没有），
     // 所以和本体一起取，别让模型实体多背一个组件
     locals: Query<(&Transform, &FacingState, &LocomotionIntent), With<Prediction>>,
-    mut models: Query<(
-        Entity,
-        &ChildOf,
-        &mut Transform,
-        Option<&mut VisualYaw>,
-        Option<&FootIk>,
-    // 模型一定不是本体（本体挂 `Prediction`）：这样两个 `Transform` 查询才是
-    // 互斥的，否则 Bevy 会在第一次跑这个系统时直接 panic（B0001）
-    ), (With<AnimModelRoot>, Without<Prediction>)>,
+    mut models: Query<
+        (
+            Entity,
+            &ChildOf,
+            &mut Transform,
+            Option<&mut VisualYaw>,
+            Option<&FootIk>,
+            // 模型一定不是本体（本体挂 `Prediction`）：这样两个 `Transform` 查询才是
+            // 互斥的，否则 Bevy 会在第一次跑这个系统时直接 panic（B0001）
+        ),
+        (With<AnimModelRoot>, Without<Prediction>),
+    >,
 ) {
     let dt = time.delta_secs();
     let airborne = jump.as_ref().is_some_and(|jump| jump.is_airborne());
@@ -263,6 +264,8 @@ mod tests {
         planted.init = true;
         let mut swing = VisualYaw::default();
         swing.init = true;
+        // 本体在这个窗口里该走过的角：顶速 × 0.15 s（支撑期量级）
+        let body_deg = crab_feast_library::tuning::TURN_SPEED_DEG_PER_SEC * 0.15;
         // 一个换步窗口量级的时长：0.15 s
         for _ in 0..9 {
             planted.advance(deg(120.0), PLANTED_DEG_PER_SEC, dt);
@@ -270,10 +273,13 @@ mod tests {
         }
         let p = planted.yaw.to_degrees().abs();
         let s = swing.yaw.to_degrees().abs();
-        // 第一段还带着角加速度的爬坡（2000°/s² 爬到 95°/s 要 0.05 s，吃掉不到 1°），
+        // 第一段还带着角加速度的爬坡（2000°/s² 爬到 125°/s 要 0.06 s，吃掉不到 1°），
         // 允许它比本体少一点点
-        assert!(p >= 12.0, "踩实档 0.15 s 只转了 {p:.1}°，跟不上本体的 13.5°");
-        // 坡爬满之后的第二段才看「跟不跟得住」：本体 90°/s × 0.15 = 13.5°，
+        assert!(
+            p >= body_deg * 0.9,
+            "踩实档 0.15 s 只转了 {p:.1}°，跟不上本体的 {body_deg:.1}°"
+        );
+        // 坡爬满之后的第二段才看「跟不跟得住」：本体 120°/s × 0.15 = 18°，
         // 踩实档这时已经是稳态转速，必须不落后
         let yaw0 = planted.yaw;
         for _ in 0..9 {
@@ -281,10 +287,13 @@ mod tests {
         }
         let steady = (planted.yaw - yaw0).to_degrees().abs();
         assert!(
-            steady >= 13.5 - 1e-2,
-            "踩实档稳态 0.15 s 只转了 {steady:.2}°，跟不上本体的 13.5°（差值会攒到翻面）"
+            steady >= body_deg - 1e-2,
+            "踩实档稳态 0.15 s 只转了 {steady:.2}°，跟不上本体的 {body_deg:.1}°（差值会攒到翻面）"
         );
-        assert!(s > p * 1.4, "0.15 s 内踩实 {p:.1}°，换步 {s:.1}°，档位没拉开");
+        assert!(
+            s > p * 1.4,
+            "0.15 s 内踩实 {p:.1}°，换步 {s:.1}°，档位没拉开"
+        );
         assert!(s > 15.0, "换步窗口只转了 {s:.1}°，追不回来");
     }
 
@@ -394,14 +403,14 @@ mod tests {
         );
     }
 
-    /// 稳态不许落后：本体以 90°/s 匀速转，视觉朝向必须跟住（误差 < 1°）。
+    /// 稳态不许落后：本体以顶速（120°/s）匀速转，视觉朝向必须跟住（误差 < 1°）。
     ///
     /// 这是「腿扭到一个奇怪的角度」的回归测试：按误差取速的旧实现会稳定落后
-    /// `90 ÷ 8 ≈ 11°`，那 11° 进混合空间的 yaw 轴就是横移剪辑
+    /// `顶速 ÷ 8 ≈ 15°`，那 15° 进混合空间的 yaw 轴就是横移剪辑
     #[test]
     fn tracks_the_interpolated_yaw_without_a_steady_lag() {
         let dt = 1.0 / 60.0;
-        let rate = 90.0f32;
+        let rate = crab_feast_library::tuning::TURN_SPEED_DEG_PER_SEC;
         let mut visual = VisualYaw::default();
         visual.init = true;
         // 先跑一秒把任何瞬态吃掉
@@ -411,7 +420,7 @@ mod tests {
             visual.advance(body, PLANTED_DEG_PER_SEC, dt);
         }
         let lag = wrap_pi(body - visual.yaw).to_degrees().abs();
-        assert!(lag < 1.0, "稳态落后 {lag:.2}°（90°/s 直行转身）");
+        assert!(lag < 1.0, "稳态落后 {lag:.2}°（{rate:.0}°/s 直行转身）");
     }
 
     /// 差值写回必须是「视觉 = 本体 + 本地」：本地旋转写错，模型会整体偏一个角

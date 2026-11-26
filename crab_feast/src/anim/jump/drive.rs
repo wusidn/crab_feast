@@ -52,12 +52,8 @@ pub(super) fn latch_jump_request(input: Res<JumpInput>, mut action: ResMut<JumpA
 /// 本地角色查询：实体 + 移动意向。
 ///
 /// 意向并进这条查询是为了压住系统参数上限（Bevy 最多 16 个参数）。
-type LocalAvatarQuery<'w, 's> = Query<
-    'w,
-    's,
-    (Entity, Option<&'static LocomotionIntent>),
-    With<Avatar>,
->;
+type LocalAvatarQuery<'w, 's> =
+    Query<'w, 's, (Entity, Option<&'static LocomotionIntent>), With<Avatar>>;
 
 /// 状态机 + 时间轴 + 垂直位移。跑在 `AnimationSet::Drive`，晚于移动/朝向。
 #[allow(clippy::too_many_arguments)]
@@ -365,9 +361,9 @@ pub(super) fn drive_jump(
                 // 预测端的刚体是 Dynamic（自己积分），但它同样属于联机：起跳速度
                 // 仍要取服务端那一档，否则客户端跳得比服务端高一截
                 let net_mode = kinematic
-                    || mode
-                        .as_deref()
-                        .is_some_and(|mode| matches!(mode, crate::state::SessionMode::Online { .. }));
+                    || mode.as_deref().is_some_and(|mode| {
+                        matches!(mode, crate::state::SessionMode::Online { .. })
+                    });
                 // 实测速度只用来「抬高」：贴地时接触求解会留下 ±0.2 m/s 的噪声，
                 // 按它起跳只能升两三厘米，表现就是「按了跳、人只抬了一下」。
                 // 联网 / 预测端直接用服务端同一份离地速度，不能按实测抬（会越抬越高）。

@@ -12,7 +12,10 @@ use std::{
 
 use super::core::{ClipMeta, ClipSet};
 use super::driver::PoseDriver;
-use crate::{GameState, scene::{Avatar, AvatarYaw}};
+use crate::{
+    GameState,
+    scene::{Avatar, AvatarYaw},
+};
 use bevy::{app::AnimationSystems, prelude::*, transform::TransformSystems};
 
 pub struct CharacterPlugin;

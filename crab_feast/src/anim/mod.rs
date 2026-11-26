@@ -19,9 +19,9 @@ pub mod character;
 /// 与具体作品无关的混合空间层（文档 / 采样权重 / 姿态求值），只给本作用。
 pub mod core;
 pub mod jump;
+pub mod locomotion;
 /// 看向：把偏航 / 俯仰程序化地摊到脊椎链，叠在动画姿态之上。
 pub mod look;
-pub mod locomotion;
 pub mod mixers;
 
 pub(crate) mod driver;
@@ -49,10 +49,10 @@ pub(crate) use driver::{Skeleton, build_skeleton};
 pub use foot_ik::FootIk;
 pub use locomotion::VisualYaw;
 // 联机远端角色要自己往 `FootIk` 里写支撑权重/静止判据，还得排到 IK 前面
+pub(crate) use character::AnimModelRoot;
 pub use foot_ik::FootIkSettings;
 #[allow(unused_imports)]
 pub(crate) use foot_ik::{FootIkSet, FootIkTarget};
-pub(crate) use character::AnimModelRoot;
 pub use mixers::{MixerCache, MixerEdit, load_space_doc, save_space_doc};
 
 pub(crate) use self::core::ClipSet;

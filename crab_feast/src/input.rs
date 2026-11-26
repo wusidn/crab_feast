@@ -633,8 +633,12 @@ fn movement_system(
     let dt = time.delta_secs();
     let effective = *effective;
     if crab_feast_library::diag::log_enabled("CRAB_LOG_SPEED") {
-        info!("speed/frame: active={} airborne={} dt={:.3}",
-            effective.is_active(), airborne, dt);
+        info!(
+            "speed/frame: active={} airborne={} dt={:.3}",
+            effective.is_active(),
+            airborne,
+            dt
+        );
     }
     let Some((target_angle, magnitude)) = effective
         .is_active()
@@ -687,8 +691,15 @@ fn movement_system(
     if crab_feast_library::diag::log_enabled("CRAB_LOG_YAW") {
         info!(
             "dir-input: cam_yaw={:.1} fwd=({:.2},{:.2},{:.2}) stick=({:.2},{:.2}) world=({:.2},{:.2},{:.2})",
-            camera.yaw.to_degrees(), forward.x, forward.y, forward.z,
-            smoothed_local.x, smoothed_local.y, direction.x, direction.y, direction.z
+            camera.yaw.to_degrees(),
+            forward.x,
+            forward.y,
+            forward.z,
+            smoothed_local.x,
+            smoothed_local.y,
+            direction.x,
+            direction.y,
+            direction.z
         );
     }
     // 档位量级**不过滤波器**：它是「起步加速」的手感，和转向是两个旋钮，
@@ -699,7 +710,8 @@ fn movement_system(
     // 排在移动之后）。16ms 的滞后在 90°/s 的转速下是 1.5°，对曲线没有影响。
     // 单机、预测端、服务端用同一个函数（服务端见 `launcher/server/src/main.rs`），
     // 一端降速另一端不降，和解系统会一直把预测位置往回拽。
-    for (mut velocity, movement_controller, mut intent, facing, pos, mut ramp) in movers.iter_mut() {
+    for (mut velocity, movement_controller, mut intent, facing, pos, mut ramp) in movers.iter_mut()
+    {
         // 意向先写：空中也照样写，身体朝向由 `facing_system` 按它转
         // （空中转速已经被 `AIR_TURN` 压过，能转但转不快）
         intent.direction = direction;
@@ -751,8 +763,19 @@ fn movement_system(
             let err = facing.map_or(0.0, |f| f.error_deg);
             let yaw = facing.map_or(0.0, |f| f.yaw.to_degrees());
             let py = pos.map_or(0.0, |p| p.0.y);
-            info!("speed: yaw={:.1}° ctrl={:.2} ramp={:.2} err={:.1} y={:.3} vy={:.2} target=({:.2},{:.2}) vel=({:.2},{:.2})",
-                yaw, movement_controller.speed, ramp.0, err, py, velocity.0.y, target.x, target.z, velocity.0.x, velocity.0.z);
+            info!(
+                "speed: yaw={:.1}° ctrl={:.2} ramp={:.2} err={:.1} y={:.3} vy={:.2} target=({:.2},{:.2}) vel=({:.2},{:.2})",
+                yaw,
+                movement_controller.speed,
+                ramp.0,
+                err,
+                py,
+                velocity.0.y,
+                target.x,
+                target.z,
+                velocity.0.x,
+                velocity.0.z
+            );
         }
         let stepped = crab_feast_library::tuning::ground_velocity_step(
             [velocity.0.x, velocity.0.z],
@@ -1163,13 +1186,10 @@ fn look_system(
     // 按住 Ctrl：在**积分的那一刻**就把累计角夹住（取 min/max），不是等一帧
     // 之后再纠正。否则 `CameraSet::Place` 已经按越界值摆过机位，玩家会看到
     // 「先冲过去、再被拽回来」的橡皮筋，而这里是一到边界就原地不动。
-    let hold_range = lock
-        .as_deref()
-        .filter(|lock| lock.held)
-        .map(|lock| {
-            let limit = ORBIT_HOLD_YAW_LIMIT_DEG.to_radians();
-            (lock.yaw - limit, lock.yaw + limit)
-        });
+    let hold_range = lock.as_deref().filter(|lock| lock.held).map(|lock| {
+        let limit = ORBIT_HOLD_YAW_LIMIT_DEG.to_radians();
+        (lock.yaw - limit, lock.yaw + limit)
+    });
 
     look_controllers
         .iter_mut()
@@ -1178,8 +1198,10 @@ fn look_system(
 
             match look_controller.axis {
                 LookAxis::Yaw => {
-                    look_controller.accumulated_yaw =
-                        clamp_hold_yaw(look_controller.accumulated_yaw - input.x * rotate_speed, hold_range);
+                    look_controller.accumulated_yaw = clamp_hold_yaw(
+                        look_controller.accumulated_yaw - input.x * rotate_speed,
+                        hold_range,
+                    );
                 }
                 LookAxis::Pitch => {
                     look_controller.accumulated_pitch = (look_controller.accumulated_pitch
@@ -1187,8 +1209,10 @@ fn look_system(
                         .clamp(-max_pitch, max_pitch);
                 }
                 LookAxis::YawAndPitch => {
-                    look_controller.accumulated_yaw =
-                        clamp_hold_yaw(look_controller.accumulated_yaw - input.x * rotate_speed, hold_range);
+                    look_controller.accumulated_yaw = clamp_hold_yaw(
+                        look_controller.accumulated_yaw - input.x * rotate_speed,
+                        hold_range,
+                    );
                     look_controller.accumulated_pitch = (look_controller.accumulated_pitch
                         + input.y * rotate_speed)
                         .clamp(-max_pitch, max_pitch);
@@ -2158,7 +2182,12 @@ mod tests {
                 .unwrap()
                 .accumulated_yaw = yaw;
         };
-        let get = |app: &App| app.world().get::<LookController>(camera).unwrap().accumulated_yaw;
+        let get = |app: &App| {
+            app.world()
+                .get::<LookController>(camera)
+                .unwrap()
+                .accumulated_yaw
+        };
 
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -2169,7 +2198,11 @@ mod tests {
         // 界内（57°）：原样保留
         set(&mut app, 1.0);
         app.update();
-        assert!((get(&app) - 1.0).abs() < 1e-6, "界内被改动了：{}", get(&app));
+        assert!(
+            (get(&app) - 1.0).abs() < 1e-6,
+            "界内被改动了：{}",
+            get(&app)
+        );
 
         // 往左拖过 160°：停在 160°
         set(&mut app, 3.02); // ≈173°
@@ -2183,7 +2216,11 @@ mod tests {
         // 往右拖过 160°：停在 -160°
         set(&mut app, -3.02);
         app.update();
-        assert!((get(&app) + limit).abs() < 1e-5, "右侧没有夹住：{}", get(&app));
+        assert!(
+            (get(&app) + limit).abs() < 1e-5,
+            "右侧没有夹住：{}",
+            get(&app)
+        );
 
         // 松开 Ctrl：恢复自由绕，不再夹
         app.world_mut()
@@ -2202,7 +2239,11 @@ mod tests {
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::ControlLeft);
         app.update();
-        assert!((get(&app) - 3.02).abs() < 1e-6, "按下瞬间跳了：{}", get(&app));
+        assert!(
+            (get(&app) - 3.02).abs() < 1e-6,
+            "按下瞬间跳了：{}",
+            get(&app)
+        );
     }
 
     /// 输入侧：一次拖动越界时，累计角**当场**就停在边界，不会先冲过去再被拽回。
@@ -2290,4 +2331,3 @@ mod tests {
         assert!((app.world().resource::<OrbitLock>().yaw + 1.1).abs() < 1e-6);
     }
 }
-

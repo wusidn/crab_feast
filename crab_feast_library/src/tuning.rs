@@ -14,13 +14,19 @@ pub const MOVE_SPEED_MPS: f32 = 3.0;
 
 /// 最大转向角速度（度/秒）。
 ///
-/// 180°/s：180° 反向 1.26 秒、90° 0.6 秒。
+/// 120°/s：180° 反向约 1.7 秒（0.17 秒起步段走 10°、末段 12° 进比例收尾）。
 ///
-/// 历史值：90°/s、350°/s² → 180° 要 2.2 秒。这个「有重量」的节奏在实机上被判定
+/// 2026-11-26 从 90 抬到 120，做手感试验档。选 120 而不是 180 的理由是**脚**：
+/// 一段支撑约 0.15 s，120°/s 只要 18°，而 `FootYawLock` 一段支撑最多攥住
+/// `foot_yaw_limit`（30°，踝 12 + 绕前掌 18）——还剩 12° 余量，支撑稍长、
+/// support 低通过头都不会滑；180°/s 是 27°/stance，余量只剩 3°，站立 pivot
+/// 那种没有步态门控的段落会把脚拖着走。
+///
+/// 历史值：90°/s、700°/s² → 180° 要 2.2 秒。这个「有重量」的节奏在实机上被判定
 /// 成「转身时人像在原地打转、看着抖」——真机每帧都在转、但用户几乎转两秒才到位，
 /// 中间还压着降速地板，看起来就是原地打摆子。调快顶速后转身一次到位，抖动消失。
 /// 30°/s、120°/s² → 6.1 秒（太沉，已否决）；450°/s、3000°/s² → 0.63 秒（观感偏假）。
-pub const TURN_SPEED_DEG_PER_SEC: f32 = 90.0;
+pub const TURN_SPEED_DEG_PER_SEC: f32 = 120.0;
 
 /// 最大转向角加速度（度/秒²）。
 ///
@@ -445,15 +451,15 @@ mod tests {
         (secs, first)
     }
 
-    /// 手感就是这个数：顶速 90°/s 下 180° 反向约 2.1 秒、90° 约 1.1 秒
-    ///（顶速曾经是 180°/s，那时是 1.13 / 0.6 秒；`8ad151f` 按真机观感降到了 90）。
+    /// 手感就是这个数：顶速 120°/s 下 180° 反向约 1.6 秒、90° 约 0.95 秒
+    ///（顶速曾经是 90°/s，那时是 2.1 / 1.1 秒；再往前是 180°/s 的 1.13 / 0.6 秒）。
     /// 顶速没被吃掉（一下子转过去）或加速度丢了（第一帧就满速）都在这里露出来。
     #[test]
     fn reversal_takes_the_designed_time() {
         let (reversal, first) = turn_seconds(180.0, 1.0 / 60.0);
-        assert!((1.9..2.35).contains(&reversal), "180° 用了 {reversal}s");
+        assert!((1.45..1.85).contains(&reversal), "180° 用了 {reversal}s");
         assert!(
-            (0.9..1.3).contains(&turn_seconds(90.0, 1.0 / 60.0).0),
+            (0.8..1.1).contains(&turn_seconds(90.0, 1.0 / 60.0).0),
             "90° 用得太久/太快"
         );
         // 起步段受加速度限制：60 Hz 第一帧只该走 350°/s² × dt² ≈ 0.1°，不是 1.5°
@@ -511,7 +517,10 @@ mod tests {
         assert_eq!(turn_speed_scale(0.0), 1.0);
         // 玩家要求：120° 以内不减速（含 120 本身）
         let quiet = TURN_BRAKE_START_DEG_DEFAULT - TURN_BRAKE_BAND_DEG;
-        assert!((quiet - 120.0).abs() < 1e-4, "不减速区该到 120°，实测 {quiet}");
+        assert!(
+            (quiet - 120.0).abs() < 1e-4,
+            "不减速区该到 120°，实测 {quiet}"
+        );
         for deg in [0.0, 30.0, 60.0, 90.0, 110.0, 119.0, 120.0] {
             assert_eq!(turn_speed_scale(deg), 1.0, "{deg}° 不该减速");
         }
@@ -608,10 +617,7 @@ mod tests {
         for _ in 0..5 {
             v = ground_velocity_step(v, [0.0, MOVE_SPEED_MPS], REVERSE_ACCEL_MPS2, dt);
         }
-        assert!(
-            v[1] > MOVE_SPEED_MPS * 0.99,
-            "起步 0.083s 该到顶速：{v:?}"
-        );
+        assert!(v[1] > MOVE_SPEED_MPS * 0.99, "起步 0.083s 该到顶速：{v:?}");
         let v = ground_velocity_step(
             [0.0, MOVE_SPEED_MPS],
             [0.0, MOVE_SPEED_MPS],
@@ -625,8 +631,14 @@ mod tests {
     #[test]
     fn wide_turn_keeps_its_speed() {
         let dt = 1.0 / 60.0;
-        let left = [MOVE_SPEED_MPS * (-45f32).to_radians().sin(), MOVE_SPEED_MPS * 45f32.to_radians().cos()];
-        let right = [MOVE_SPEED_MPS * 45f32.to_radians().sin(), MOVE_SPEED_MPS * 45f32.to_radians().cos()];
+        let left = [
+            MOVE_SPEED_MPS * (-45f32).to_radians().sin(),
+            MOVE_SPEED_MPS * 45f32.to_radians().cos(),
+        ];
+        let right = [
+            MOVE_SPEED_MPS * 45f32.to_radians().sin(),
+            MOVE_SPEED_MPS * 45f32.to_radians().cos(),
+        ];
         let mut v = left;
         let mut min_speed = MOVE_SPEED_MPS;
         let mut ticks = 0;
@@ -759,11 +771,8 @@ mod tests {
         let mut floor_at = None;
         for _ in 0..600 {
             let error = wrap_pi(std::f32::consts::PI - yaw);
-            let target = turn_speed_scale_with(
-                error.to_degrees(),
-                TURN_BRAKE_START_DEG_DEFAULT,
-                floor,
-            );
+            let target =
+                turn_speed_scale_with(error.to_degrees(), TURN_BRAKE_START_DEG_DEFAULT, floor);
             scale = ramp_turn_brake(scale, target, rate, dt);
             if floor_at.is_none() && scale <= floor + 1e-4 {
                 floor_at = Some(secs);

@@ -568,7 +568,9 @@ impl FootLock {
         let anim_gate = if !gate_applies {
             1.0
         } else {
-            STANDING_CREEP.max(smoothstep((self.anim_speed / ANIM_STILL_SPAN).clamp(0.0, 1.0)))
+            STANDING_CREEP.max(smoothstep(
+                (self.anim_speed / ANIM_STILL_SPAN).clamp(0.0, 1.0),
+            ))
         };
         let mut progress = advance_progress(self.progress, want, dt * anim_gate, secs);
         // 离地后还残差 = 把脚横向拖回去。这个速度必须**跟着动画自己挪脚**：
@@ -583,7 +585,8 @@ impl FootLock {
         if enabled && !self.planted {
             let residue = self.residual.length();
             if residue > BIG_DEBT && self.anim_peak > FAST_PACE {
-                let budget = (self.anim_peak * dt.max(0.0) * RELEASE_GAIN / residue).clamp(0.0, 1.0);
+                let budget =
+                    (self.anim_peak * dt.max(0.0) * RELEASE_GAIN / residue).clamp(0.0, 1.0);
                 let newest = (smoothstep(progress) - budget).max(0.0);
                 if newest < self.strength {
                     progress = progress.min(inverse_smoothstep(newest));
@@ -796,7 +799,10 @@ mod tests {
             if pin > 0.5 {
                 assert!(ball_drift < 2e-3, "球被扫走了 {ball_drift:.4}m");
             } else {
-                assert!(ball_drift > 2e-2, "旧行为下球本来就该被扫走，实际 {ball_drift:.4}m");
+                assert!(
+                    ball_drift > 2e-2,
+                    "旧行为下球本来就该被扫走，实际 {ball_drift:.4}m"
+                );
             }
         }
     }

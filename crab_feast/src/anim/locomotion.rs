@@ -104,10 +104,7 @@ impl Plugin for LocomotionPlugin {
 /// 这一步是「预览里看到的档位」与「游戏里跑出来的速度」对齐的关键：
 /// 走 / 跑 / 侧向的快慢全由剪辑自己的净步幅与时长决定，改采样点位置就等于改移速，
 /// 不需要在代码里再维护一套走路速度、跑步速度。
-fn sync_move_speed(
-    driver: Res<PoseDriver>,
-    mut controllers: Query<&mut MovementController>,
-) {
+fn sync_move_speed(driver: Res<PoseDriver>, mut controllers: Query<&mut MovementController>) {
     // 还没求值过（模型未就绪）就保留默认值；预览单条剪辑时混合空间仍然在求值，
     // 地速依旧新鲜，角色不会停在最后一个档位上滑走
     if !driver.evaluated {
@@ -250,10 +247,7 @@ fn drive_locomotion(
 ///
 /// 联机角色由服务端快照搬位置，物理线速度恒为 0（`Kinematic` 的组件 Avian 不写），
 /// 所以有 [`PlanarMotion`] 就以它为准；单机角色没有这个组件，照旧读物理速度。
-fn planar_displacement(
-    velocity: Option<&LinearVelocity>,
-    measured: Option<&PlanarMotion>,
-) -> Vec2 {
+fn planar_displacement(velocity: Option<&LinearVelocity>, measured: Option<&PlanarMotion>) -> Vec2 {
     match measured {
         Some(measured) => measured.0,
         None => velocity
@@ -263,7 +257,8 @@ fn planar_displacement(
 }
 
 /// 角度归一到 (-180, 180]
-fn wrap_deg(deg: f32) -> f32 {    (deg + 180.0).rem_euclid(360.0) - 180.0
+fn wrap_deg(deg: f32) -> f32 {
+    (deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
 /// 按最短弧限速：跨 ±180 时不绕远路

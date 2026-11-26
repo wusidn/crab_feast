@@ -404,7 +404,8 @@ fn step_rate_from_delta(
 
 /// 物理步频分级：每秒固定步数应接近 60。
 #[cfg_attr(not(feature = "net"), allow(dead_code))]
-fn classify_step_rate(steps_per_sec: f32) -> (DiagnosticStatus, String) {    let target = 1.0 / FIXED_DT;
+fn classify_step_rate(steps_per_sec: f32) -> (DiagnosticStatus, String) {
+    let target = 1.0 / FIXED_DT;
     let dev = (steps_per_sec - target).abs();
     if steps_per_sec <= f32::EPSILON {
         (DiagnosticStatus::Warn, "本秒没有物理步".to_string())
@@ -432,7 +433,10 @@ impl Plugin for DiagnosticsPlugin {
             // 物理步计数：挂在固定步长调度上，每个物理 tick 自增 1。步频直接数这个
             // 累加器，不再从 `DriftDiag.steps`（历史累计计数）反推，避免累计量泄漏进 Hz。
             .add_systems(bevy::app::FixedPostUpdate, count_physics_step)
-            .add_systems(Update, collect_diagnostics.run_if(in_state(crate::GameState::Game)));
+            .add_systems(
+                Update,
+                collect_diagnostics.run_if(in_state(crate::GameState::Game)),
+            );
     }
 }
 
@@ -523,7 +527,10 @@ impl Sample {
         if !rows.is_empty() {
             sample.ik_count = rows.len();
             sample.ik_avg_blend = Some(
-                rows.iter().map(|(_, _, _, blend, _, _)| *blend).sum::<f32>() / rows.len() as f32,
+                rows.iter()
+                    .map(|(_, _, _, blend, _, _)| *blend)
+                    .sum::<f32>()
+                    / rows.len() as f32,
             );
             let mut cache = world.resource_mut::<IkStepCache>();
             let mut best: Option<(f32, f32, f32)> = None;
@@ -592,8 +599,12 @@ fn collect_diagnostics(world: &mut World) {
     #[cfg(feature = "net")]
     apply_net_side(&sample, &mut diag, dt);
     #[cfg(not(feature = "net"))]
-    for id in [DiagnosticRowId::NetSnapshot, DiagnosticRowId::PhysicsStepRate] {
-        diag.row_mut(id).set(DiagnosticStatus::Offline, "—", "非联机构建不参与", "");
+    for id in [
+        DiagnosticRowId::NetSnapshot,
+        DiagnosticRowId::PhysicsStepRate,
+    ] {
+        diag.row_mut(id)
+            .set(DiagnosticStatus::Offline, "—", "非联机构建不参与", "");
     }
 
     apply_common_side(&sample, &mut diag, dt);
@@ -785,12 +796,9 @@ fn apply_net_side(sample: &Sample, diag: &mut Diagnostics, dt: f32) {
             "还没收到本地角色的 NetPos",
             "",
         ),
-        Some(still) if still > 0.5 => net_row.set(
-            DiagnosticStatus::Ok,
-            "静止",
-            "最近 0.5 s 位置没有变化",
-            "",
-        ),
+        Some(still) if still > 0.5 => {
+            net_row.set(DiagnosticStatus::Ok, "静止", "最近 0.5 s 位置没有变化", "")
+        }
         Some(_) => {
             let interval = meter.interval_ms;
             // 阈值放宽到 40 ms（25Hz）以下都算正常：60Hz 服务端的实际间隔会在
@@ -803,9 +811,7 @@ fn apply_net_side(sample: &Sample, diag: &mut Diagnostics, dt: f32) {
                 DiagnosticStatus::Ok
             };
             let reason = match status {
-                DiagnosticStatus::Bad => format!(
-                    "快照 {interval:.0} ms 一次，位移会出现明显台阶"
-                ),
+                DiagnosticStatus::Bad => format!("快照 {interval:.0} ms 一次，位移会出现明显台阶"),
                 DiagnosticStatus::Warn => format!("快照 {interval:.0} ms 一次，偏慢"),
                 _ => String::new(),
             };

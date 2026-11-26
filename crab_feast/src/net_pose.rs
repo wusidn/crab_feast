@@ -267,10 +267,7 @@ impl PoseSmoothing {
         } else {
             ((at - a.rel) / span).clamp(0.0, 1.0)
         };
-        Some((
-            a.pos.lerp(b.pos, alpha),
-            lerp_yaw(a.yaw, b.yaw, alpha),
-        ))
+        Some((a.pos.lerp(b.pos, alpha), lerp_yaw(a.yaw, b.yaw, alpha)))
     }
 }
 
@@ -496,7 +493,10 @@ mod tests {
         assert!(jump < 0.12, "卡顿帧位移 {jump}，等于瞬移两格：{shown:?}");
         // 卡完之后几帧内回到正常步长（时钟只被夹到最新，不欠账）
         let after = shown[35] - shown[34];
-        assert!((after - 0.05).abs() < 0.01, "恢复后步长 {after} 未回到 5 cm");
+        assert!(
+            (after - 0.05).abs() < 0.01,
+            "恢复后步长 {after} 未回到 5 cm"
+        );
     }
 
     /// 服务端 60 Hz 匀速发布，`delay(published)` 给出该快照的额外传输延迟；
@@ -614,7 +614,10 @@ mod tests {
             let offset = step as f32 * 0.5;
             let deficit = lag + offset;
             let warp = lag_warp(deficit, lag);
-            assert!(warp.abs() <= TIME_WARP + 1e-6, "deficit {deficit} 伸缩 {warp}");
+            assert!(
+                warp.abs() <= TIME_WARP + 1e-6,
+                "deficit {deficit} 伸缩 {warp}"
+            );
             if offset.abs() <= LAG_DEAD_BAND {
                 assert!(warp.abs() < 1e-6, "死区里不该出手：{deficit} → {warp}");
             }
@@ -623,7 +626,8 @@ mod tests {
 
     /// 同一份快照被渲染帧重复喂进来（120 Hz 屏 / 60 Hz 快照）：不许打断插值。
     #[test]
-    fn duplicate_snapshots_are_ignored() {        let dt = 1.0 / 120.0;
+    fn duplicate_snapshots_are_ignored() {
+        let dt = 1.0 / 120.0;
         let mut smoothing = PoseSmoothing::default();
         let mut shown = Vec::new();
         for frame in 0..120u32 {
@@ -693,7 +697,10 @@ mod tests {
         }
         for tick in 0..5u32 {
             let (pos, _) = smoothing.sample_at(tick).expect("有历史就该查得到");
-            assert!((pos.x - 0.05 * tick as f32).abs() < 1e-5, "tick {tick} 查到 {pos:?}");
+            assert!(
+                (pos.x - 0.05 * tick as f32).abs() < 1e-5,
+                "tick {tick} 查到 {pos:?}"
+            );
         }
         // 超出历史范围：宁可不修，也不许拿错帧
         assert!(smoothing.sample_at(900).is_none());
@@ -710,7 +717,10 @@ mod tests {
         let (p1, y1) = smoothing.sample_at(1).unwrap();
         assert!((p0 - Vec3::new(0.2, 0.0, -0.1)).length() < 1e-5);
         assert!((p1 - Vec3::new(0.25, 0.0, -0.1)).length() < 1e-5);
-        assert!((y0 - 0.3).abs() < 1e-5 && (y1 - 0.4).abs() < 1e-5, "{y0} {y1}");
+        assert!(
+            (y0 - 0.3).abs() < 1e-5 && (y1 - 0.4).abs() < 1e-5,
+            "{y0} {y1}"
+        );
     }
 
     /// 朝向插值走最短一边：跨 ±180° 不许绕远路。

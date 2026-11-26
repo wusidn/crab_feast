@@ -725,7 +725,13 @@ fn group_limits(slots: &[LookSlot], settings: &LookSettings) -> GroupLimits {
         }
     }
 
-    let ratio = |part: f32, whole: f32| if whole > f32::EPSILON { part / whole } else { 0.0 };
+    let ratio = |part: f32, whole: f32| {
+        if whole > f32::EPSILON {
+            part / whole
+        } else {
+            0.0
+        }
+    };
     GroupLimits {
         spine_yaw_ratio: ratio(spine_yaw, spine_yaw + cervical_yaw),
         spine_pitch_ratio: ratio(spine_pitch, spine_pitch + cervical_pitch),
@@ -1053,11 +1059,7 @@ mod tests {
         // `FacingState` 是角色身上的组件（取第一个角色），这里和模型放同一个实体
         let model = app
             .world_mut()
-            .spawn((
-                AnimModelRoot,
-                FacingState::default(),
-                LookAt::default(),
-            ))
+            .spawn((AnimModelRoot, FacingState::default(), LookAt::default()))
             .id();
         app.update();
         assert_eq!(
@@ -1182,9 +1184,7 @@ mod tests {
 
         bones
             .into_iter()
-            .map(|(kind, entity)| {
-                (kind, app.world().get::<Transform>(entity).unwrap().rotation)
-            })
+            .map(|(kind, entity)| (kind, app.world().get::<Transform>(entity).unwrap().rotation))
             .collect()
     }
 
@@ -1204,10 +1204,7 @@ mod tests {
         }
         // 每一节都要真的参与，不能只有脖子在动
         for (kind, yaw, _) in &bones {
-            assert!(
-                yaw.abs() > 0.5,
-                "{kind:?} 只转了 {yaw}°，脊柱链没参与"
-            );
+            assert!(yaw.abs() > 0.5, "{kind:?} 只转了 {yaw}°，脊柱链没参与");
         }
         // 腰椎几乎不能拧，胸椎是转身主力，颈椎补剩下的一半
         let lumbar = bones
@@ -1235,7 +1232,10 @@ mod tests {
             .filter(|(kind, _, _)| matches!(*kind, LookBoneKind::Neck | LookBoneKind::Head))
             .map(|(_, yaw, _)| *yaw)
             .sum();
-        assert!(near(cervical, 65.0 * 0.50, 1.0), "颈椎合计 {cervical}，明细 {bones:?}");
+        assert!(
+            near(cervical, 65.0 * 0.50, 1.0),
+            "颈椎合计 {cervical}，明细 {bones:?}"
+        );
     }
 
     /// 镜头绕到正后方时，肩膀要真的跟着拧过去，不能停在 90°——

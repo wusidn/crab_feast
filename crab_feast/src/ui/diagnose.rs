@@ -20,8 +20,8 @@
 
 use bevy::prelude::*;
 
-use crate::diagnose::{DiagnosticRowId, DiagnosticStatus, Diagnostics, SUB_MAX_UNITS, clip_text};
 use crate::GameState;
+use crate::diagnose::{DiagnosticRowId, DiagnosticStatus, Diagnostics, SUB_MAX_UNITS, clip_text};
 use crate::ui::menu::{MenuConfig, MenuPageBody, MenuPageDef, MenuSet, widgets};
 
 /// 菜单页面 id
@@ -454,11 +454,11 @@ mod tests {
             let head = kids[0];
             // 各标记在子树里按组件查找，不依赖具体嵌套层级
             let light = find_in_tree::<RowLight>(world, head);
-            assert!(
-                light.is_some_and(|entity| world
+            assert!(light.is_some_and(|entity| {
+                world
                     .get::<RowLight>(entity)
-                    .is_some_and(|marker| marker.0 == *id))
-            );
+                    .is_some_and(|marker| marker.0 == *id)
+            }));
             assert!(find_in_tree::<RowPrimary>(world, head).is_some());
             assert!(world.get::<RowDetail>(kids[1]).is_some());
             assert!(world.get::<RowReason>(kids[2]).is_some());
@@ -485,8 +485,12 @@ mod tests {
         // 标一条异常 → 总览异常
         {
             let mut diag = app.world_mut().resource_mut::<Diagnostics>();
-            diag.row_mut(DiagnosticRowId::NetSnapshot)
-                .set(DiagnosticStatus::Bad, "0.200 m", "命中 0 · 未命中 10", "残差过大");
+            diag.row_mut(DiagnosticRowId::NetSnapshot).set(
+                DiagnosticStatus::Bad,
+                "0.200 m",
+                "命中 0 · 未命中 10",
+                "残差过大",
+            );
         }
         app.world_mut()
             .run_system_once(sync_page)

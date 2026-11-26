@@ -444,10 +444,7 @@ impl FootIk {
     /// 两只脚最近一帧分给腿骨的自旋（度）：踝扛不动的那段里，转了多少换成
     /// 「股骨+胫骨绕自己骨轴滚」。和 `ankle_twist_deg` 相加 = 整段偏航
     pub fn leg_roll_deg(&self) -> [f32; 2] {
-        [
-            self.leg_roll[0].to_degrees(),
-            self.leg_roll[1].to_degrees(),
-        ]
+        [self.leg_roll[0].to_degrees(), self.leg_roll[1].to_degrees()]
     }
 
     /// 两只脚踝关节里**还剩**多少扭转（度）。分给腿骨之后它应当掉到十几度以内；
@@ -1447,9 +1444,7 @@ fn solve_foot_ik(
             }
             // 球 = 落下去的踝 + 当帧的「踝→前掌」：锁脚把锚点钉在前掌上时，
             // 这一个点就是画面上贴着地的那一点，它的速度就是肉眼看到的滑步
-            let ball = pose
-                .toe
-                .map_or(target, |toe| target + (toe - pose.end));
+            let ball = pose.toe.map_or(target, |toe| target + (toe - pose.end));
             measure_slip(
                 &mut slip[index],
                 &mut slip_prev[index],
@@ -1536,10 +1531,10 @@ fn solve_leg(pose: LegPose, target: Vec3, pole: Vec3, roll: f32, up: Vec3) -> Op
     // 不然滚的是反方向 —— 踝里的扭转会翻倍
     let roll_upper = Quat::from_axis_angle(upward(solution.upper_dir, up), roll);
     let roll_lower = Quat::from_axis_angle(upward(solution.lower_dir, up), roll);
-    let upper_world = roll_upper
-        * aim_world_rotation(pose.upper_rot, pose.joint - pose.root, solution.upper_dir);
-    let lower_world = roll_lower
-        * aim_world_rotation(pose.lower_rot, pose.end - pose.joint, solution.lower_dir);
+    let upper_world =
+        roll_upper * aim_world_rotation(pose.upper_rot, pose.joint - pose.root, solution.upper_dir);
+    let lower_world =
+        roll_lower * aim_world_rotation(pose.lower_rot, pose.end - pose.joint, solution.lower_dir);
 
     Some(LegSolution {
         upper_local: (pose.parent_rot.inverse() * upper_world).normalize(),
@@ -1602,7 +1597,9 @@ fn knee_pole(animated: Vec3, foot_forward: Vec3, ramp: f32) -> Vec3 {
     if foot_forward.length_squared() <= 1e-6 {
         return animated;
     }
-    animated.lerp(foot_forward.normalize(), ramp).normalize_or_zero()
+    animated
+        .lerp(foot_forward.normalize(), ramp)
+        .normalize_or_zero()
 }
 
 /// 膝盖朝向的低通：`previous` / `animated` 都是世界空间的单位向量，
@@ -2309,7 +2306,8 @@ mod tests {
     fn solved_leg_lands_on_target() {
         let pose = straight_pose();
         let target = Vec3::new(0.12, 0.0, 0.0);
-        let solved = solve_leg(pose, target, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
+        let solved =
+            solve_leg(pose, target, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
 
         let upper_world = pose.parent_rot * solved.upper_local;
         let lower_world = upper_world * solved.lower_local;
@@ -2351,7 +2349,10 @@ mod tests {
         for _ in 0..6 {
             ball.x += 0.016_667;
             measure_slip(&mut slip, &mut prev, true, ball, dt);
-            assert!((slip - 1.0).abs() < 1e-3, "滑步读出 {slip:.3} m/s，期望 1.0");
+            assert!(
+                (slip - 1.0).abs() < 1e-3,
+                "滑步读出 {slip:.3} m/s，期望 1.0"
+            );
         }
     }
 
@@ -2459,18 +2460,15 @@ mod tests {
         };
         let pole = pose.joint - pose.root;
         let flat = solve_leg(pose, pose.end, pole, 0.0, Vec3::Y).expect("应当有解");
-        let rolled = solve_leg(
-            pose,
-            pose.end,
-            pole,
-            10f32.to_radians(),
-            Vec3::Y,
-        )
-        .expect("应当有解");
+        let rolled =
+            solve_leg(pose, pose.end, pole, 10f32.to_radians(), Vec3::Y).expect("应当有解");
 
         let flat_twist = flat.foot_local.angle_between(Quat::IDENTITY).to_degrees();
         let rolled_twist = rolled.foot_local.angle_between(Quat::IDENTITY).to_degrees();
-        assert!(flat_twist > 18.0, "初始扭转只有 {flat_twist:.1}°，测试摆错了");
+        assert!(
+            flat_twist > 18.0,
+            "初始扭转只有 {flat_twist:.1}°，测试摆错了"
+        );
         assert!(
             rolled_twist < flat_twist - 7.0,
             "腿骨自旋把踝的扭转从 {flat_twist:.1}° 变成 {rolled_twist:.1}°（应该在减）"
@@ -2529,7 +2527,8 @@ mod tests {
     #[test]
     fn unchanged_target_is_a_noop() {
         let pose = straight_pose();
-        let solved = solve_leg(pose, pose.end, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
+        let solved =
+            solve_leg(pose, pose.end, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
         assert!(solved.upper_local.angle_between(Quat::IDENTITY) < 1e-4);
         assert!(solved.lower_local.angle_between(Quat::IDENTITY) < 1e-4);
         assert!(solved.foot_local.angle_between(Quat::IDENTITY) < 1e-4);
@@ -2540,7 +2539,8 @@ mod tests {
     fn unreachable_target_keeps_bone_lengths() {
         let pose = straight_pose();
         let target = Vec3::new(0.0, 0.0, 0.6);
-        let solved = solve_leg(pose, target, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
+        let solved =
+            solve_leg(pose, target, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
 
         let upper_world = pose.parent_rot * solved.upper_local;
         let lower_world = upper_world * solved.lower_local;

@@ -416,7 +416,10 @@ fn load_settings(
             if (loaded.turn_brake_start_deg - default.turn_brake_start_deg).abs() > 1e-3
                 || (loaded.turn_brake_min_scale - default.turn_brake_min_scale).abs() > 1e-3
             {
-                let path = path.0.as_deref().map_or("<无>".into(), |p| p.display().to_string());
+                let path = path
+                    .0
+                    .as_deref()
+                    .map_or("<无>".into(), |p| p.display().to_string());
                 info!(
                     "移动设置用的是存档值：转身降速 起点 {:.0}° / 下限 {:.2}×（{path}），\
                      代码默认 {:.0}° / {:.2}×",
