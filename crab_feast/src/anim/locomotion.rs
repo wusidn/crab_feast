@@ -75,7 +75,7 @@ pub(crate) fn yaw_of(rotation: Quat) -> f32 {
 /// 之前排查「转一下」时默认常开，日志里每帧级别的东西不该在正式包里刷屏；
 /// 和 `CRAB_LOG_YAW` / `CRAB_LOG_JUMP` 同一套约定。
 pub(crate) fn log_turn() -> bool {
-    std::env::var("CRAB_LOG_TURN").is_ok()
+    crab_feast_library::diag::log_enabled("CRAB_LOG_TURN")
 }
 
 pub struct LocomotionPlugin;

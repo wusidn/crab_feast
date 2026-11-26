@@ -1332,7 +1332,7 @@ fn send_input(
         .map(|action| uplink_jump_level(action.state, action.is_queued(), jump_pressed))
         .unwrap_or(jump_pressed);
     // 现场排查用：`CRAB_LOG_JUMP=1` 看上行电平什么时候翻起来、当时动作层在哪个状态。
-    if std::env::var("CRAB_LOG_JUMP").is_ok() && jump != *last_level {
+    if crab_feast_library::diag::log_enabled("CRAB_LOG_JUMP") && jump != *last_level {
         let state = action
             .as_ref()
             .map(|action| format!("{:?}", action.state))
@@ -1346,9 +1346,11 @@ fn send_input(
 
     // 摇杆是相对相机的：往上推 = 屏幕深处 = 视线水平朝向
     let forward = facing.view_forward();
-    let right = Vec3::new(-forward.z, 0.0, forward.x);
-    let world = right * local.x + forward * (-local.y);
-    if std::env::var("CRAB_LOG_YAW").is_ok() {
+    let world = Vec3::from_array(crab_feast_library::tuning::world_stick(
+        forward.to_array(),
+        [local.x, local.y],
+    ));
+    if crab_feast_library::diag::log_enabled("CRAB_LOG_YAW") {
         info!("uplink: auto={} local=({:.2},{:.2}) world=({:.2},{:.2}) fwd=({:.2},{:.2})", auto, local.x, local.y, world.x, world.z, forward.x, forward.z);
     }
     // 没有预测核 / 还没上锚时发 0，服务端退回「到达即生效」。

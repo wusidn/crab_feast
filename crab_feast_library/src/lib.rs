@@ -1,6 +1,8 @@
 pub mod ik;
 /// 空中操控 / 起跳速度的共享规则（客户端、服务端、设置面板同源）。
 pub mod air;
+/// 诊断日志闸门（编译期 feature + 运行期缓存的环境变量）。
+pub mod diag;
 pub mod platform;
 /// 角色运动调参常量（转身限速等），客户端与服务器共用。
 pub mod tuning;

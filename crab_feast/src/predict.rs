@@ -137,9 +137,11 @@ pub(crate) fn pred_velocity(
     let direction = if effective.is_active() {
         let local = effective.local_stick();
         let forward = facing.view_forward();
-        let right = Vec3::new(-forward.z, 0.0, forward.x);
-        let world = right * local.x + forward * (-local.y);
-        Vec2::new(world.x, world.z).normalize_or_zero()
+        let world = crab_feast_library::tuning::world_stick(
+            forward.to_array(),
+            [local.x, local.y],
+        );
+        Vec2::new(world[0], world[2]).normalize_or_zero()
     } else {
         Vec2::ZERO
     };
@@ -191,20 +193,32 @@ pub(crate) fn pred_velocity(
         intent.speed_scale = pred.brake;
 
         if !airborne {
-            let ground = if direction.length_squared() > 1e-6 {
-                // 档位同时进速度：只进动画不进速度，走档就是「腿在走、身子在冲刺」
-                tuning::ground_velocity_push([direction.x, direction.y], pred.brake, push)
+            if direction.length_squared() <= 1e-6 {
+                // 松手：**一 tick 归零**，不是交给 `ground_velocity_step` 去滑停。
+                //
+                // 服务端 `drive_avatars` 那条分支是 `Vec2::ZERO`、单机
+                // `movement_system` 也是当场写 0，这里若走「速度矢量逼近 0」的
+                // 有限加速度分支，是 6 m/s²：从 3 m/s 滑 0.5 秒、多走 0.75 米。
+                // 之后每一份快照都在把位置往回拽（`pred_reconcile` 是整段补偿），
+                // 观感就是「松手后人再漂一段、然后被拽回来」
+                velocity.0.x = 0.0;
+                velocity.0.z = 0.0;
             } else {
-                [0.0, 0.0]
-            };
-            let stepped = tuning::ground_velocity_step(
-                [velocity.0.x, velocity.0.z],
-                ground,
-                tuning::REVERSE_ACCEL_MPS2,
-                dt,
-            );
-            velocity.0.x = stepped[0];
-            velocity.0.z = stepped[1];
+                // 档位同时进速度：只进动画不进速度，走档就是「腿在走、身子在冲刺」
+                let ground = tuning::ground_velocity_push(
+                    [direction.x, direction.y],
+                    pred.brake,
+                    push,
+                );
+                let stepped = tuning::ground_velocity_step(
+                    [velocity.0.x, velocity.0.z],
+                    ground,
+                    tuning::REVERSE_ACCEL_MPS2,
+                    dt,
+                );
+                velocity.0.x = stepped[0];
+                velocity.0.z = stepped[1];
+            }
         } else if air_steer_active(air_elapsed, air_steer_secs) && direction.length_squared() > 1e-6 {
             // 滞空：保动量、限转向（同一份 `air_steer_velocity`，同一组旋钮）。
             // 加速度按档位缩放：单机用 `magnitude`、服务端用「dir 长度 × force」，
@@ -422,6 +436,64 @@ mod tests {
         assert!(
             (half_axis - 0.25).abs() < 1e-3 && (half_speed - 0.75).abs() < 0.05,
             "轻推摇杆被当成满档：轴 {half_axis}、地速 {half_speed}"
+        );
+    }
+
+    /// 松手：预测端必须**一 tick 归零**，不能按 6 m/s² 滑停
+    ///
+    /// 服务端那条分支是直接写 `Vec2::ZERO`，单机 `movement_system` 也是当场写 0。
+    /// 这里若走「速度矢量逼近 0」，3 m/s 要滑 0.5 秒、多走 0.75 米，之后每一份
+    /// 快照都在把位置往回拽（`pred_reconcile` 整段补偿），观感是「松手后又漂一下」
+    #[test]
+    fn release_stops_in_one_tick_like_the_server() {
+        use bevy::ecs::system::RunSystemOnce;
+        use std::time::Duration;
+
+        let mut app = App::new();
+        app.init_resource::<Time<Fixed>>()
+            .init_resource::<PredClock>()
+            .insert_resource(EffectiveMove {
+                direction: Vec2::NEG_Y,
+                deflection: 1.0,
+                force: 1.0,
+            })
+            .insert_resource(CameraFacing {
+                yaw: 0.0,
+                pitch: 0.0,
+            })
+            .insert_resource(MovementSettings::default())
+            .insert_resource(JumpSettings::default());
+        app.world_mut().resource_mut::<PredClock>().anchored = true;
+        let body = app
+            .world_mut()
+            .spawn((
+                LinearVelocity::ZERO,
+                Rotation::IDENTITY,
+                Prediction::default(),
+                LocomotionIntent::default(),
+                FacingState::default(),
+            ))
+            .id();
+        let tick = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<Time<Fixed>>()
+                .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+            app.world_mut()
+                .run_system_once(pred_velocity)
+                .expect("预测端跑不起来");
+        };
+        for _ in 0..30 {
+            tick(&mut app);
+        }
+        let cruising = app.world().get::<LinearVelocity>(body).expect("速度").0;
+        assert!(cruising.length() > 2.5, "先要跑起来：{cruising:?}");
+
+        *app.world_mut().resource_mut::<EffectiveMove>() = EffectiveMove::default();
+        tick(&mut app);
+        let stopped = app.world().get::<LinearVelocity>(body).expect("速度").0;
+        assert!(
+            stopped.x.abs() < 1e-6 && stopped.z.abs() < 1e-6,
+            "松手一 tick 后还留着水平速度：{stopped:?}"
         );
     }
 

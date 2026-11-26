@@ -101,7 +101,7 @@ pub(super) fn follow_landing_phase(
 ) {
     let progress = (land_time / recover_secs.max(f32::EPSILON)).clamp(0.0, 1.0);
     let phase = landing_phase_at(target, advance, progress);
-    if std::env::var("CRAB_LOG_LAND").is_ok() {
+    if crab_feast_library::diag::log_enabled("CRAB_LOG_LAND") {
         info!(
             "land t={:.3} prog={:.3} phase={:.3} target={:.3} adv={:.3}",
             land_time, progress, phase, target, advance

@@ -330,7 +330,7 @@ pub(super) fn drive_jump(
     action.root_y = root_y_at(&action, action.clip_time);
     // 现场调参用：`CRAB_LOG_JUMP=1` 逐帧打出状态机（状态 / 权重 / 剪辑时间 / 接地距离 /
     // 移动相位 / 支撑权重），用来看空中是不是还在跑、落地交接有没有跳。
-    if std::env::var("CRAB_LOG_JUMP").is_ok() {
+    if crab_feast_library::diag::log_enabled("CRAB_LOG_JUMP") {
         let phase = driver
             .phases
             .get(LocomotionMixer::ID)

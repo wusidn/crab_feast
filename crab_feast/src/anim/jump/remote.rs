@@ -238,7 +238,7 @@ impl RemoteJump {
         let ticks = net.ticks as f32 / TICK_HZ as f32;
         let fresh = phase != jump_phase::GROUND && (net.seq != self.net_seq || !self.net_primed);
         self.net_primed = true;
-        if std::env::var("CRAB_LOG_NET_JUMP").is_ok() && phase != self.net_phase {
+        if crab_feast_library::diag::log_enabled("CRAB_LOG_NET_JUMP") && phase != self.net_phase {
             info!(
                 "remote jump: seq={} phase {}→{} ticks={}",
                 net.seq, self.net_phase, phase, net.ticks

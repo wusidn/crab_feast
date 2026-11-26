@@ -1062,7 +1062,7 @@ fn drive_avatars(
             charge.verify_secs = LAUNCH_VERIFY_SECS;
             charge.launch_y = transform.translation.y;
             // 现场排查用：`CRAB_LOG_SRV=1` 看服务端到底给了多少离地速度、从哪个高度给的。
-            if std::env::var("CRAB_LOG_SRV").is_ok() {
+            if crab_feast_library::diag::log_enabled("CRAB_LOG_SRV") {
                 info!(
                     "srv launch vy={vy:.2} y={:.3} xz={:.2},{:.2} grounded={grounded} measured={:.2} kind={:?}",
                     transform.translation.y,
@@ -1074,7 +1074,7 @@ fn drive_avatars(
             }
         }
         // 逐帧：起跳后把竖直速度与高度打出来，用来区分「初速度不够」和「人被卡住」
-        if std::env::var("CRAB_LOG_SRV").is_ok() && (charge.charging || velocity.0.y.abs() > 0.02) {
+        if crab_feast_library::diag::log_enabled("CRAB_LOG_SRV") && (charge.charging || velocity.0.y.abs() > 0.02) {
             info!(
                 "srv av y={:.3} vy={:.3} xz={:.2},{:.2} grounded={grounded} charging={} el={:.3}",
                 transform.translation.y,
@@ -1112,7 +1112,7 @@ fn drive_avatars(
         }
 
         // 现场排查：`CRAB_LOG_INPUT=1` 时每秒一行，看服务端到底吃到哪一条输入
-        if std::env::var("CRAB_LOG_INPUT").is_ok() && time.elapsed_secs() >= stat.next_print {
+        if crab_feast_library::diag::log_enabled("CRAB_LOG_INPUT") && time.elapsed_secs() >= stat.next_print {
             stat.next_print = time.elapsed_secs() + 1.0;
             info!(
                 "srv input: desired={desired} applied_t={} exact={} fallback={} none={} qlen={} \
@@ -2069,14 +2069,14 @@ mod physics_probe {
             (min_scale - floor).abs() < 1e-4,
             "180° 该压到下限 {floor}，实测最低 {min_scale}"
         );
-        // 速度必须过零（先刹住、再反向），而不是一帧翻过去
+        // 速度必须过零（先刹住、再反向），而不是一帧翻过去、也不是绕半圈
         assert!(min_speed < 0.2, "反向要经过静止，实测最低 {min_speed}");
         // 两秒后是在下限上倒退走，方向就是输入方向
         assert!(
             velocity.y < -MOVE_SPEED_MPS * floor * 0.9,
             "该倒着往回走了：{velocity:?}"
         );
-        // 全程不许横向偏出去（之前取身体朝向时这里会跑出 1.6 m）
+        // 全程不许横向偏出去（取身体朝向 / 绕转都会甩出 1.6~3 m）
         assert!(lateral < 1e-4, "反向过程划出圆弧了：横向 {lateral}");
         assert!(yaw.abs() < 180f32.to_radians());
         assert!(floor > 0.0, "下限不能归零");

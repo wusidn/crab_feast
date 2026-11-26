@@ -7,6 +7,11 @@ edition = "2024"
 name = "crab-feast-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# 与服务端同一套口径：`CRAB_LOG_SRV` / `CRAB_LOG_INPUT` 的每 tick 打印
+diag-log = ["crab_feast_library/diag-log"]
+
 [dependencies]
 crab_feast_launcher = { path = "../shared" }
 bevy.workspace = true
