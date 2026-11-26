@@ -53,22 +53,35 @@ pub const TURN_BRAKE_MIN_RANGE: (f32, f32) = (0.2, 1.0);
 
 /// 转身降速的默认「到位角」（度）：夹角到这个数就压到下限，再大也不更低。
 ///
-/// 取 90 是玩家的原话「转弯大于 90° 才开始那种减速转身」：小角度侧移照常跑，
-/// 掉头 / 大拐弯才进入「先刹住惯性、再折线转过去」的段。
-pub const TURN_BRAKE_START_DEG_DEFAULT: f32 = 90.0;
+/// 取 124 是玩家的原话「小于 120 度的转身不需要减速」：不减速区 =
+/// `start - TURN_BRAKE_BAND_DEG` = 120，所以 120° 以内一律满速，
+/// 120~124 留 4° 缓冲带把「不减速」接到下限上，再大按折线转（见
+/// [`TURN_BRAKE_MIN_SCALE_DEFAULT`]）。历史值 90：那时 100° 的转弯也要降到 0.4。
+pub const TURN_BRAKE_START_DEG_DEFAULT: f32 = 124.0;
 
 /// 转身降速的默认下限（0~1）：大角度转弯时保留的地速。
 ///
-/// 0.25 的用意是**折线**：甩头时人只往前滑一小段（0.75 m/s），身体趁这段低速
-/// 转过去，转完再顺着新方向加速。**不归零**——完全停住会变成「原地转身」，
-/// 那是上一版被否掉的观感。
+/// 配 `start = 124`，**只有 120° 以上的转身才吃这个数**：120° 以内一律满速，
+/// 120~124 用 4° 余弦过渡，124° 以上整段压在下限。
+///
+/// 0.4 是「甩头折线」：180° 掉头时人只往前蹭一小段，身体趁这段低速转过去，
+/// 转完再顺着新方向提速。这一层原本是为「转身时脚在地上打滑、有残影」加的，
+/// 脚那边三副药上完之后它在小角度已经没用了（45°/90° 现在都不进带），
+/// 但**大角度还是要它**：没有它，150°~180° 的转身就是一条满速侧飘的弧线，
+/// 看着像没转身、被地面甩出去（实测被否）。
+///
+/// 掉头过零本身不归这一层管：速度方向要反，`ground_velocity_step` 必须让它
+/// 过零（[`REVERSE_ACCEL_MPS2`]）。这里的 0.4 决定的是「转过去之后倒退走多快」。
 pub const TURN_BRAKE_MIN_SCALE_DEFAULT: f32 = 0.4;
 
-/// 夹角小于它时完全不加刹车（度）：这段是「正常跑，顺手歪一点」。
+/// 「完全不减速」到「下限」之间的过渡带宽度（度）：实际的不减速区到
+/// `start - BAND` 为止。
 ///
-/// 曲线从这里才开始往下走，到 [`TURN_BRAKE_START_DEG_DEFAULT`] 压到下限。
-/// 两端导数都是 0，所以既不会在小角度突然顿一下，也不会在拉满时硬跳。
-pub const TURN_BRAKE_RECOVER_DEG: f32 = 30.0;
+/// 4° 是给默认的 124 配的：120° 以内一律满速（玩家要求「小于 120 度的转身
+/// 不需要减速」，含 120 本身），120~124 用一条两端导数为 0 的余弦走完，再大
+/// 就压在下限上。跟着 `start` 走而不是钉死一个角，是为了让面板上把起点调小
+/// （比如 60）时曲线跟着整体左移，而不是被一条固定的 120° 门槛盖住
+pub const TURN_BRAKE_BAND_DEG: f32 = 4.0;
 
 /// 降速有多快（比例/秒）：**转速吃满之后**满速压到下限约 0.34 秒。
 ///
@@ -92,17 +105,19 @@ pub fn turn_speed_scale_with(error_deg: f32, start_deg: f32, min_scale: f32) -> 
     let start = start_deg.clamp(TURN_BRAKE_START_RANGE.0, TURN_BRAKE_START_RANGE.1);
     let floor = min_scale.clamp(TURN_BRAKE_MIN_RANGE.0, TURN_BRAKE_MIN_RANGE.1);
     let deg = error_deg.abs();
+    // 不减速区：`start` 往回收一个过渡带的宽度（默认 124 - 4 = 120）
+    let recover = (start - TURN_BRAKE_BAND_DEG).max(0.0);
     // 小角度：正常跑，别去碰
-    if deg <= TURN_BRAKE_RECOVER_DEG {
+    if deg <= recover {
         return 1.0;
     }
     // 大角度：一路压在同一个下限里，整段转弯都是「低速折线」
     if deg >= start {
         return floor;
     }
-    // 中间只留一小段过渡：从 RECOVER 处的 1.0 缓降到 start 处的 floor
-    let span = (start - TURN_BRAKE_RECOVER_DEG).max(1.0);
-    let t = ((deg - TURN_BRAKE_RECOVER_DEG) / span).clamp(0.0, 1.0);
+    // 中间只留一小段过渡：从 recover 处的 1.0 缓降到 start 处的 floor
+    let span = (start - recover).max(1e-3);
+    let t = ((deg - recover) / span).clamp(0.0, 1.0);
     // ease = 0.5 - 0.5cos(πt)：两端斜率 0，进 / 出刹车带都不打顿
     let ease = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
     1.0 - (1.0 - floor) * ease
@@ -154,14 +169,39 @@ pub const SNAP_LEN_MPS: f32 = 0.35;
 
 /// 顺向（夹角 ≤70°）但需要大幅调整时的加速度（米/秒²）。
 ///
-/// 20 m/s² 下 0 → 3.0 只要 0.15 秒；它只负责「跨过掉头、被打断之后重新起来」这类
-/// 大跨度调整，正常微调走上面的一帧到位。
-pub const GROUND_ACCEL_MPS2: f32 = 20.0;
+/// 48 m/s² 下 0 → 3.0 只要 0.0625 秒（约 4 tick），一段支撑期都还没走完 ——
+/// 「站起来一两步之内就该到顶速」。正常微调仍然走上面的一帧到位。
+///
+/// 历史值 20（0.15s）：那是按「跨过掉头、被同步打断后重新起来」这类场景定的，
+/// 站着起步也走它就显得「走了一两步才跑起来」。掉头/反向不吃这个数，
+/// 仍按调用方给的 [`REVERSE_ACCEL_MPS2`] 走惯性，所以「过零时一帧弹满速」的
+/// 老毛病不会回来
+pub const GROUND_ACCEL_MPS2: f32 = 48.0;
 
 /// 顺向 / 大角度 的分界（70°）。
 pub const SNAP_ALIGN_COS: f32 = 0.342;
 
+/// 中角度（70°~150°）换向时，速度矢量绕转的角速度（度/秒）。
+///
+/// 这一档**不让速度掉下来**：人和车拐弯不会先站住再往新方向起步，
+/// 真实的重心转移是「保持速度、把方向掰过去」。90° 在 540°/s 下是 0.167 秒
+/// （10 个 60Hz tick），比身体转身（[`TURN_SPEED_DEG_PER_SEC`] 90°/s，要 1 秒）
+/// 快得多 —— 位移先拐、身体后跟，双脚再看身体朝向去跟，这正是脚 IK 现在
+/// 该处理的事，而不是靠把速度刹成零来掩盖。
+pub const GROUND_TURN_DEG_PER_SEC: f32 = 540.0;
+
+/// 掉头分界（≈148°）：夹角超过它才退回「直线插值、过零、再反向加速」。
+///
+/// 180° 如果也走绕转，速度矢量会在满速上原地转半圈 —— 位移就是一条大圆弧，
+/// 玩家看到的是「人没转身却往旁边飘出去」。真掉头必须过零：先沿原方向刹住，
+/// 再往反方向加速，位移是一条直线（这也是 `reverse_velocity_passes_through_zero`
+/// 一直在守的那条）。
+pub const GROUND_REVERSE_COS: f32 = -0.85;
+
 /// 地速按有限加速度逼近目标：**只有大角度（>70°）才掰**，正常变向 / 起步照旧一帧到位。
+///
+/// 大角度再分两档：70°~150° 是**保持速度、绕转方向**（[`GROUND_TURN_DEG_PER_SEC`]），
+/// 150° 以上才是掉头、走直线过零（[`REVERSE_ACCEL_MPS2`]）。
 ///
 /// 大角度那一段走直线：速度矢量沿两点连线插值，先减到 0 再反向增大，
 /// 不会像「方向取身体朝向」那样绕出一个圈。判据是**夹角**而不是点积的正负号，
@@ -177,7 +217,11 @@ pub fn ground_velocity_step(current: [f32; 2], target: [f32; 2], accel: f32, dt:
     // 目标的那一 tick，点积在 0 上下翻，翻成正的那一帧直接返回满速
     // （实测 0.46 → 2.49 m/s 一 tick，画面上就是转身末尾那一下「抖/僵」）。
     // 现在任何一步都受加速度上限约束，那条不连续曲线就没有了。
-    let cos = if len2 > 1e-8 && tlen2 > 1e-8 {
+    // 当前速度≈0（站着起步）：没有「夹角」可言，不能落到惯性那一档
+    let starting = len2 <= 1e-8;
+    let cos = if starting {
+        1.0
+    } else if tlen2 > 1e-8 {
         dot / (len2.sqrt() * tlen2.sqrt())
     } else {
         -1.0
@@ -188,22 +232,45 @@ pub fn ground_velocity_step(current: [f32; 2], target: [f32; 2], accel: f32, dt:
     // 顺向 + 小跨度：一帧到位（跟手、也是被打断之后立刻恢复的那条路）。
     // 顺向 + 大跨度（比如已经刹到 0 又要回满速）：按 GROUND_ACCEL 起，别一帧弹上去。
     // 大角度 / 反向：按调用方给的 `accel` 走惯性。
-    let rate = if cos >= SNAP_ALIGN_COS {
-        if len <= SNAP_LEN_MPS || len2 <= 1e-8 {
+    // 小跨度：一帧到位（跟手、也是被打断之后立刻恢复的那条路）
+    if cos >= SNAP_ALIGN_COS && len <= SNAP_LEN_MPS {
+        return target;
+    }
+    // 真掉头：直线插值、过零、再反向加速（`accel` 是调用方给的惯性加速度）
+    if !starting && cos <= GROUND_REVERSE_COS {
+        let max_step = accel * dt;
+        if len <= max_step {
             return target;
         }
+        return [
+            current[0] + dx / len * max_step,
+            current[1] + dz / len * max_step,
+        ];
+    }
+    // 其余（含中角度换向、走档换速、起步）：**绕转方向 + 单独追速度大小**。
+    // 关键点：方向绕转不改速度大小，所以 90° 换向一步都不掉速；
+    // 只在「几乎同向」时才允许用 `GROUND_ACCEL_MPS2` 快上量，方向不对时
+    // 用调用方给的 `accel` —— 否则掉头过零那几 tick 会一帧弹起来
+    let r0 = len2.sqrt();
+    let r1 = tlen2.sqrt();
+    if r0 <= 1e-6 {
+        // 静止起步：没有方向可绕，直接朝目标方向把量提起来
+        let dir = [target[0] / r1, target[1] / r1];
+        let r = r1.min(GROUND_ACCEL_MPS2 * dt);
+        return [dir[0] * r, dir[1] * r];
+    }
+    let r_rate = if cos >= SNAP_ALIGN_COS {
         GROUND_ACCEL_MPS2
     } else {
         accel
     };
-    let max_step = rate * dt;
-    if len <= max_step {
-        return target;
-    }
-    [
-        current[0] + dx / len * max_step,
-        current[1] + dz / len * max_step,
-    ]
+    let a0 = current[0].atan2(current[1]);
+    let a1 = target[0].atan2(target[1]);
+    let delta = wrap_pi(a1 - a0);
+    let max_rot = GROUND_TURN_DEG_PER_SEC.to_radians() * dt;
+    let a = a0 + delta.clamp(-max_rot, max_rot);
+    let r = r0 + (r1 - r0).clamp(-r_rate * dt, r_rate * dt);
+    [a.sin() * r, a.cos() * r]
 }
 
 /// 本 tick 的**目标**转身降速比例：只看夹角，不含时间斜坡。
@@ -241,14 +308,26 @@ pub fn ground_brake_target(
 /// 朝向和位移是两条独立的时间轴：甩头时人先刹住、再倒退走，身体慢慢转过去。
 /// 方向若跟着脸向，位移就会被身体带着划出一道大圆弧——实测被否掉的观感。
 pub fn ground_velocity(dir: [f32; 2], brake: f32) -> [f32; 2] {
+    ground_velocity_push(dir, brake, 1.0)
+}
+
+/// 带档位的地速目标：`满速 × 斜坡 × 档位`。
+///
+/// `push` 是玩家把杆推了多少（摇杆偏转 × force，0~1），和混合空间 `speed` 轴
+/// 是同一个量。档位必须**同时**改速度和动画：只改动画、速度仍按满速算，走档时
+/// 腿在走、身子在冲刺，观感就是「一直在跑」；只改速度、动画仍按满档算，腿就比
+/// 身子快，看起来是滑步。
+///
+/// 单机角色的速度来自混合输出的等效地速（走 1.6 / 跑 2.9 m/s），联机两端没有
+/// 动画数据可用，所以这里按 `MOVE_SPEED_MPS × push` 折算——服务端与预测端必须
+/// 调同一个函数、喂同一个 `push`，两条轨迹才逐 tick 同源。
+pub fn ground_velocity_push(dir: [f32; 2], brake: f32, push: f32) -> [f32; 2] {
     let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
     if len <= 1e-6 {
         return [0.0, 0.0];
     }
-    [
-        dir[0] / len * MOVE_SPEED_MPS * brake,
-        dir[1] / len * MOVE_SPEED_MPS * brake,
-    ]
+    let speed = MOVE_SPEED_MPS * brake * push.clamp(0.0, 1.0);
+    [dir[0] / len * speed, dir[1] / len * speed]
 }
 
 /// 用默认参数算地速保留比例（固定参数的调用点与测试用这个）
@@ -334,14 +413,15 @@ mod tests {
         (secs, first)
     }
 
-    /// 手感就是这个数：180° 反向 1.133 秒、90° 0.6 秒。
+    /// 手感就是这个数：顶速 90°/s 下 180° 反向约 2.1 秒、90° 约 1.1 秒
+    ///（顶速曾经是 180°/s，那时是 1.13 / 0.6 秒；`8ad151f` 按真机观感降到了 90）。
     /// 顶速没被吃掉（一下子转过去）或加速度丢了（第一帧就满速）都在这里露出来。
     #[test]
     fn reversal_takes_the_designed_time() {
         let (reversal, first) = turn_seconds(180.0, 1.0 / 60.0);
-        assert!((1.0..1.35).contains(&reversal), "180° 用了 {reversal}s");
+        assert!((1.9..2.35).contains(&reversal), "180° 用了 {reversal}s");
         assert!(
-            (0.4..0.8).contains(&turn_seconds(90.0, 1.0 / 60.0).0),
+            (0.9..1.3).contains(&turn_seconds(90.0, 1.0 / 60.0).0),
             "90° 用得太久/太快"
         );
         // 起步段受加速度限制：60 Hz 第一帧只该走 350°/s² × dt² ≈ 0.1°，不是 1.5°
@@ -397,7 +477,12 @@ mod tests {
     #[test]
     fn turn_brake_curve_holds_its_shape() {
         assert_eq!(turn_speed_scale(0.0), 1.0);
-        assert_eq!(turn_speed_scale(TURN_BRAKE_RECOVER_DEG), 1.0);
+        // 玩家要求：120° 以内不减速（含 120 本身）
+        let quiet = TURN_BRAKE_START_DEG_DEFAULT - TURN_BRAKE_BAND_DEG;
+        assert!((quiet - 120.0).abs() < 1e-4, "不减速区该到 120°，实测 {quiet}");
+        for deg in [0.0, 30.0, 60.0, 90.0, 110.0, 119.0, 120.0] {
+            assert_eq!(turn_speed_scale(deg), 1.0, "{deg}° 不该减速");
+        }
         // 到位角及更大：一路压在下限，整段转弯是同一个低速
         let floor = turn_speed_scale(180.0);
         assert!(
@@ -408,9 +493,9 @@ mod tests {
         assert!(floor > 0.0, "下限不能归零，那是「原地转身」");
         // 左右对称
         assert!((turn_speed_scale(-120.0) - turn_speed_scale(120.0)).abs() < 1e-6);
-        // 过渡段单调下降（31° → 90°）
+        // 过渡段单调下降（121° → 180°）
         let mut last = 1.0;
-        for deg in 31..=180 {
+        for deg in 121..=180 {
             let now = turn_speed_scale(deg as f32);
             assert!(now <= last + 1e-6, "deg {deg}: {now} > {last}");
             last = now;
@@ -425,6 +510,18 @@ mod tests {
         let slope_out = (turn_speed_scale(179.5) - turn_speed_scale(180.0)) / 0.5;
         assert!(slope_out.abs() < 0.01, "终点斜率 {slope_out}");
         assert_eq!(turn_speed_scale(200.0), floor, "超过 180° 保持下限");
+        // 默认口径：120° 以内满速，120° 以上才压（180° 到下限 0.4）
+        assert_eq!(turn_speed_scale(120.0), 1.0, "120° 该满速");
+        assert_eq!(turn_speed_scale(90.0), 1.0, "90° 该满速");
+        assert!(
+            (turn_speed_scale(180.0) - TURN_BRAKE_MIN_SCALE_DEFAULT).abs() < 1e-6,
+            "180° 该压到下限"
+        );
+        assert!(
+            turn_speed_scale(150.0) < 0.75,
+            "150° 该明显减速：{:.2}",
+            turn_speed_scale(150.0)
+        );
     }
 
     /// 面板上的两个旋钮：起点越早 / 下限越低，降速越明显
@@ -471,12 +568,15 @@ mod tests {
         let v = ground_velocity_step([0.0, MOVE_SPEED_MPS], lateral, REVERSE_ACCEL_MPS2, dt);
         assert_eq!(v, lateral, "0.2m/s 的顺向修正不该被摊成惯性");
 
-        // 静止起步：宽度超过 SNAP_LEN 才走加速曲线，0 → 3.0 约 0.15 秒
+        // 静止起步：0 → 3.0 约 4 tick（0.067s）
         let mut v = [0.0, 0.0];
-        for _ in 0..9 {
+        for _ in 0..5 {
             v = ground_velocity_step(v, [0.0, MOVE_SPEED_MPS], REVERSE_ACCEL_MPS2, dt);
         }
-        assert!(v[1] > MOVE_SPEED_MPS * 0.9, "起步 0.15s 该到顶速：{v:?}");
+        assert!(
+            v[1] > MOVE_SPEED_MPS * 0.99,
+            "起步 0.083s 该到顶速：{v:?}"
+        );
         let v = ground_velocity_step(
             [0.0, MOVE_SPEED_MPS],
             [0.0, MOVE_SPEED_MPS],
@@ -484,6 +584,72 @@ mod tests {
             dt,
         );
         assert_eq!(v, [0.0, MOVE_SPEED_MPS]);
+    }
+
+    /// 90° 换向（左前 45° → 右前 45°）：速度**一步都不许掉**，只许把方向绕过去
+    #[test]
+    fn wide_turn_keeps_its_speed() {
+        let dt = 1.0 / 60.0;
+        let left = [MOVE_SPEED_MPS * (-45f32).to_radians().sin(), MOVE_SPEED_MPS * 45f32.to_radians().cos()];
+        let right = [MOVE_SPEED_MPS * 45f32.to_radians().sin(), MOVE_SPEED_MPS * 45f32.to_radians().cos()];
+        let mut v = left;
+        let mut min_speed = MOVE_SPEED_MPS;
+        let mut ticks = 0;
+        while (v[0] - right[0]).abs() > 1e-3 || (v[1] - right[1]).abs() > 1e-3 {
+            v = ground_velocity_step(v, right, REVERSE_ACCEL_MPS2, dt);
+            min_speed = min_speed.min((v[0] * v[0] + v[1] * v[1]).sqrt());
+            ticks += 1;
+            assert!(ticks < 40, "90° 换向该在 0.6s 内到位：{v:?}");
+        }
+        assert!(
+            min_speed > MOVE_SPEED_MPS * 0.97,
+            "90° 换向掉速了：最低 {min_speed:.2} m/s"
+        );
+        assert!(ticks <= 12, "90° 换向要跟手（≤0.2s），实测 {ticks} tick");
+    }
+
+    /// 150° 以上仍是真掉头：必须过零，不许在满速上绕半圈
+    #[test]
+    fn reversal_still_goes_through_zero() {
+        let dt = 1.0 / 60.0;
+        let mut v = [0.0, -MOVE_SPEED_MPS];
+        let mut min_speed = MOVE_SPEED_MPS;
+        for _ in 0..90 {
+            v = ground_velocity_step(v, [0.0, MOVE_SPEED_MPS], REVERSE_ACCEL_MPS2, dt);
+            min_speed = min_speed.min((v[0] * v[0] + v[1] * v[1]).sqrt());
+        }
+        assert!(min_speed < 0.2, "反向必须过零，实测最低 {min_speed:.2}");
+        assert!(v[1] > MOVE_SPEED_MPS * 0.9, "转完该沿新方向跑：{v:?}");
+        assert!(v[0].abs() < 0.05, "掉头不许划出圆弧：{v:?}");
+    }
+
+    /// 站着起步要「一两步之内」到顶速：0 → 3.0 不许再走掉头那套惯性
+    /// （6 m/s²，0.5 秒）。这里钉住 4~6 tick 的量级
+    #[test]
+    fn startup_reaches_full_speed_within_a_step() {
+        let dt = 1.0 / 60.0;
+        let target = [0.0, MOVE_SPEED_MPS];
+        let mut v = [0.0, 0.0];
+        let mut ticks = 0;
+        while v[1] < MOVE_SPEED_MPS * 0.99 && ticks < 60 {
+            v = ground_velocity_step(v, target, REVERSE_ACCEL_MPS2, dt);
+            ticks += 1;
+        }
+        assert!(
+            ticks <= 5,
+            "起步用了 {ticks} tick（{:.3}s）才到顶速",
+            ticks as f32 * dt
+        );
+        // 走档起步（0.5 档）一样要快：半个身位之内到位
+        let mut v = [0.0, 0.0];
+        let mut ticks = 0;
+        while v[1] < MOVE_SPEED_MPS * 0.5 * 0.99 && ticks < 60 {
+            v = ground_velocity_step(v, [0.0, MOVE_SPEED_MPS * 0.5], REVERSE_ACCEL_MPS2, dt);
+            ticks += 1;
+        }
+        assert!(ticks <= 3, "走档起步用了 {ticks} tick");
+        // 起步仍然不许横向偏出去（速度方向只能沿目标线）
+        assert_eq!(v[0], 0.0, "起步冒出横向速度：{v:?}");
     }
 
     /// 掉头过零那几 tick 不许「一帧弹满速」：那正是真机上「最后一下抖/僵」的来源。
@@ -533,9 +699,12 @@ mod tests {
         assert!((soft - 1.0).abs() < 1e-6, "下限 1.0 = 完全不降速");
     }
 
-    /// 斜坡：刹车约 0.34 秒压到下限，提速约 0.7 秒回满，两者不对称
+    /// 斜坡：刹车约 0.34 秒压到下限，提速约 0.7 秒回满，两者不对称。
+    ///
+    /// 默认下限已经是 1.0（不减速），所以这里显式给 0.5 才能量到斜坡的形状
     #[test]
     fn turn_brake_follows_the_body_and_brakes_harder_than_it_recovers() {
+        let floor = 0.5f32;
         // 180° 甩头：身体按 step_yaw 转，刹车按本 tick 转速给力
         let dt = 1.0 / 60.0;
         let mut yaw = 0.0f32;
@@ -545,12 +714,16 @@ mod tests {
         let mut floor_at = None;
         for _ in 0..600 {
             let error = wrap_pi(std::f32::consts::PI - yaw);
-            let target = turn_speed_scale(error.to_degrees());
+            let target = turn_speed_scale_with(
+                error.to_degrees(),
+                TURN_BRAKE_START_DEG_DEFAULT,
+                floor,
+            );
             scale = ramp_turn_brake(scale, target, rate, dt);
-            if floor_at.is_none() && scale <= TURN_BRAKE_MIN_SCALE_DEFAULT + 1e-4 {
+            if floor_at.is_none() && scale <= floor + 1e-4 {
                 floor_at = Some(secs);
             }
-            if scale <= TURN_BRAKE_MIN_SCALE_DEFAULT + 1e-4 {
+            if scale <= floor + 1e-4 {
                 break;
             }
             let (next, next_rate) = step_yaw(yaw, rate, error, dt);
@@ -573,8 +746,12 @@ mod tests {
             scale = ramp_turn_brake(scale, 1.0, 0.0, dt);
             rise += 1;
         }
-        // 从下限（`TURN_BRAKE_MIN_SCALE_DEFAULT`）爬回 1.0 要按 `TURN_BRAKE_RISE_PER_SEC`
-        // 走完这段距离：0.4 → 1.0 就是 0.55 秒，33 个 60Hz tick
-        assert!(rise > 30, "回满太快：{rise} 个 60Hz tick");
+        // 从下限爬回 1.0 要按 `TURN_BRAKE_RISE_PER_SEC` 走完这段距离：
+        // 0.5 → 1.0 就是 0.45 秒，约 27 个 60Hz tick
+        let expect = ((1.0 - floor) / TURN_BRAKE_RISE_PER_SEC) / dt;
+        assert!(
+            (rise as f32) >= expect * 0.9 && (rise as f32) <= expect * 1.15,
+            "回满用 {rise} tick，期望 {expect:.0}"
+        );
     }
 }

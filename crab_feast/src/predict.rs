@@ -24,7 +24,7 @@ use crab_feast_library::net::{NetPos, NetTick, NetYaw};
 use crab_feast_library::tuning;
 
 use crate::anim::{JumpAction, JumpSettings};
-use crate::camera::CameraFacing;
+use crate::camera::{CameraAnchor, CameraFacing};
 use crate::input::{EffectiveMove, FacingState, LocomotionIntent, MovementSettings, wrap_pi};
 use crate::net_pose::PoseSmoothing;
 
@@ -143,8 +143,11 @@ pub(crate) fn pred_velocity(
     } else {
         Vec2::ZERO
     };
-    let force = if effective.is_active() {
-        effective.force.clamp(0.0, 1.0)
+    let push = if effective.is_active() {
+        // 档位 = 摇杆偏转 × force，和单机的 `EffectiveMove::magnitude()`
+        // 以及混合空间 `speed` 轴是同一个量。只用 `force` 会漏掉偏转量：
+        // 轻推摇杆（触屏）就按满档算，永远走不起来
+        effective.magnitude()
     } else {
         0.0
     };
@@ -153,7 +156,7 @@ pub(crate) fn pred_velocity(
         // 意向（表现层用）：方向取输入方向，量级取档位（和 `send_input` 上行同一份）
         intent.direction = Vec3::new(direction.x, 0.0, direction.y);
         intent.magnitude = if direction.length_squared() > 1e-6 {
-            force
+            push
         } else {
             0.0
         };
@@ -183,10 +186,14 @@ pub(crate) fn pred_velocity(
             settings.turn_brake_min_scale,
         );
         pred.brake = tuning::ramp_turn_brake(pred.brake, target, state.yaw_rate, dt);
+        // 降速比例也要进动画档位（和单机的 `intent.speed_scale` 同一个语义）：
+        // 只压速度不压档位，甩头时腿还在跑满档、身子已经慢下来了，就是滑步
+        intent.speed_scale = pred.brake;
 
         if !airborne {
             let ground = if direction.length_squared() > 1e-6 {
-                tuning::ground_velocity([direction.x, direction.y], pred.brake)
+                // 档位同时进速度：只进动画不进速度，走档就是「腿在走、身子在冲刺」
+                tuning::ground_velocity_push([direction.x, direction.y], pred.brake, push)
             } else {
                 [0.0, 0.0]
             };
@@ -199,11 +206,13 @@ pub(crate) fn pred_velocity(
             velocity.0.x = stepped[0];
             velocity.0.z = stepped[1];
         } else if air_steer_active(air_elapsed, air_steer_secs) && direction.length_squared() > 1e-6 {
-            // 滞空：保动量、限转向（同一份 `air_steer_velocity`，同一组旋钮）
+            // 滞空：保动量、限转向（同一份 `air_steer_velocity`，同一组旋钮）。
+            // 加速度按档位缩放：单机用 `magnitude`、服务端用「dir 长度 × force」，
+            // 这里是同一个量，轻推不会拿到满力度
             let steered = air_steer_velocity(
                 [velocity.0.x, velocity.0.z],
                 [direction.x, direction.y],
-                air_accel * force,
+                air_accel * push,
                 dt,
             );
             velocity.0.x = steered[0];
@@ -289,13 +298,23 @@ pub(crate) fn pred_reconcile(
 }
 
 /// 本帧渲染：插值（`PoseSmoothing`）+ 视觉软偏移。
+///
+/// 同时写一份**不含**软偏移的 [`CameraAnchor`]：机位读那一份，`vis` 这层收敛
+/// 只留给眼睛看角色自己（否则每次和解都会带着整幅画面晃）。
 pub(crate) fn pred_render(
     time: Res<Time>,
-    mut locals: Query<(&mut Prediction, &mut PoseSmoothing, &mut Transform)>,
+    mut commands: Commands,
+    mut locals: Query<(
+        Entity,
+        &mut Prediction,
+        &mut PoseSmoothing,
+        Option<&mut CameraAnchor>,
+        &mut Transform,
+    )>,
 ) {
     let dt = time.delta_secs();
     let decay = (-dt / VIS_TAU).exp();
-    for (mut pred, mut smoothing, mut transform) in &mut locals {
+    for (entity, mut pred, mut smoothing, mut anchor, mut transform) in &mut locals {
         pred.vis *= decay;
         pred.vis_yaw *= decay;
         let Some((pos, yaw)) = smoothing.sample(dt) else {
@@ -304,6 +323,13 @@ pub(crate) fn pred_render(
         let (vis, vis_yaw) = pred.offset();
         transform.translation = pos + vis;
         transform.rotation = Quat::from_rotation_y(yaw + vis_yaw);
+        match anchor.as_mut() {
+            Some(anchor) => anchor.0 = pos,
+            // 认领那一帧可能还没挂：下一帧之前相机先读 `Transform`，这里补上
+            None => {
+                commands.entity(entity).insert(CameraAnchor(pos));
+            }
+        }
     }
 }
 
@@ -321,6 +347,82 @@ mod tests {
         pred.vis = (pred.vis - delta).clamp_length_max(VIS_MAX);
         let shifted = before + delta;
         assert!((shifted + pred.vis - before).length() < 1e-5, "校正那一帧画面被推动了");
+    }
+
+    /// 预测端必须把「走档」原样带进动画轴，并且地速也跟着档位走。
+    ///
+    /// 单机的档位是「摇杆偏转 × force」合成 `speed` 轴，物理速度再由混合输出的
+    /// 等效地速决定——走档 1.5 m/s、跑档 3.0 m/s。预测端如果只拿 `force` 当档位、
+    /// 地速却始终按满速算，画面就是「走档的腿、跑档的身子」，看着永远在跑。
+    #[test]
+    fn walk_gait_survives_the_prediction_step() {
+        use bevy::ecs::system::RunSystemOnce;
+        use std::time::Duration;
+
+        /// 按 `deflection` / `force` 跑 40 个 tick，返回（动画轴量级，稳态地速）
+        fn step(deflection: f32, force: f32) -> (f32, f32) {
+            let mut app = App::new();
+            app.init_resource::<Time<Fixed>>()
+                .init_resource::<PredClock>()
+                .insert_resource(EffectiveMove {
+                    // 屏幕上方（-Y）= 相机视线正前方 = 世界 +Z：和初始朝向一致，
+                    // 免得测试自己被转身降速压住档位
+                    direction: Vec2::NEG_Y,
+                    deflection,
+                    force,
+                })
+                .insert_resource(CameraFacing {
+                    yaw: 0.0,
+                    pitch: 0.0,
+                })
+                .insert_resource(MovementSettings::default())
+                .insert_resource(JumpSettings::default());
+            app.world_mut().resource_mut::<PredClock>().anchored = true;
+
+            let body = app
+                .world_mut()
+                .spawn((
+                    LinearVelocity::ZERO,
+                    Rotation::IDENTITY,
+                    Prediction::default(),
+                    LocomotionIntent::default(),
+                    FacingState::default(),
+                ))
+                .id();
+
+            let mut velocity = Vec3::ZERO;
+            for _ in 0..120 {
+                app.world_mut()
+                    .resource_mut::<Time<Fixed>>()
+                    .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+                app.world_mut()
+                    .run_system_once(pred_velocity)
+                    .expect("预测端跑不起来");
+                velocity = app.world().get::<LinearVelocity>(body).expect("速度").0;
+            }
+            let intent = *app.world().get::<LocomotionIntent>(body).expect("意图");
+            (intent.magnitude, Vec2::new(velocity.x, velocity.z).length())
+        }
+
+        // 键盘走档：偏转满、force 0.5 → 档位 0.5，地速半速
+        let (walk_axis, walk_speed) = step(1.0, 0.5);
+        assert!(
+            (walk_axis - 0.5).abs() < 1e-3,
+            "走档被当成跑档送进混合空间：magnitude = {walk_axis}"
+        );
+        assert!(
+            (walk_speed - tuning::MOVE_SPEED_MPS * 0.5).abs() < 0.05,
+            "走档的地速不是半速：{walk_speed} m/s"
+        );
+        // 跑档：满档、满速
+        let (run_axis, run_speed) = step(1.0, 1.0);
+        assert!((run_axis - 1.0).abs() < 1e-3 && (run_speed - 3.0).abs() < 0.05);
+        // 触屏轻推：偏转和 force 都要算进去（单机是 `偏转 × force`），不能按满档跑
+        let (half_axis, half_speed) = step(0.5, 0.5);
+        assert!(
+            (half_axis - 0.25).abs() < 1e-3 && (half_speed - 0.75).abs() < 0.05,
+            "轻推摇杆被当成满档：轴 {half_axis}、地速 {half_speed}"
+        );
     }
 
     /// 视觉偏移按指数收敛，帧率不同、同样的真实时间长度收敛到同样的量。

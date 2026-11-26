@@ -153,6 +153,29 @@ pub struct FootIkSettings {
     /// 为什么不无限拧：踝关节本身不产生偏航，全靠髋的外旋。真人撑着脚转到 ~30° 就
     /// 拧不动了，再转就是脚在地上撇。0 = 不锁（退回旧行为）
     pub foot_yaw_limit: f32,
+    /// 踝关节自己能扛多少偏航（度）：本体转过去、脚掌还压在地上的那一段，
+    /// 先由踝（其实是髋外旋，腿两侧分摊）吸收这么多，**再多的部分改由绕前掌转**
+    /// 实现（口径见 [`FootYawLock`] 与 [`FootLock::set_ball_pin`]）。
+    ///
+    /// 为什么不是把全部给踝：脚掌平放在地上、身体转 28°，踝关节在画面上就是一
+    /// 个歪掉的角，腿还得横伸出去够它。真人这时不是「拧脚踝」，是**踩到前掌、
+    /// 脚跟抬起来、整个身体绕那颗球转** —— 球的接触点不动，踝跟着小腿走，
+    /// 腿只需要几度外展，画面上看不出任何滑动。
+    ///
+    /// 取 12°：踝的横轴（距下关节）活动范围本来就这么大，再加上小腿自己能带
+    /// 一点。0 = 一有偏航就绕球转（脚掌从踩实第一帧就跟着身体走）；
+    /// 等于 `foot_yaw_limit` = 关掉绕球转，退回「拧着脚踝硬扛」的旧行为
+    pub ball_pivot_enter: f32,
+    /// 踝关节替身体扛不下的那点偏航，分多少给**腿骨**（0..1）。
+    ///
+    /// 脚被钉在地上、身体转过去，这段角差最后全压在踝上：胫骨相对脚掌被拧
+    /// 二三十度，膝盖的前面跟着身体撇出去 —— 观感就是「小腿被强行扭转、膝盖
+    /// 外翻」。真人不是这么转的：髋内旋能吃到 20~40°，胫骨相对脚掌只有十几度。
+    /// 所以先分一段给股骨+胫骨（同向同量地绕自己骨轴滚，膝盖两端仍对齐），
+    /// 剩下的才留给踝。0 = 全压踝上（旧行为），默认 0.65
+    pub leg_roll_share: f32,
+    /// 腿骨最多内/外旋多少度（度）。再大就不是「跟着转」，是「腿被拧」了
+    pub leg_roll_max: f32,
     /// 落地后「把脚掌从空中的限速值过渡到动画值」的时长（秒）。
     ///
     /// 空中限速会让脚掌滞后动画十几度，落地那一帧如果直接把 `planted` 的分支切成
@@ -191,6 +214,12 @@ impl Default for FootIkSettings {
             ground_probe: true,
             // 30°：髋外旋能撑住的量级；再大脚掌相对小腿就明显歪了
             foot_yaw_limit: 30.0,
+            // 12°：踝（距下关节）自己扛的量；再多就绕前掌转，脚跟在离地
+            ball_pivot_enter: 12.0,
+            // 0.65 / 18°：28° 的一段转身，踝只留 10°（距下关节本来就吃得住），
+            // 18° 交给髋内旋 + 胫骨自旋
+            leg_roll_share: 0.65,
+            leg_roll_max: 18.0,
             // 30cm：比一条小腿短得多，不会从台阶上方误打到下面的地面
             ground_probe_rise: 0.30,
             // 1.5m：够跨过一层楼梯（约 17cm）和常见落差，又不会打到很远的房间地板
@@ -301,6 +330,19 @@ pub struct FootIk {
     lift_out: [f32; 2],
     /// 两只脚的脚掌偏航锁状态（踩实期间不让脚掌被身体拧着走）
     yaw_locks: [FootYawLock; 2],
+    /// 两只脚**踩实期间**前掌（球）在地面上的滑移速度（m/s）。
+    ///
+    /// 球是脚掌上真正压地的那一点，也是绕球转的支点：锚点正确时它必须接近 0。
+    /// 不用踝当读数 —— 绕球转的时候踝本来就走一段弧，那不是滑步
+    slip: [f32; 2],
+    /// 上一帧的球位置；离地时置 None，下一段支撑重新起量
+    slip_prev: [Option<Vec3>; 2],
+    /// 两只脚这一帧分给腿骨的自旋（弧度，正负号同 `FootYawLock`）。
+    /// 从踝手里接过来、换成绕骨轴滚的那一段
+    leg_roll: [f32; 2],
+    /// 两只脚踝关节里**还剩**多少扭转（弧度）：`yaw_out - leg_roll`。
+    /// 也就是「胫骨相对脚掌还拧着多少」，面板上读它判断要不要继续加 `leg_roll_share`
+    ankle_twist: [f32; 2],
 }
 
 impl Default for FootIk {
@@ -331,6 +373,10 @@ impl Default for FootIk {
             toe_bend: [0.0; 2],
             lift_out: [0.0; 2],
             yaw_locks: [FootYawLock::default(); 2],
+            slip: [0.0; 2],
+            slip_prev: [None; 2],
+            leg_roll: [0.0; 2],
+            ankle_twist: [0.0; 2],
         }
     }
 }
@@ -360,6 +406,10 @@ impl FootIk {
         self.toe_bend = [0.0; 2];
         self.lift_out = [0.0; 2];
         self.yaw_locks = [FootYawLock::default(); 2];
+        self.slip = [0.0; 2];
+        self.slip_prev = [None; 2];
+        self.leg_roll = [0.0; 2];
+        self.ankle_twist = [0.0; 2];
     }
 
     /// 骨架缓存是否就绪（模型还在异步加载时为 false）
@@ -381,6 +431,43 @@ impl FootIk {
     /// 两只脚最近一帧被拉动的距离（米）
     pub fn correction(&self) -> [f32; 2] {
         self.correction
+    }
+
+    /// 两只脚**踩实期间**前掌（球）在地面上的滑移速度（m/s）。
+    ///
+    /// 诊断面板上的「滑步」就是它，比 `correction` 更直接：修正量是**欠的账**，
+    /// 这个是**脚底压地那一点真的在地上走**。
+    pub fn slip(&self) -> [f32; 2] {
+        self.slip
+    }
+
+    /// 两只脚最近一帧分给腿骨的自旋（度）：踝扛不动的那段里，转了多少换成
+    /// 「股骨+胫骨绕自己骨轴滚」。和 `ankle_twist_deg` 相加 = 整段偏航
+    pub fn leg_roll_deg(&self) -> [f32; 2] {
+        [
+            self.leg_roll[0].to_degrees(),
+            self.leg_roll[1].to_degrees(),
+        ]
+    }
+
+    /// 两只脚踝关节里**还剩**多少扭转（度）。分给腿骨之后它应当掉到十几度以内；
+    /// 一直在 25°+ 就是 `leg_roll_share` 还不够（也就是画面上看到的外翻）
+    pub fn ankle_twist_deg(&self) -> [f32; 2] {
+        [
+            self.ankle_twist[0].to_degrees(),
+            self.ankle_twist[1].to_degrees(),
+        ]
+    }
+
+    /// 两只脚最近一帧**绕前掌（球）转**的角度（度，自踩实起；正负号同身体转身方向相反）。
+    ///
+    /// 和 [`Self::yaw_lock_deg`] 对着看就是那段转身的分工：踝扛了多少、绕球转了多少。
+    /// 两者相加 = 本体这一段支撑里总共转过的角
+    pub fn ball_pivot_deg(&self) -> [f32; 2] {
+        [
+            self.yaw_locks[0].ball().to_degrees(),
+            self.yaw_locks[1].ball().to_degrees(),
+        ]
     }
 
     /// 两只脚当前承重点沿脚掌滑到哪了（0 = 脚踝，1 = 前掌）
@@ -829,6 +916,10 @@ fn solve_foot_ik(
             toe_bend,
             lift_out,
             yaw_locks,
+            slip,
+            slip_prev,
+            leg_roll,
+            ankle_twist,
             ..
         } = &mut *ik;
         let ground = *ground;
@@ -858,6 +949,8 @@ fn solve_foot_ik(
             *poles = [None; 2];
             *foot_rots = [None; 2];
             *toe_clamps = [None; 2];
+            *slip = [0.0; 2];
+            *slip_prev = [None; 2];
             *landing = [0.0; 2];
             *landing_from = [None; 2];
             *air_secs = [1.0; 2];
@@ -948,16 +1041,38 @@ fn solve_foot_ik(
                     planted_before,
                     replanted_before,
                     settings.foot_yaw_limit,
+                    settings.ball_pivot_enter,
                     dt,
                 )
                 .to_degrees();
+            // 超出踝活动范围的那段角改成「绕前掌（球）转」：承重点挪到前掌、
+            // 脚跟抬起来。球是脚掌上真正压在地上的那一点 —— 它不动，画面上就没有
+            // 滑动；踝随小腿走（不再被拧），腿也只需要几度外展就能吸收。
+            //
+            // 两个量都是**绝对**的（自踩实起累计），不是每帧增量：`FootLock` 每帧
+            // 用「踩实时的脚向量 − 当帧脚向量」算锚点，重复累加会转两倍
+            let ball_deg = yaw_locks[index].ball().to_degrees();
+            let enter = settings
+                .ball_pivot_enter
+                .max(0.0)
+                .min(settings.foot_yaw_limit.max(0.0));
+            let span = (settings.foot_yaw_limit - enter).max(1e-3);
+            // 承重点用 2° 的短坡切过去：几何项本身 ∝ 绕球角（起步那几帧本来就接近 0），
+            // 这里的坡只是为了不在一帧里把 `roll`（抬跟那条路）的项也一起翻倍
+            let pin = smoothstep((ball_deg.abs() / 2.0).clamp(0.0, 1.0));
+            let heel_up = smoothstep((ball_deg.abs() / span).clamp(0.0, 1.0));
+            locks[index].set_ball_pin(pin);
+            locks[index].set_heel_floor(HEEL_PIVOT_FLOOR_MAX * heel_up);
+
             // 再乘全局淡入：和位置修正一样，IK 关掉的过程中这条锁也要跟着放，
             // 否则位置已经交还动画、脚掌朝向还拧着 → 结束时脚突然撇一下
             let yaw_out = yaw_deg * blend;
+            // 脚掌绕它转的那根轴（地面法线）。下面分给腿骨的自旋必须**绕同一根
+            // 指上的轴**，否则拧的是反的：踝里的扭转会翻倍而不是缩小
+            let up = ground[index].map_or(Vec3::Y, |hit| hit.normal);
             if yaw_out.abs() > 1e-3 {
                 // 绕地面法线拧（斜坡上仍贴着坡面；没有射线命中就退回世界竖直轴）。
                 // 脚掌连同前掌整块刚体转，绕的是踝：踝还钉在锚点上，转出去的是前掌
-                let up = ground[index].map_or(Vec3::Y, |hit| hit.normal);
                 let rigid = Quat::from_axis_angle(up, yaw_out.to_radians());
                 pose.foot_rot = (rigid * pose.foot_rot).normalize();
                 if let Some(toe_rot) = pose.toe_rot {
@@ -967,6 +1082,27 @@ fn solve_foot_ik(
                     pose.toe = Some(pose.end + rigid * (toe - pose.end));
                 }
             }
+
+            // 这段偏航现在全压在踝上：小腿跟着身体转过去、脚掌被钉在原地，
+            // 胫骨相对脚掌就被拧了 `yaw_out` 那么多。画面上是「小腿被强行扭转，
+            // 膝盖顶到外侧」。真人做不到那个角 —— 髋内旋 + 胫骨自旋先吃掉一大半，
+            // 剩下的才进踝。分给腿骨的那段由 `solve_leg` 换成绕骨轴的滚
+            //
+            // 只在**踩实**的时候接：离地后脚不再被锁，这段角差本来就该还给动画。
+            // 而且退回要限速（见 `LEG_ROLL_RELEASE`）—— 一帧退回 18° 就是膝盖被拧
+            let planted_roll = locks[index].is_planted();
+            let want_roll = if planted_roll {
+                split_leg_roll(
+                    yaw_out,
+                    settings.leg_roll_share,
+                    settings.leg_roll_max.to_radians(),
+                )
+            } else {
+                0.0
+            };
+            let split = advance_leg_roll(leg_roll[index], want_roll, planted_roll, dt);
+            leg_roll[index] = split;
+            ankle_twist[index] = yaw_out - split;
 
             // 目标位置里已经带着「解除锁定后还没还完的残差」，
             // 所以抬脚是平滑追上动画，不会从锚点瞬移回去
@@ -993,7 +1129,34 @@ fn solve_foot_ik(
             // 混合空间换剪辑 / 权重抖动时，动画极点会逐帧晃，膝盖跟着晃就是「顿」；
             // 平滑后膝盖只朝一个方向慢慢转，转身时 50ms 的滞后肉眼看不出来。
             // 抬跟段要拿它探解，所以在这里算一次、后面共用（每帧同一条腿只平滑一次）
-            let animated_pole = (pose.joint - pose.root).normalize_or_zero();
+            // 脚钉在地上、身体转过去的时候，膝盖该跟着**脚**的矢状面弯，而不是
+            // 跟着身体：髋转、踝不动，股骨和胫骨只能在膝上横向掰开一个折角 ——
+            // 这就是画面上那个「膝盖外翻」。极点换成脚掌指向（踝→前掌的水平投影），
+            // 膝盖就一直在脚的正上方弯；偏航锁得越多，越以脚为准
+            let foot_forward = pose
+                .toe
+                .map(|toe| {
+                    let v = toe - pose.end;
+                    Vec3::new(v.x, 0.0, v.z)
+                })
+                .filter(|v| v.length_squared() > 1e-6)
+                .unwrap_or(Vec3::ZERO);
+            // 只在**超出踝活动范围**的那段里以脚为准。走路时偏航锁只有几度
+            // （脚跟落地→离地本来就会自然外旋几度），那时极点必须原样听动画的，
+            // 否则膝盖会被一个纯水平的矢量带偏，站直也会外翻
+            let enter_rad = settings.ball_pivot_enter.max(1.0).to_radians();
+            let ramp = if locks[index].is_planted() {
+                smoothstep(((yaw_out.abs() - enter_rad) / enter_rad.max(1e-3)).clamp(0.0, 1.0))
+            } else {
+                // 空中 / 抬腿：脚掌自己正在转（背屈、外旋），拿它当极点会让膝盖
+                // 跟着甩出去 —— 摆动期一律听动画
+                0.0
+            };
+            let animated_pole = knee_pole(
+                (pose.joint - pose.root).normalize_or_zero(),
+                foot_forward,
+                ramp,
+            );
             let smoothed_pole = smooth_pole(poles[index], animated_pole, dt, settings.pole_secs);
             if smoothed_pole.is_some() {
                 poles[index] = smoothed_pole;
@@ -1256,10 +1419,18 @@ fn solve_foot_ik(
                         transform.rotation = (pose.lower_rot.inverse() * pose.foot_rot).normalize();
                     }
                 }
+                // 离地：这一段量不到滑步（脚本来就该走），下一段支撑重新起量
+                measure_slip(
+                    &mut slip[index],
+                    &mut slip_prev[index],
+                    false,
+                    pose.toe.unwrap_or(pose.end),
+                    dt,
+                );
                 continue;
             }
 
-            let Some(solved) = solve_leg(pose, target, pole) else {
+            let Some(solved) = solve_leg(pose, target, pole, split, up) else {
                 continue;
             };
             let Some(leg) = rig.legs.get(index) else {
@@ -1274,8 +1445,37 @@ fn solve_foot_ik(
             if let Ok(mut transform) = transforms.get_mut(leg.foot) {
                 transform.rotation = solved.foot_local;
             }
+            // 球 = 落下去的踝 + 当帧的「踝→前掌」：锁脚把锚点钉在前掌上时，
+            // 这一个点就是画面上贴着地的那一点，它的速度就是肉眼看到的滑步
+            let ball = pose
+                .toe
+                .map_or(target, |toe| target + (toe - pose.end));
+            measure_slip(
+                &mut slip[index],
+                &mut slip_prev[index],
+                locks[index].is_planted(),
+                ball,
+                dt,
+            );
         }
     }
+}
+
+/// 量这一帧脚底接触点在地面上走了多远（m/s）。
+///
+/// 口径是**前掌（球）**这一个点：它是脚掌上压地的那一点，也是绕球转的支点。
+/// 不用踝读数 —— 绕球转的时候踝本来就该走一段弧；也不用脚掌朝向的扫弧 ——
+/// 球钉住、脚跟抬起来的时候，脚掌转是对的，不是滑。
+///
+/// 只在连续两帧都踩实时有意义（飞行期脚本来就该走），离地时清掉参照点。
+fn measure_slip(slip: &mut f32, previous: &mut Option<Vec3>, planted: bool, ball: Vec3, dt: f32) {
+    if !planted {
+        *slip = 0.0;
+        *previous = None;
+        return;
+    }
+    *slip = previous.map_or(0.0, |last| (ball - last).length() / dt.max(1e-4));
+    *previous = Some(ball);
 }
 
 /// 只解不写：按当前姿态把腿解一次，返回 `(解出来的膝盖, 实际到达的踝)`。
@@ -1319,16 +1519,27 @@ struct LegSolution {
 ///
 /// `pole`：膝盖应当偏向的世界方向（已归一化的单位向量）。传低通后的值，
 /// 膝盖就不会跟着动画的极点逐帧抖。
-fn solve_leg(pose: LegPose, target: Vec3, pole: Vec3) -> Option<LegSolution> {
+///
+/// `roll`：股骨 / 胫骨各自绕**自己骨轴**再滚多少（弧度）。两段骨滚同一个量，
+/// 膝两端的前面仍然对齐（不会在膝上掰出折角），但整条腿的朝向往脚那边偏
+/// 一个 `roll` —— 踝里剩下的扭转因此少这么多。脚的世界朝向、踝的位置都不变：
+/// 它只是把「拧在踝上的那段」提前在腿上转掉
+fn solve_leg(pose: LegPose, target: Vec3, pole: Vec3, roll: f32, up: Vec3) -> Option<LegSolution> {
     let solution = solve_two_bone(
         pose.root, pose.joint, pose.end, target,
         // 极点方向；退化时求解器会自己退回当前膝盖的偏移方向
         pole,
     )?;
 
-    let upper_world =
-        aim_world_rotation(pose.upper_rot, pose.joint - pose.root, solution.upper_dir);
-    let lower_world = aim_world_rotation(pose.lower_rot, pose.end - pose.joint, solution.lower_dir);
+    // 骨轴是「髋→膝」「膝→踝」，指向地面；而 `roll` 的口径和脚掌那个刚体旋转
+    // 一样（绕地面法线、正方向按右手定则）。所以先把骨轴翻到「指上」再转，
+    // 不然滚的是反方向 —— 踝里的扭转会翻倍
+    let roll_upper = Quat::from_axis_angle(upward(solution.upper_dir, up), roll);
+    let roll_lower = Quat::from_axis_angle(upward(solution.lower_dir, up), roll);
+    let upper_world = roll_upper
+        * aim_world_rotation(pose.upper_rot, pose.joint - pose.root, solution.upper_dir);
+    let lower_world = roll_lower
+        * aim_world_rotation(pose.lower_rot, pose.end - pose.joint, solution.lower_dir);
 
     Some(LegSolution {
         upper_local: (pose.parent_rot.inverse() * upper_world).normalize(),
@@ -1336,6 +1547,62 @@ fn solve_leg(pose: LegPose, target: Vec3, pole: Vec3) -> Option<LegSolution> {
         lower_local: (upper_world.inverse() * lower_world).normalize(),
         foot_local: (lower_world.inverse() * pose.foot_rot).normalize(),
     })
+}
+
+/// 把一根骨轴翻成「朝上」的口径：`roll` 的正方向统一按「绕地面法线、右手定则」，
+/// 而骨轴（髋→膝、膝→踝）是朝下的。不翻过来，股骨/胫骨就滚反了
+fn upward(axis: Vec3, up: Vec3) -> Vec3 {
+    if axis.dot(up) < 0.0 { -axis } else { axis }
+}
+
+/// 腿骨自旋**接上**的速率（度/秒）：踩实那一刻脚已经在地上，可以快一点。
+/// 100°/s ≈ 1.7°/帧，18° 的量摊满 0.18s
+const LEG_ROLL_RATE: f32 = 100.0;
+
+/// 腿骨自旋**放开**的速率（度/秒）：脚离地之后才放的这一段。
+///
+/// 比接上慢得多（18° 要 0.23s）：抬腿那一帧如果把 18° 一口气退回 0，股骨和
+/// 胫骨会在一帧里反向滚 18°，膝盖就像被一只看不见的手拧了一下 —— 用户报的
+/// 「抬腿时膝盖严重外翻」就是它。摊开放，动画本来就在摆动期自己做旋转
+const LEG_ROLL_RELEASE: f32 = 80.0;
+
+/// 腿骨自旋的跨帧推进：踩实时向目标靠近，离地后一帧一帧退回 0。
+///
+/// 两个速率分开而不是共用一个：接上要跟得上支撑期开头（不然整个支撑期都在
+/// 慢慢追），放开要慢（不然抬腿那一帧膝盖反向滚一下）
+fn advance_leg_roll(current: f32, target: f32, planted: bool, dt: f32) -> f32 {
+    let rate = if planted {
+        LEG_ROLL_RATE
+    } else {
+        LEG_ROLL_RELEASE
+    };
+    let step = rate.to_radians() * dt.max(0.0);
+    let delta = (target - current).clamp(-step, step);
+    current + delta
+}
+
+/// 一段偏航里分给腿骨（自旋）多少弧度。
+///
+/// 按比例分再夹上限：小角度（正常走路里的几度）按比例吃掉一部分，看着就是腿
+/// 轻轻跟着转；大角度（支撑期里转 25°+）夹在上限，剩下的留在踝里。
+/// 夹上限而不是「全给腿」：腿真的滚到 20° 以上，脚掌相对地面就明显歪了
+fn split_leg_roll(twist: f32, share: f32, max: f32) -> f32 {
+    if !twist.is_finite() {
+        return 0.0;
+    }
+    (twist * share.clamp(0.0, 1.0)).clamp(-max.abs(), max.abs())
+}
+
+/// 极点：动画的膝盖朝向 + 脚掌指向，按 `ramp`（偏航锁的强度）混合。
+///
+/// 走路/站立时两者本来就差不多（膝盖朝脚尖）；转身时它们差的就是那段偏航，
+/// 这时以脚为准 —— 膝盖留在脚的矢状面里，不会横向掰开
+fn knee_pole(animated: Vec3, foot_forward: Vec3, ramp: f32) -> Vec3 {
+    let ramp = ramp.clamp(0.0, 1.0);
+    if foot_forward.length_squared() <= 1e-6 {
+        return animated;
+    }
+    animated.lerp(foot_forward.normalize(), ramp).normalize_or_zero()
 }
 
 /// 膝盖朝向的低通：`previous` / `animated` 都是世界空间的单位向量，
@@ -1404,6 +1671,13 @@ const LIFT_RELEASE_SECS: f32 = 0.10;
 /// 且跨帧连续 —— 抬脚那一帧不会看到脚掌「弹」一下。
 const YAW_RELEASE_SECS: f32 = 0.10;
 
+/// 绕前掌转时抬跟进度的下限（0..1）。
+///
+/// 刻度同 [`crab_feast_library::ik::foot_lock::ROLL_SPAN`]：0.3 是承重点刚滑到
+/// 前掌、开始掰脚掌，再往上才真的把脚跟抬离地面。取 0.45：脚跟抬离一两厘米、
+/// 脚掌俯 10~15° —— 刚好够「绕球转」看起来是在**转**，又不像在蹬地
+const HEEL_PIVOT_FLOOR_MAX: f32 = 0.45;
+
 /// 单只脚的偏航锁：踩实期间让脚掌的**世界朝向**不跟着身体的偏航转。
 ///
 /// 锁脚（[`FootLock`]）只管位置，脚掌旋转一直原样跟着动画的 hips 走 ——
@@ -1418,6 +1692,12 @@ struct FootYawLock {
     applied: f32,
     /// 上一帧量到的脚掌朝向：用来认出「脚掌被动画掰到失控、方位角翻过去」的读数
     last_yaw: Option<f32>,
+    /// 这一段支撑里本体一共转了多少（弧度，自踩实起，正负号同 `applied` 的相反数）：
+    /// 「脚掌本来被身体带着要转多少」
+    want: f32,
+    /// 其中**超出踝关节活动范围、改由绕前掌转**的那一段（弧度，自踩实起）。
+    /// 它是绝对量而不是增量：踩实那帧为 0，随本体转起来单调长，抬脚清零
+    ball: f32,
 }
 
 /// 一帧之内脚掌朝向跳多少度就算「量错了」。真转身 90°/s 只有 1.5°/帧，
@@ -1435,6 +1715,7 @@ impl FootYawLock {
         planted: bool,
         replanted: bool,
         limit_deg: f32,
+        enter_deg: f32,
         dt: f32,
     ) -> f32 {
         let limit = limit_deg.max(0.0).to_radians();
@@ -1442,6 +1723,8 @@ impl FootYawLock {
             // 离地：基准作废（下一段支撑重新记），压着的补偿指数放掉
             self.reference = None;
             self.last_yaw = None;
+            self.want = 0.0;
+            self.ball = 0.0;
             self.applied *= (-dt.max(0.0) / YAW_RELEASE_SECS).exp();
             if self.applied.abs() < 1e-4 {
                 self.applied = 0.0;
@@ -1472,12 +1755,33 @@ impl FootYawLock {
         let want = self
             .reference
             .map_or(0.0, |reference| wrap_pi(reference - yaw_now));
+        self.want = want;
+
+        // 分工：踝自己拧 `enter`，剩下的绕前掌转。
+        //
+        // - `excess` = 超出踝活动范围的那段角 → 交给「绕球」；
+        // - 绕球也不是无限的：踝到前掌只有十几厘米，转太多踝得甩出去半条腿。
+        //   上限是 `limit - enter`（也就是「脚掌世界朝向还允许被带偏」的余量），
+        //   再多的部分只能让脚掌在地上滑 —— 和旧行为一致，且只在 30° 以上的
+        //   大角度上才会碰到（那种角度本来就得抬脚重踩，不是靠拧能解决的）
+        let enter = enter_deg.max(0.0).to_radians().min(limit);
+        let span = (limit - enter).max(0.0);
+        self.ball = (want - want.clamp(-enter, enter)).clamp(-span, span);
+        // 施加到脚掌上的补偿 = 脚掌要「被按住」的那部分
         self.applied = if limit > 0.0 {
-            want.clamp(-limit, limit)
+            (want - self.ball).clamp(-limit, limit)
         } else {
             0.0
         };
+        if limit <= 0.0 {
+            self.ball = 0.0;
+        }
         self.applied
+    }
+
+    /// 本段支撑里绕前掌转的角度（弧度，自踩实起；正负号同 [`Self::applied`] 相反）
+    fn ball(&self) -> f32 {
+        self.ball
     }
 }
 
@@ -2005,7 +2309,7 @@ mod tests {
     fn solved_leg_lands_on_target() {
         let pose = straight_pose();
         let target = Vec3::new(0.12, 0.0, 0.0);
-        let solved = solve_leg(pose, target, pose.joint - pose.root).expect("应当有解");
+        let solved = solve_leg(pose, target, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
 
         let upper_world = pose.parent_rot * solved.upper_local;
         let lower_world = upper_world * solved.lower_local;
@@ -2022,11 +2326,210 @@ mod tests {
         );
     }
 
+    /// 滑步读数是「前掌（球）真的在地上走」：钉住时必须是 0，
+    /// 被拖着走时按 m/s 算出来。它是分辨「拉扯 / 滑步 / 动画不匹配」三路的第一把尺子
+    #[test]
+    fn slip_reads_zero_when_the_ball_is_pinned() {
+        let mut slip = 0.0;
+        let mut prev = None;
+        let ball = Vec3::new(0.12, 0.0, 0.13);
+        let dt = 1.0 / 60.0;
+        for _ in 0..12 {
+            measure_slip(&mut slip, &mut prev, true, ball, dt);
+            assert!(slip < 1e-4, "钉住的脚报出 {slip:.4} m/s 的滑步");
+        }
+    }
+
+    /// 每帧挪 1.67cm（= 1 m/s @60Hz）要读出 1 m/s
+    #[test]
+    fn slip_reads_the_actual_ground_speed() {
+        let mut slip = 0.0;
+        let mut prev = None;
+        let dt = 1.0 / 60.0;
+        let mut ball = Vec3::ZERO;
+        measure_slip(&mut slip, &mut prev, true, ball, dt);
+        for _ in 0..6 {
+            ball.x += 0.016_667;
+            measure_slip(&mut slip, &mut prev, true, ball, dt);
+            assert!((slip - 1.0).abs() < 1e-3, "滑步读出 {slip:.3} m/s，期望 1.0");
+        }
+    }
+
+    /// 踝绕球转、球不动：那不是滑步。读数只看球，不看踝
+    #[test]
+    fn slip_ignores_the_ankle_orbiting_the_ball() {
+        let mut slip = 0.0;
+        let mut prev = None;
+        let dt = 1.0 / 60.0;
+        let ball = Vec3::new(0.12, 0.0, 0.13);
+        let ankle = Vec3::new(0.12, 0.0, 0.0);
+        measure_slip(&mut slip, &mut prev, true, ball, dt);
+        // 踝绕球转 16°，球留在原地
+        let spun = ball + Quat::from_rotation_y(16f32.to_radians()) * (ankle - ball);
+        assert!((spun - ankle).length() > 0.02, "踝本来就该走出一段弧");
+        measure_slip(&mut slip, &mut prev, true, ball, dt);
+        assert!(slip < 1e-4, "绕球转被判成滑步：{slip:.4} m/s");
+    }
+
+    /// 离地那一段不算滑步，而且要清掉参照点：下一段支撑的第一帧不能拿
+    /// 上一段支撑的球位置去比（那会凭空多出一条腿长的滑步）
+    #[test]
+    fn slip_resets_when_the_foot_leaves_the_ground() {
+        let mut slip = 0.0;
+        let mut prev = None;
+        let dt = 1.0 / 60.0;
+        measure_slip(&mut slip, &mut prev, true, Vec3::ZERO, dt);
+        measure_slip(&mut slip, &mut prev, false, Vec3::new(0.0, 0.3, 0.8), dt);
+        assert_eq!(slip, 0.0);
+        assert!(prev.is_none(), "离地没清参照点");
+    }
+
+    /// 腿骨自旋只拧腿、不动脚：脚的**世界朝向**必须一点不差地保住
+    /// （那是偏航锁的全部意义），胫骨绕自己的骨轴滚了 `roll` 那么多
+    #[test]
+    fn leg_roll_twists_the_shin_without_touching_the_foot() {
+        let pose = straight_pose();
+        let pole = pose.joint - pose.root;
+        let roll = 20f32.to_radians();
+        let flat = solve_leg(pose, pose.end, pole, 0.0, Vec3::Y).expect("应当有解");
+        let rolled = solve_leg(pose, pose.end, pole, roll, Vec3::Y).expect("应当有解");
+
+        let upper_flat = pose.parent_rot * flat.upper_local;
+        let lower_flat = upper_flat * flat.lower_local;
+        let upper_rolled = pose.parent_rot * rolled.upper_local;
+        let lower_rolled = upper_rolled * rolled.lower_local;
+
+        // 胫骨的世界旋转多了一个「绕骨轴」的滚
+        let delta = lower_rolled * lower_flat.inverse();
+        assert!(
+            (delta.angle_between(Quat::IDENTITY) - roll).abs() < 1e-3,
+            "腿骨只滚了 {:.1}°，期望 {:.1}°",
+            delta.angle_between(Quat::IDENTITY).to_degrees(),
+            roll.to_degrees()
+        );
+        // 脚的世界朝向不变：锁住的是脚，不是腿
+        let foot_flat = lower_flat * flat.foot_local;
+        let foot_rolled = lower_rolled * rolled.foot_local;
+        assert!(
+            foot_rolled.angle_between(foot_flat) < 1e-4,
+            "脚掌被腿骨自旋带走了 {:.1}°",
+            foot_rolled.angle_between(foot_flat).to_degrees()
+        );
+    }
+
+    /// 腿骨自旋的跨帧推进：踩实时接上，离地后**一帧一帧**退回，绝不一帧跳到 0。
+    /// 「抬腿时膝盖被拧一下」就是从这里漏出去的（18° 一帧退回）
+    #[test]
+    fn leg_roll_releases_gradually_after_the_foot_lifts() {
+        let dt = 1.0 / 60.0;
+        let max = 18f32.to_radians();
+        // 踩实：从 0 爬上 18° 大概要 0.18s（11 帧）
+        let mut roll = 0.0;
+        let mut frames = 0;
+        while roll < max - 1e-4 && frames < 120 {
+            roll = advance_leg_roll(roll, max, true, dt);
+            frames += 1;
+        }
+        assert!(frames < 14, "接上花了 {frames} 帧，太慢");
+        // 离地：一帧的变化必须远小于总量，而且总帧数够多（没人看得见的慢放）
+        let mut previous = roll;
+        let mut release = 0;
+        while roll.abs() > 1e-4 && release < 600 {
+            roll = advance_leg_roll(roll, 0.0, false, dt);
+            assert!(
+                (previous - roll).to_degrees() <= 80.0 / 60.0 + 1e-3,
+                "离地那一帧退了 {:.2}°",
+                (previous - roll).to_degrees()
+            );
+            previous = roll;
+            release += 1;
+        }
+        assert!(release >= 12, "18° 只用 {release} 帧就退完了，膝盖会被拧");
+        assert!(roll.abs() <= 1e-4, "没退回 0：{:.3}°", roll.to_degrees());
+    }
+
+    /// 自旋的**方向**要对：分给腿骨的那段必须把踝里的扭转减掉，而不是翻倍。
+    /// 骨轴（膝→踝）朝下，直接拿它转是反的 —— 这个测试就是钉住 `upward` 那一下
+    #[test]
+    fn leg_roll_reduces_the_ankle_twist_not_doubles_it() {
+        // 身体没动、脚掌被偏航锁拧了 +20°：踝里本来有 20° 的扭转
+        let pose = LegPose {
+            foot_rot: Quat::from_rotation_y(20f32.to_radians()),
+            ..straight_pose()
+        };
+        let pole = pose.joint - pose.root;
+        let flat = solve_leg(pose, pose.end, pole, 0.0, Vec3::Y).expect("应当有解");
+        let rolled = solve_leg(
+            pose,
+            pose.end,
+            pole,
+            10f32.to_radians(),
+            Vec3::Y,
+        )
+        .expect("应当有解");
+
+        let flat_twist = flat.foot_local.angle_between(Quat::IDENTITY).to_degrees();
+        let rolled_twist = rolled.foot_local.angle_between(Quat::IDENTITY).to_degrees();
+        assert!(flat_twist > 18.0, "初始扭转只有 {flat_twist:.1}°，测试摆错了");
+        assert!(
+            rolled_twist < flat_twist - 7.0,
+            "腿骨自旋把踝的扭转从 {flat_twist:.1}° 变成 {rolled_twist:.1}°（应该在减）"
+        );
+    }
+
+    /// 踝里剩下的扭转被分给腿骨之后要掉到人能做到的范围：28.5° 的一段转身，
+    /// 踝只留十来度（距下关节的量），其余交给髋内旋 + 胫骨自旋
+    #[test]
+    fn split_leg_roll_caps_the_ankle_twist() {
+        let settings = FootIkSettings::default();
+        let max = settings.leg_roll_max.to_radians();
+        let lock = 28.5f32.to_radians();
+        let split = split_leg_roll(lock, settings.leg_roll_share, max);
+        let residual = (lock - split).to_degrees();
+        assert!(
+            residual > 8.0 && residual < 12.0,
+            "踝里还剩 {residual:.1}°（28.5° 的一段转身）"
+        );
+        // 小角度按比例吃：走路的几度不该被夹上限全给腿
+        let small = split_leg_roll(6f32.to_radians(), settings.leg_roll_share, max);
+        assert!((small / 6f32.to_radians() - settings.leg_roll_share).abs() < 1e-4);
+        // 反向也一样，而且不会越过上限
+        assert!(split_leg_roll(-40f32.to_radians(), 0.65, max).abs() <= max + 1e-5);
+        assert_eq!(split_leg_roll(0.0, 0.65, max), 0.0);
+    }
+
+    /// 脚钉在地上、身体转过去时，极点要以**脚**为准：膝盖留在脚的矢状面里，
+    /// 不然髋转、踝不动，股骨胫骨只能在膝上横向掰开（画面上就是外翻）
+    #[test]
+    fn knee_pole_follows_the_foot_when_the_body_turns() {
+        let body_turned = Vec3::new(30f32.to_radians().sin(), 0.0, 30f32.to_radians().cos());
+        let foot_forward = Vec3::Z;
+        // 没锁（走路/站立）：还是听动画的（膝盖朝脚尖，两者本来就差不多）
+        let idle = knee_pole(body_turned, foot_forward, 0.0);
+        assert!(idle.angle_between(body_turned) < 1e-4);
+        // 锁满（身体转过一段）：极点翻到脚那边
+        let locked = knee_pole(body_turned, foot_forward, 1.0);
+        assert!(
+            locked.angle_between(foot_forward) < 1e-4,
+            "极点还跟着身体：{locked:?}"
+        );
+        // 半锁：在两者之间，而且是个单位向量
+        let half = knee_pole(body_turned, foot_forward, 0.5);
+        assert!((half.length() - 1.0).abs() < 1e-4);
+        assert!(
+            half.angle_between(body_turned).to_degrees() > 1.0
+                && half.angle_between(foot_forward).to_degrees() > 1.0
+        );
+        // 没有前掌骨（`toe = None`）：退回动画的极点，不能变成零向量
+        let no_toe = knee_pole(body_turned, Vec3::ZERO, 1.0);
+        assert!(no_toe.angle_between(body_turned) < 1e-4);
+    }
+
     /// 目标就是当前脚踝时，解应当退化成恒等（不该凭空给姿态加旋转）
     #[test]
     fn unchanged_target_is_a_noop() {
         let pose = straight_pose();
-        let solved = solve_leg(pose, pose.end, pose.joint - pose.root).expect("应当有解");
+        let solved = solve_leg(pose, pose.end, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
         assert!(solved.upper_local.angle_between(Quat::IDENTITY) < 1e-4);
         assert!(solved.lower_local.angle_between(Quat::IDENTITY) < 1e-4);
         assert!(solved.foot_local.angle_between(Quat::IDENTITY) < 1e-4);
@@ -2037,7 +2540,7 @@ mod tests {
     fn unreachable_target_keeps_bone_lengths() {
         let pose = straight_pose();
         let target = Vec3::new(0.0, 0.0, 0.6);
-        let solved = solve_leg(pose, target, pose.joint - pose.root).expect("应当有解");
+        let solved = solve_leg(pose, target, pose.joint - pose.root, 0.0, Vec3::Y).expect("应当有解");
 
         let upper_world = pose.parent_rot * solved.upper_local;
         let lower_world = upper_world * solved.lower_local;
@@ -2621,9 +3124,12 @@ mod tests {
         };
         let ankle = ankle_world(left_bones);
         let drift = Vec3::new(ankle.x - anchor_left.x, 0.0, ankle.z - anchor_left.z).length();
+        // 锚点现在钉的是**前掌**（球），踝是被允许绕球走的：18° 里踝扛 12°、
+        // 剩下 6° 绕球，踝沿球走出 9mm。不锁时身体会把它横向带走 29mm。
+        // 画面上真正压地的那一点是前掌（见 `FootLock::set_ball_pin`）
         assert!(
-            drift < 0.005,
-            "脚踝偏离锚点 {drift:.4}m（身体转 18° 本会把脚横向带走 {hip_drift:.4}m）"
+            drift < 0.012,
+            "脚踝绕球走偏了 {drift:.4}m（不锁 {hip_drift:.4}m）"
         );
 
         // 位置锁住了还不够：脚掌的**朝向**也得钉住，否则身体一转脚掌就在地上「拧螺丝」。
@@ -2645,9 +3151,18 @@ mod tests {
         }
         let toe = Vec3::from(matrix.translation);
         let yaw_deg = foot_yaw(ankle, toe).expect("脚掌平放，量得到").to_degrees();
+        // 脚掌朝向：踝能扛的那段 `ball_pivot_enter` 仍被锁住，超出去的部分改成绕球转
+        // ——所以脚掌**允许**跟着身体走那 6°，踝关节只拧 12°，不是 17°
+        let enter = app
+            .world()
+            .resource::<FootIkSettings>()
+            .ball_pivot_enter
+            .max(0.0);
+        let want = 18.0 - 0.9; // 踩实发生在第 0 帧，那时身体已经转到 0.9°
+        let expect = (want - enter).max(0.0);
         assert!(
-            (yaw_deg - 0.9).abs() < 1.0,
-            "着地脚的朝向跟着身体转了：{yaw_deg:.1}°（身体已转到 18°，没锁时约 17.1°）"
+            (yaw_deg - expect).abs() < 2.0,
+            "着地脚的朝向 {yaw_deg:+.1}°，期望 {expect:+.1}°（身体转 {want:.1}°，踝扛 {enter:.0}°）"
         );
 
         // 骨长不能被 IK 拉长：两段都应保持 0.35m
@@ -4571,7 +5086,7 @@ mod tests {
 
         for frame in 0..90 {
             // 身体转了之后，动画给的脚掌朝向就跟着 body 的偏航走 —— 这正是 bug 的来源
-            let applied = lock.update(Some(body), true, frame == 0, limit, dt);
+            let applied = lock.update(Some(body), true, frame == 0, limit, limit, dt);
             let world_deg = wrap_pi(body + applied).to_degrees();
             let body_deg = body.to_degrees();
             // 撑得住：世界朝向钉死在 0；撑不住：跟着身体撇，但落后正好一个上限
@@ -4606,19 +5121,19 @@ mod tests {
         let mut lock = FootYawLock::default();
         // 踩实时脚掌朝 0，随后身体慢慢把它带到 0.5 rad（1.7°/帧，和 90°/s 的实速同量级），
         // 补偿应当恰好是 -0.5；一步跳 34° 会被 `YAW_JUMP_MAX` 当成量错
-        lock.update(Some(0.0), true, true, 30.0, dt);
+        lock.update(Some(0.0), true, true, 30.0, 30.0, dt);
         let drift = 0.5_f32;
         let mut yaw = 0.0f32;
         while yaw < drift {
             yaw = (yaw + 0.03).min(drift);
-            lock.update(Some(yaw), true, false, 30.0, dt);
+            lock.update(Some(yaw), true, false, 30.0, 30.0, dt);
         }
         let held = lock.applied;
         assert!((held + drift).abs() < 1e-4, "基准没锁上：{held}");
 
         let mut previous = held;
         for _ in 0..30 {
-            let now = lock.update(Some(drift), false, false, 30.0, dt);
+            let now = lock.update(Some(drift), false, false, 30.0, 30.0, dt);
             assert!(now.abs() <= previous.abs() + 1e-6, "放掉的过程不能变大");
             assert!(previous.abs() - now.abs() < 0.15, "单帧不能跳");
             previous = now;
@@ -4634,23 +5149,23 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut lock = FootYawLock::default();
         // 踩实时脚掌朝 0，随后动画逐帧把它带到 0.6 rad（34°），补偿顶到 -30°
-        lock.update(Some(0.0), true, true, 30.0, dt);
+        lock.update(Some(0.0), true, true, 30.0, 30.0, dt);
         let yaw = 0.6_f32;
         let mut now = 0.0f32;
         while now < yaw {
             now = (now + 0.03).min(yaw);
-            lock.update(Some(now), true, false, 30.0, dt);
+            lock.update(Some(now), true, false, 30.0, 30.0, dt);
         }
         assert!((lock.applied.to_degrees().abs() - 30.0).abs() < 1e-3);
         // 空中 2 帧：只放掉一点点
         for _ in 0..2 {
-            lock.update(Some(yaw), false, false, 30.0, dt);
+            lock.update(Some(yaw), false, false, 30.0, 30.0, dt);
         }
         let before = lock.applied;
         assert!(before.to_degrees().abs() > 20.0, "2 帧不该放光");
 
         // 重新踩实：基准按「当前实际所在」记，补偿不变
-        let after = lock.update(Some(yaw), true, true, 30.0, dt);
+        let after = lock.update(Some(yaw), true, true, 30.0, 30.0, dt);
         assert!(
             (after - before).abs() < 1e-4,
             "重新踩实跳了：{:.3}° → {:.3}°",
@@ -4665,16 +5180,16 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut lock = FootYawLock::default();
         // 先锁住，再让动画把脚掌带到 20°，补偿攒到 -20°
-        lock.update(Some(0.0), true, true, 30.0, dt);
+        lock.update(Some(0.0), true, true, 30.0, 30.0, dt);
         let drift = 0.35_f32;
         for _ in 0..10 {
-            lock.update(Some(drift), true, false, 30.0, dt);
+            lock.update(Some(drift), true, false, 30.0, 30.0, dt);
         }
         let held = lock.applied;
         assert!((held + drift).abs() < 1e-3, "基准没锁上：{held}");
 
         // 量不到（脚掌竖起来了）：冻结，不许清零
-        let now = lock.update(None, true, false, 30.0, dt);
+        let now = lock.update(None, true, false, 30.0, 30.0, dt);
         assert!(
             (now - held).abs() < 1e-6,
             "量不到时应当冻结，实际 {:.2}° → {:.2}°",
@@ -4684,7 +5199,7 @@ mod tests {
 
         // 读数突然翻 180°：同样算量错，不能采纳
         let flipped = wrap_pi(drift + std::f32::consts::PI);
-        let now = lock.update(Some(flipped), true, false, 30.0, dt);
+        let now = lock.update(Some(flipped), true, false, 30.0, 30.0, dt);
         assert!(
             (now - held).abs() < 1e-6,
             "翻过去的读数被采纳了：{:.2}°",
@@ -4697,9 +5212,9 @@ mod tests {
     fn zero_limit_disables_the_yaw_lock() {
         let dt = 1.0 / 60.0;
         let mut lock = FootYawLock::default();
-        lock.update(Some(0.0), true, true, 0.0, dt);
+        lock.update(Some(0.0), true, true, 0.0, 0.0, dt);
         for _ in 0..20 {
-            let applied = lock.update(Some(0.4), true, false, 0.0, dt);
+            let applied = lock.update(Some(0.4), true, false, 0.0, 0.0, dt);
             assert_eq!(applied, 0.0);
         }
         assert_eq!(lock.applied, 0.0);

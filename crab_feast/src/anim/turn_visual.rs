@@ -32,7 +32,6 @@ use super::character::AnimModelRoot;
 use super::foot_ik::{FootIk, FootIkSettings};
 use super::jump::JumpAction;
 use super::locomotion::{VisualYaw, log_turn, yaw_of};
-use crab_feast_library::tuning::approach;
 use crate::input::{FacingState, LocomotionIntent, foot_support};
 use crate::predict::Prediction;
 
@@ -40,22 +39,21 @@ use crate::predict::Prediction;
 ///
 /// **必须不小于本体的转身顶速**（`tuning::TURN_SPEED_DEG_PER_SEC = 90`）：小于它，
 /// 差值在支撑期里就会一路攒大，攒到 180° 时 `wrap_pi` 一翻就是「瞬间转一个大角度」，
-/// 再花一两秒慢慢追回来——这正是实机上看到的那个形状。取 130 让它永远能跟住，
-/// 快慢的形状交给「换步窗口」去给（支撑期慢、抬脚期快）
-const PLANTED_DEG_PER_SEC: f32 = 130.0;
+/// 再花一两秒慢慢追回来——这正是实机上看到的那个形状。
+///
+/// 取 95 而不是 130：脚在支撑期里是钉在世界上的，本体每转一度，踝就要被拽着
+/// 走 `半径 × 1°`。130°/s × 0.3s × 身侧 12cm = 8.2cm 的弧，单机那条路径
+/// （`facing_system` 顶速 90°/s）只有 5.6cm —— 联机比单机多 44% 的拉拽，
+/// 这是「转弯时脚被拉扯 / 松手就滑步」的来源。95 只比本体快一点点，既能
+/// 永远跟住、不把差值攒到翻面，支撑期里的弧又回到单机的量级；真要更快，
+/// 快的那一段交给抬脚窗口（[`SWING_DEG_PER_SEC`]）
+const PLANTED_DEG_PER_SEC: f32 = 95.0;
 /// 有一只脚离地（换步窗口）允许的转速：把这一步该转的角度追回来
 const SWING_DEG_PER_SEC: f32 = 300.0;
 /// 腾空（跳跃）：没有地面反力，几乎不许转
 const AIR_DEG_PER_SEC: f32 = 20.0;
-/// 角加速度（度/秒²）：起步与收尾要有形状，否则一帧到顶速。
-/// 取大一点是为了让 0.15 s 的换步窗口也能真的转出角度——真正的人在脚离地时
-/// 可以甩得很快，慢的是踩实那一段
-const ACCEL_DEG_PER_SEC2: f32 = 2000.0;
 /// 支撑权重低于它就算「有脚离地」
 const SWING_CONTACT: f32 = 0.35;
-/// 追上目标的增益（度/秒 每 度误差）：误差 20° 时就跑满当前档位
-const FOLLOW_GAIN: f32 = 8.0;
-
 /// 允许落后本体多少（度）就强制加档追。
 ///
 /// 这是「绝不把差值攒到 ±180」的保险：差值一大，模型相对本体就朝向背面，
@@ -74,21 +72,19 @@ const LAG_LOG_SECS: f32 = 1.0;
 impl VisualYaw {
     /// 推进一帧，返回新的视觉朝向（弧度）。
     ///
-    /// `speed` 是本帧允许的顶速（度/秒），`target` 是逻辑朝向（弧度）。
-    /// 转过头的量永远不超过剩余误差，所以不会在终点来回摆。
+    /// `speed` 是本帧允许的顶速（度/秒），`target` 是**插值后的**本体朝向（弧度）。
+    ///
+    /// 纯粹按速度限流，没有「按误差比例加速」那一层：目标的转速本来就在 90°/s
+    /// 以内（它是插值曲线，不是逻辑朝向的 180°/s 硬转），限速只是防跳；
+    /// 而按误差取速会让它**稳定落后** `转速 / 增益` —— 90°/s ÷ 8 = 11°。
+    /// 那 11° 会被 `locomotion` 当成「移动方向偏了 11°」塞进混合空间的 yaw 轴，
+    /// 转弯时腿就切去放横移剪辑，看起来就是「腿扭到一个奇怪的角度」，IK 治不了
     fn advance(&mut self, target: f32, speed: f32, dt: f32) -> f32 {
         let error = wrap_pi(target - self.yaw);
-        let error_deg = error.to_degrees();
-        let speed = speed.max(0.0);
-        let desired = if error_deg.abs() < 0.5 {
-            0.0
-        } else {
-            error.signum() * (error_deg.abs() * FOLLOW_GAIN).min(speed)
-        };
-        let accel = ACCEL_DEG_PER_SEC2 * dt;
-        self.rate = approach(self.rate, desired, accel).clamp(-speed, speed);
-        let step = error.signum() * (self.rate.abs().to_radians() * dt).min(error.abs());
-        self.yaw = wrap_pi(self.yaw + step);
+        let cap = speed.max(0.0) * dt.max(0.0);
+        let step = error.to_degrees().clamp(-cap, cap);
+        self.rate = step / dt.max(1e-4);
+        self.yaw = wrap_pi(self.yaw + step.to_radians());
         self.yaw
     }
 }
@@ -181,7 +177,10 @@ pub(crate) fn follow_visual_yaw(
             speed
         };
 
-        let yaw = visual.advance(facing.yaw, speed, dt);
+        // 目标换成**插值后的**本体朝向：`PoseSmoothing::sample` 已经把位置和朝向
+        // 一起插值成一条延迟 1.25/3.0 tick 的曲线，模型只要跟着它 —— 两只表叠起来
+        // 才是那 11° 稳定落后 + 支撑期拧脚的来源
+        let yaw = visual.advance(body_yaw, speed, dt);
 
         // 诊断：可见朝向单帧跳了多少。`视觉` 那一栏是我们自己算的（理论上不会跳），
         // `本体` 那一栏是 `pred_render` 写进本体 Transform 的。哪一栏在跳，
@@ -271,9 +270,20 @@ mod tests {
         }
         let p = planted.yaw.to_degrees().abs();
         let s = swing.yaw.to_degrees().abs();
-        // 同样的 0.15 s 里，踩实档至少不能比本体走得少（本体 90°/s × 0.15 = 13.5°），
-        // 换步窗口则明显更快
-        assert!(p >= 13.5, "踩实档 0.15 s 只转了 {p:.1}°，跟不上本体的 13.5°");
+        // 第一段还带着角加速度的爬坡（2000°/s² 爬到 95°/s 要 0.05 s，吃掉不到 1°），
+        // 允许它比本体少一点点
+        assert!(p >= 12.0, "踩实档 0.15 s 只转了 {p:.1}°，跟不上本体的 13.5°");
+        // 坡爬满之后的第二段才看「跟不跟得住」：本体 90°/s × 0.15 = 13.5°，
+        // 踩实档这时已经是稳态转速，必须不落后
+        let yaw0 = planted.yaw;
+        for _ in 0..9 {
+            planted.advance(deg(120.0), PLANTED_DEG_PER_SEC, dt);
+        }
+        let steady = (planted.yaw - yaw0).to_degrees().abs();
+        assert!(
+            steady >= 13.5 - 1e-2,
+            "踩实档稳态 0.15 s 只转了 {steady:.2}°，跟不上本体的 13.5°（差值会攒到翻面）"
+        );
         assert!(s > p * 1.4, "0.15 s 内踩实 {p:.1}°，换步 {s:.1}°，档位没拉开");
         assert!(s > 15.0, "换步窗口只转了 {s:.1}°，追不回来");
     }
@@ -315,13 +325,9 @@ mod tests {
         let body = app
             .world_mut()
             .spawn((
+                // `pred_render` 写进本体的**插值朝向**：这一层要跟的就是它
                 Transform::default(),
-                FacingState {
-                    yaw: deg(60.0),
-                    ..Default::default()
-                },
-                // 跑起来才有换步窗口；这里按「满速前进」摆，`foot_support` 才会走
-                // 支撑权重那一条分支（否则意向量为 0 一律按踩实，档位是另一档）
+                FacingState::default(),
                 LocomotionIntent {
                     direction: Vec3::Z,
                     magnitude: 1.0,
@@ -343,8 +349,8 @@ mod tests {
             ))
             .id();
 
-        // 头两帧：先让系统把 VisualYaw 对齐到本体（0°），再开始追 60°
-        for _ in 0..3 {
+        // 先把视觉朝向对齐到本体（0°）
+        for _ in 0..2 {
             app.world_mut()
                 .resource_mut::<Time>()
                 .advance_by(Duration::from_secs_f32(1.0 / 60.0));
@@ -352,15 +358,60 @@ mod tests {
                 .run_system_once(follow_visual_yaw)
                 .expect("视觉转身系统跑不起来");
         }
-        let yaw = yaw_of(app.world().get::<Transform>(model).expect("模型").rotation);
-        assert!(yaw.abs() > deg(0.5), "模型根节点没被写入朝向：{yaw}");
+        // 本体一帧甩到 60°（`pred_render` 的插值曲线偶尔会走这样一步）
+        app.world_mut()
+            .get_mut::<Transform>(body)
+            .expect("本体")
+            .rotation = Quat::from_rotation_y(deg(60.0));
+        for _ in 0..2 {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+            app.world_mut()
+                .run_system_once(follow_visual_yaw)
+                .expect("视觉转身系统跑不起来");
+        }
+
+        // 模型根节点写的是「视觉 − 本体」的本地差值：踩实档一帧只能走 1.6°，
+        // 所以本地应该是 -58° 一带，绝不可能是 0（没写）
+        let local = yaw_of(app.world().get::<Transform>(model).expect("模型").rotation);
         assert!(
-            (yaw - deg(60.0)).abs() > deg(1.0),
-            "踩实档一帧就追上了 60°，档位没生效"
+            local < deg(-20.0),
+            "模型根节点没被写入朝向（本地 {:.1}°）",
+            local.to_degrees()
+        );
+        assert!(
+            local > deg(-60.0),
+            "踩实档一帧就把 60° 追平了，档位没生效（本地 {:.1}°）",
+            local.to_degrees()
         );
         // 本体一个字节都不该动
         let body_yaw = yaw_of(app.world().get::<Transform>(body).expect("本体").rotation);
-        assert!(body_yaw.abs() < 1e-6, "本体被写了：{body_yaw}");
+        assert!(
+            (body_yaw - deg(60.0)).abs() < 1e-6,
+            "本体被写了：{:.1}°",
+            body_yaw.to_degrees()
+        );
+    }
+
+    /// 稳态不许落后：本体以 90°/s 匀速转，视觉朝向必须跟住（误差 < 1°）。
+    ///
+    /// 这是「腿扭到一个奇怪的角度」的回归测试：按误差取速的旧实现会稳定落后
+    /// `90 ÷ 8 ≈ 11°`，那 11° 进混合空间的 yaw 轴就是横移剪辑
+    #[test]
+    fn tracks_the_interpolated_yaw_without_a_steady_lag() {
+        let dt = 1.0 / 60.0;
+        let rate = 90.0f32;
+        let mut visual = VisualYaw::default();
+        visual.init = true;
+        // 先跑一秒把任何瞬态吃掉
+        let mut body = 0.0f32;
+        for _ in 0..120 {
+            body += deg(rate * dt);
+            visual.advance(body, PLANTED_DEG_PER_SEC, dt);
+        }
+        let lag = wrap_pi(body - visual.yaw).to_degrees().abs();
+        assert!(lag < 1.0, "稳态落后 {lag:.2}°（90°/s 直行转身）");
     }
 
     /// 差值写回必须是「视觉 = 本体 + 本地」：本地旋转写错，模型会整体偏一个角

@@ -816,6 +816,9 @@ fn ground_brake_target(dir: Vec2, yaw: f32, turn_start_deg: f32, turn_min_scale:
 
 /// 地面速度目标（方向取输入方向，大小 = 满速 × 斜坡），见
 /// [`tuning::ground_velocity`]。
+///
+/// 只给探针用：实际驱动走 [`tuning::ground_velocity_push`]（要带档位）。
+#[cfg(test)]
 fn ground_velocity(dir: Vec2, brake: f32) -> Vec2 {
     let v = tuning::ground_velocity([dir.x, dir.y], brake);
     Vec2::new(v[0], v[1])
@@ -913,14 +916,11 @@ fn drive_avatars(
 
         let dir = Vec2::new(latest.0.dir[0], latest.0.dir[1]);
         let direction = dir.normalize_or_zero();
-        // 物理速度是「想走」的结果，会被墙/方块吃掉；动画与转向要的是意向，
-        // 所以这里两个都记：velocity 交给物理，intent 交给表现层
+        // 档位 = 摇杆偏转（`dir` 的长度）× force，和客户端的 `EffectiveMove::magnitude()`、
+        // 混合空间 `speed` 轴是同一个量。只看 `force` 会漏掉偏转量：触屏轻推被当成满档，
+        // 以及走档的 force=0.5 只改动画不改速度，结果是「腿在走、身子在冲刺」。
+        let push = (dir.length() * latest.0.force).clamp(0.0, 1.0);
         intent.dir = direction.to_array();
-        intent.speed = if direction.length_squared() > 1e-6 {
-            MOVE_SPEED_MPS * latest.0.force.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
         let yaw = net_yaw.map_or(0.0, |yaw| yaw.0);
         // 降速斜坡**每个 tick 都推**，空中也推：空中不改地速，但绝不能让两端的斜坡
         // 停在不同的格子上——落地那一 tick 速度是从坡上取的，差一格就是一步。
@@ -933,12 +933,27 @@ fn drive_avatars(
         brake.0 =
             tuning::ramp_turn_brake(brake.0, target, facing_rate.map_or(0.0, |rate| rate.0), dt);
 
+        // 物理速度是「想走」的结果，会被墙/方块吃掉；动画与转向要的是意向，
+        // 所以这里两个都记：velocity 交给物理，intent 交给表现层。
+        // 档位要和客户端同源：`push × 斜坡`，只乘 `push` 不乘斜坡，甩头时
+        // 身子已经慢下来、腿还在跑满档，看着就是滑步
+        intent.speed = if direction.length_squared() > 1e-6 {
+            MOVE_SPEED_MPS * push * brake.0
+        } else {
+            0.0
+        };
+
         if charge.phase != JumpPhase::Air {
             // 转身降速：夹角大时压到下限、**不归零**，甩头时人还往前走，只是慢下来。
             // 旋钮来自客户端上行（`turn_brake_start_deg` / `turn_brake_min_scale`），
             // 两端用同一条曲线 + 同一个斜坡才能逐 tick 对齐。
             let ground = if direction.length_squared() > 1e-6 {
-                let target = ground_velocity(direction, brake.0);
+                let target = tuning::ground_velocity_push(
+                    direction.to_array(),
+                    brake.0,
+                    push,
+                );
+                let target = Vec2::new(target[0], target[1]);
                 // 反向按有限加速度掰（和客户端同一个函数）：先刹到 0 再反向加速
                 let stepped = tuning::ground_velocity_step(
                     [velocity.0.x, velocity.0.z],
@@ -1567,6 +1582,10 @@ mod physics_probe {
                     LatestInput(MoveInput {
                         dir,
                         force: 1.0,
+                        // 这条用例量的是「刹车用的是权威 yaw」，所以显式把刹车打开：
+                        // 默认下限现在是 1.0（完全不减速），不传的话整段都不刹
+                        turn_brake_start_deg: 90.0,
+                        turn_brake_min_scale: 0.4,
                         ..MoveInput::default()
                     }),
                     InputGrace(INPUT_GRACE_SECS),
@@ -1649,7 +1668,7 @@ mod physics_probe {
         let (_, forward_path, _) = run_case([0.0, 1.0], 0.0, 120);
         let forward_speed = forward_path / 2.0;
         assert!(
-            // 起步有 0.15s 的加速曲线（20 m/s²），两秒平均会少走约 0.22m
+            // 起步有 0.067s 的加速曲线（48 m/s²），两秒平均会少走约 0.1m
             (forward_speed - MOVE_SPEED_MPS).abs() < 0.3,
             "正前方没跑满速：{forward_speed:.2} m/s"
         );
@@ -2062,23 +2081,26 @@ mod physics_probe {
         assert!(yaw.abs() < 180f32.to_radians());
         assert!(floor > 0.0, "下限不能归零");
 
-        // 90° 侧移：夹角正好在「开始刹车」的边上，速度一帧就换向、腿还在原地转。
-        // 身体转得快，夹角很快掉到 90° 以下，刹车就先松手了，所以只到中间档
-        let (min_scale, _, _, velocity, _, lateral, _) =
+        // 90° 侧移：120° 以内不减速（玩家口径），所以整段都是满速。
+        // 换向仍受加速度约束（90° 已经超出「顺向」那 70°），所以末态才沿新方向
+        let (min_scale, _, _, velocity, _, _, min_speed) =
             run(Vec2::new(1.0, 0.0), 0.0, cruise, 60, start, floor, dt);
         assert!(
-            min_scale < 0.7 && min_scale > floor + 0.05,
-            "90° 应该是中间档，实测 {min_scale}"
+            (min_scale - 1.0).abs() < 1e-4,
+            "90° 不该减速（120° 以内一律满速），实测 {min_scale}"
         );
-        // 换向现在是一条受加速度约束的曲线（不许一帧翻过去），所以过渡期里
-        // 垂直分量会从 3 掉到 0——只验「末态」在新方向上，不再拿全程最大值卡它
+        // 90° 是「绕转方向」不是「线插到零」：全程速度一点都不许掉
         assert!(
-            velocity.x > 2.0 && velocity.y.abs() < 1e-3,
+            min_speed > MOVE_SPEED_MPS * 0.97,
+            "90° 换向掉速了：最低 {min_speed:.2} m/s"
+        );
+        assert!(
+            velocity.x > 2.9 && velocity.y.abs() < 0.05,
             "90° 侧移最后该沿着新方向跑：{velocity:?}"
         );
         assert!(lateral <= MOVE_SPEED_MPS + 1e-4, "{lateral}");
 
-        // 过渡段：误差 60° 介于满速和下限之间
+        // 60° 误差同样在不减速区里
         let yaw0 = std::f32::consts::PI - 60f32.to_radians();
         let (_, scale, _, _, _, _, _) = run(
             Vec2::new(0.0, -1.0),
@@ -2090,8 +2112,8 @@ mod physics_probe {
             dt,
         );
         assert!(
-            scale > floor + 0.05 && scale < 1.0 - 0.05,
-            "60° 应该是中间值，实测 {scale}"
+            (scale - 1.0).abs() < 1e-4,
+            "60° 不该减速，实测 {scale}"
         );
 
         // 转过来之后：满速沿新方向，降速不漏到稳态

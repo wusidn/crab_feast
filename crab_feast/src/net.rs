@@ -11,8 +11,9 @@
 //! - **所有玩家（含本地）都是 `Kinematic`**：`Position` / `Rotation` 每帧直接由
 //!   `NetPos` / `NetYaw` 赋值（见 `net_pose.rs`），客户端不做预测、不做残差修正；
 //! - `Transform` 只有一份是插值出来的（[`PoseSmoothing`]）：在两份快照之间推进，
-//!   固定落后 1.25 个快照间隔。它不预测、不外推、不回写物理，只为把 60 Hz 采样
-//!   落在显示器帧上产生的台阶铺平；
+//!   固定落后一个可配的 tick 数（本地 1.25 / 远端 3.0，即 21 / 50 ms）。它不预测、不外推、不回写物理，只为把 60 Hz 采样
+//!   落在显示器帧上产生的台阶铺平；余量见底/积压时靠 ±10% 的时间伸缩排掉，
+//!   不靠硬夹（硬夹在真实网络上就是"冻结一帧再补格"）；
 //! - 本地角色挂 `Avatar`，交给动画系统那套单实例管线（混合空间 / 脚部 IK）；
 //! - 管线要的动画参数（[`LocomotionIntent`] / [`FacingState`]）在联网模式下没有本地物理
 //!   去写，由 `drive_net_animation` 每帧从复制下来的 `NetMotion` / `NetYaw` 翻译过来——
@@ -566,8 +567,9 @@ fn spawn_remote_visual(
         // Avian 0.8 的刚体只有 Dynamic / Static / Kinematic 三档：
         // Kinematic 不参与积分，组件由我们自己写，正好匹配"位置由服务器给"
         RigidBody::Kinematic,
-        // 视觉插值：远端玩家和本地玩家一样，60Hz 快照直写会一格一格跳
-        PoseSmoothing::default(),
+        // 视觉插值：远端玩家和本地玩家一样，60Hz 快照直写会一格一格跳。
+        // 远端要吸收过网抖动，缓冲比本地预测端更厚（见 `net_pose` 的两个滞后常量）
+        PoseSmoothing::remote(),
     ));
 }
 
@@ -697,8 +699,10 @@ fn claim_local_avatar(
                 // `Kinematic`、物理速度恒为 0，不补这一份转身时腿会继续朝正前方迈
                 LocomotionIntent::default(),
                 FacingState::default(),
-                // 视觉插值的状态：认领前挂在远端路径上，这里保证本地角色也有一份
-                PoseSmoothing::default(),
+                // 视觉插值的状态：认领前挂在远端路径上，这里换成**本地**的缓冲。
+                // 这条时间轴由 `pred_record` 在定步长里直接喂，没有到达抖动，
+                // 只需要夹住两份快照的一点余量（远端那 50 ms 的余量会白加在输入延迟上）
+                PoseSmoothing::local(),
                 // 本地预测核：自己按 60 Hz 推位移与朝向，快照只用来校正。
                 // `PlanarMotion` 不再挂——预测端有真实 `LinearVelocity`，
                 // 动画的 `yaw` 轴直接读实测位移，比服务端那份晚一个 RTT 的值更准。

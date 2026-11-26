@@ -42,10 +42,12 @@ pub(crate) use driver::{Skeleton, build_skeleton};
 // `FootIk` 是联机角色管理 / 调试面板要读的公共句柄，当前单人流程还没用到
 #[allow(unused_imports)]
 pub use foot_ik::FootIk;
+pub use locomotion::VisualYaw;
 // 联机远端角色要自己往 `FootIk` 里写支撑权重/静止判据，还得排到 IK 前面
 pub use foot_ik::FootIkSettings;
 #[allow(unused_imports)]
 pub(crate) use foot_ik::{FootIkSet, FootIkTarget};
+pub(crate) use character::AnimModelRoot;
 pub use mixers::{MixerCache, MixerEdit, load_space_doc, save_space_doc};
 
 pub(crate) use self::core::ClipSet;

@@ -409,6 +409,23 @@ fn load_settings(
     match loaded {
         Some(loaded) => {
             info!("移动设置已从磁盘载入：{loaded:?}");
+            // 磁盘上的旋钮会**盖掉**代码里的默认值：这层改过很多次默认
+            // （90→124、1.0→0.4），旧档里存的是老数，于是「改了代码没生效」。
+            // 每次启动把实际口径和路径打出来，省得再猜
+            let default = MovementSettings::default();
+            if (loaded.turn_brake_start_deg - default.turn_brake_start_deg).abs() > 1e-3
+                || (loaded.turn_brake_min_scale - default.turn_brake_min_scale).abs() > 1e-3
+            {
+                let path = path.0.as_deref().map_or("<无>".into(), |p| p.display().to_string());
+                info!(
+                    "移动设置用的是存档值：转身降速 起点 {:.0}° / 下限 {:.2}×（{path}），\
+                     代码默认 {:.0}° / {:.2}×",
+                    loaded.turn_brake_start_deg,
+                    loaded.turn_brake_min_scale,
+                    default.turn_brake_start_deg,
+                    default.turn_brake_min_scale
+                );
+            }
             *settings = loaded;
         }
         None => info!("没有移动设置文件，使用默认值"),

@@ -460,6 +460,11 @@ struct Sample {
     ik_corr: Option<f32>,
     /// 同一具骨架本帧的根位移（米），只作副信息对照。
     ik_step: Option<f32>,
+    /// 踩实的脚在地面上实际的滑移速度（m/s，取最坏的一只）
+    ik_slip: Option<f32>,
+    /// 踝关节里还剩多少扭转（度，取最坏的一只）：分给腿骨之后该掉到十几度以内，
+    /// 一直在 25°+ 就是画面上看到的「小腿被拧、膝盖外翻」
+    ik_twist: Option<f32>,
     ik_avg_blend: Option<f32>,
     ik_count: usize,
     cam_strategy: Option<&'static str>,
@@ -467,6 +472,9 @@ struct Sample {
     /// 本地（联机）角色的最新快照位置。
     #[cfg_attr(not(feature = "net"), allow(dead_code))]
     net_pos: Option<[f32; 3]>,
+    /// 本地角色的视觉滞后（秒）：本地预测端和远端玩家用的缓冲不一样，读实际那份。
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    net_lag: Option<f32>,
 }
 
 impl Sample {
@@ -495,27 +503,33 @@ impl Sample {
 
         // 脚部 IK：每具骨架单独量本帧根位移，再把修正里「超出根位移的那一份」取最坏。
         // 跨角色（本地 + 远端）混算会把别人的台阶扣到这具骨架上，所以位移必须逐实体配。
-        let rows: Vec<(Entity, Vec3, f32, f32)> = world
+        let rows: Vec<(Entity, Vec3, f32, f32, f32, f32)> = world
             .query::<(Entity, &FootIk, &GlobalTransform)>()
             .iter(world)
             .map(|(entity, ik, transform)| {
                 let correction = ik.correction();
+                let slip = ik.slip();
+                let twist = ik.ankle_twist_deg();
                 (
                     entity,
                     transform.translation(),
                     correction[0].max(correction[1]),
                     ik.blend(),
+                    slip[0].max(slip[1]),
+                    twist[0].abs().max(twist[1].abs()),
                 )
             })
             .collect();
         if !rows.is_empty() {
             sample.ik_count = rows.len();
             sample.ik_avg_blend = Some(
-                rows.iter().map(|(_, _, _, blend)| *blend).sum::<f32>() / rows.len() as f32,
+                rows.iter().map(|(_, _, _, blend, _, _)| *blend).sum::<f32>() / rows.len() as f32,
             );
             let mut cache = world.resource_mut::<IkStepCache>();
             let mut best: Option<(f32, f32, f32)> = None;
-            for (entity, pos, correction, _) in rows {
+            for (entity, pos, correction, _, slip, twist) in rows {
+                sample.ik_slip = Some(sample.ik_slip.map_or(slip, |worst| worst.max(slip)));
+                sample.ik_twist = Some(sample.ik_twist.map_or(twist, |worst| worst.max(twist)));
                 // 第一次见到这具骨架（刚刷出来 / 重生）：没有上一帧位置，这一帧不判，
                 // 否则出生时的那一次大修正会被当成异常
                 let previous = cache.last.insert(entity, pos);
@@ -545,14 +559,18 @@ impl Sample {
         {
             let local_id = world.get_resource::<crate::net::LocalPlayer>().map(|p| p.0);
             if let Some(local_id) = local_id {
-                sample.net_pos = world
+                let (pos, lag) = world
                     .query::<(
                         &crab_feast_library::net::NetPlayerId,
                         &crab_feast_library::net::NetPos,
+                        Option<&crate::net_pose::PoseSmoothing>,
                     )>()
                     .iter(world)
-                    .find(|(id, _)| id.0 == local_id)
-                    .map(|(_, pos)| pos.0);
+                    .find(|(id, _, _)| id.0 == local_id)
+                    .map(|(_, pos, smooth)| (pos.0, smooth.map(|s| s.lag_secs())))
+                    .unwrap_or(([0.0; 3], None));
+                sample.net_pos = Some(pos);
+                sample.net_lag = lag;
             }
         }
 
@@ -672,7 +690,9 @@ fn apply_common_side(sample: &Sample, diag: &mut Diagnostics, dt: f32) {
                 status,
                 format!("{excess:.3} m"),
                 format!(
-                    "修正 {correction:.3} · 台阶 {step:.3} · {} 具 · 权重 {avg_blend:.2}",
+                    "修正 {correction:.3} · 台阶 {step:.3} · 前掌滑步 {:.0}cm/s · 踝扭 {:.0}° · {} 具 · 权重 {avg_blend:.2}",
+                    sample.ik_slip.unwrap_or(0.0) * 100.0,
+                    sample.ik_twist.unwrap_or(0.0),
                     sample.ik_count
                 ),
                 reason,
@@ -753,8 +773,8 @@ fn apply_net_side(sample: &Sample, diag: &mut Diagnostics, dt: f32) {
     }
 
     // 网络快照：`Position` 每帧直接取快照，视觉 `Transform` 由 `PoseSmoothing`
-    // 在最近两份快照之间插值（固定滞后 1.25 个间隔）。这里量的是快照本身的节奏——
-    // 多久变一次、每次跳多远，有没有插值、预测都不影响这两个数。
+    // 在最近两份快照之间插值（目标滞后 2 个间隔，余量靠 ±10% 时间伸缩维持）。
+    // 这里量的是快照本身的节奏——多久变一次、每次跳多远，插值、预测都不影响这两个数。
     diag.net.observe(dt, sample.net_pos);
     let meter = diag.net.clone();
     let net_row = diag.row_mut(DiagnosticRowId::NetSnapshot);
@@ -795,7 +815,7 @@ fn apply_net_side(sample: &Sample, diag: &mut Diagnostics, dt: f32) {
                 format!(
                     "步长 {:.3} m · 视觉滞后 {:.0} ms",
                     meter.step_m,
-                    crate::net_pose::PoseSmoothing::lag() * 1000.0
+                    sample.net_lag.unwrap_or(0.0) * 1000.0
                 ),
                 reason,
             );

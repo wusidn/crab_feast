@@ -1211,8 +1211,13 @@ mod tests {
     #[test]
     fn reversal_brakes_speed_but_keeps_turning() {
         let mut app = movement_app(false, 1.0, -Vec2::Y);
+        // 默认下限现在是 1.0（完全不减速），这条量的是**机制**本身，
+        // 所以显式把面板旋钮拧到 0.4
+        let floor = 0.4f32;
+        app.world_mut()
+            .resource_mut::<MovementSettings>()
+            .turn_brake_min_scale = floor;
         step(&mut app, 1.0 / 60.0);
-        let floor = crab_feast_library::tuning::TURN_BRAKE_MIN_SCALE_DEFAULT;
 
         set_facing_error(&mut app, 180.0);
         step(&mut app, 1.0 / 60.0);
@@ -1251,6 +1256,34 @@ mod tests {
         assert!(
             (intent_of(&mut app).speed_scale - 1.0).abs() < 1e-6,
             "小角度不该降速"
+        );
+    }
+
+    /// 默认设置的分界：90°/120° 满速，180° 掉头才压到下限
+    #[test]
+    fn default_settings_only_brake_past_120_degrees() {
+        let mut app = movement_app(false, 1.0, -Vec2::Y);
+        set_facing_error(&mut app, 90.0);
+        for _ in 0..40 {
+            step(&mut app, 1.0 / 60.0);
+        }
+        let intent = intent_of(&mut app);
+        assert!(
+            (intent.speed_scale - 1.0).abs() < 1e-4,
+            "90° 不该降速：{}",
+            intent.speed_scale
+        );
+
+        set_facing_error(&mut app, 180.0);
+        for _ in 0..60 {
+            step(&mut app, 1.0 / 60.0);
+        }
+        let intent = intent_of(&mut app);
+        let floor = crab_feast_library::tuning::TURN_BRAKE_MIN_SCALE_DEFAULT;
+        assert!(
+            (intent.speed_scale - floor).abs() < 1e-3,
+            "180° 该压到下限 {floor}，实测 {}",
+            intent.speed_scale
         );
     }
 

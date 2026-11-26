@@ -76,6 +76,18 @@ impl Plugin for CameraPlugin {
     }
 }
 
+/// 相机锚点：角色身上"干净"的位置，**不含**预测端的视觉软偏移。
+///
+/// 默认没有这个组件——相机直接读角色的视觉 `Transform`。联机预测端（`predict::pred_render`）
+/// 每帧把它写成"插值出来、但没加 `vis`"的那个位置：`vis` 是和解时注入给角色自己的
+/// 视觉收敛（约 0.1 s 衰减），只该作用在角色身上。相机要是读角色的 `Transform`，
+/// 这层冲量会带动机位，整幅画面跟着晃——本地角色压在准心上反而看不出来，
+/// 远处那个角色相对背景在抖。
+///
+/// 只影响机位，不参与物理 / 动画 / 任何回写。
+#[derive(Component, Clone, Copy, Debug)]
+pub struct CameraAnchor(pub Vec3);
+
 /// 轨道相机：绕着焦点转，**与角色朝向无关**。
 ///
 /// 偏航 / 俯仰存在它自己的 [`LookController`] 里（右半屏拖动积分得到），
@@ -186,10 +198,11 @@ fn setup_game_camera(mut commands: Commands) {
 /// 各策略的查询过滤器不一致，出现「弹簧看到角色、锚定看不到」这种怪事）。
 fn gather_follow_input(
     rigs: Query<&CameraRig>,
-    avatars: Query<(Entity, &Transform), With<Avatar>>,
+    avatars: Query<(Entity, &Transform, Option<&CameraAnchor>), With<Avatar>>,
     mut input: ResMut<FollowInput>,
 ) {
-    let (Some(rig), Some((avatar_entity, avatar))) = (rigs.iter().next(), avatars.iter().next())
+    let (Some(rig), Some((avatar_entity, avatar, anchor))) =
+        (rigs.iter().next(), avatars.iter().next())
     else {
         input.valid = false;
         return;
@@ -197,7 +210,8 @@ fn gather_follow_input(
 
     input.valid = true;
     input.avatar = avatar_entity;
-    input.translation = avatar.translation;
+    // 有锚点（联机预测端）就读锚点：机位不许跟着和解的视觉软偏移晃
+    input.translation = anchor.map_or(avatar.translation, |anchor| anchor.0);
     input.focus_height = rig.focus_height;
 }
 

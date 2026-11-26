@@ -26,17 +26,45 @@ use crab_feast_library::net::{
 use crate::input::{FacingState, LocomotionIntent, PlanarMotion, wrap_pi};
 use crate::net::LocalPlayer;
 
-/// 视觉落后最新快照多少个 tick。
+/// 远端玩家的视觉落后量（tick）。
 ///
-/// 这是唯一的"缓冲"：留一个多 tick 的余量，保证视觉始终落在两份快照之间。
-/// 65 mm@3 m/s ≈ 21 ms 的额外延迟，换掉的是所有台阶。
-pub(crate) const LAG_TICKS: f32 = 1.25;
+/// 远端这条时间轴上的快照是**过网来的**，到达抖动是真的：一份被延迟的包会让
+/// 视觉时钟顶到最新 tick，那一帧定住、下一包到了再走，"顿一下、窜一下"。
+/// 而且 60 Hz 快照 + 60 Hz 渲染本身还有一格量化——一帧错过一份包就等于白丢一格，
+/// 所以真正能吃掉的抖动量是 `滞后 - 1` tick。
+/// 3 tick（50 ms）留出两格（≈33 ms）的到达抖动余量，是 Wi-Fi 上实测比较安稳的档。
+pub(crate) const REMOTE_LAG_TICKS: f32 = 3.0;
+
+/// 本地预测端的视觉落后量（tick）。
+///
+/// 本地这条时间轴是 `pred_record` 在定步长里自己喂的，到达时刻精确、没有抖动，
+/// 所以只需要够"夹住"两份快照的一点余量。沿用原来那档 1.25 tick（≈21 ms）：
+/// 预测本来就是为了手感，不该在这层再凭空加 30 ms。
+pub(crate) const LOCAL_LAG_TICKS: f32 = 1.25;
+
+/// 时间伸缩的上限（±10%）。
+///
+/// 缓冲余量偏离目标时不是硬夹，而是让视觉时钟快/慢一点把余量拉回来。
+/// 3 m/s 下 10% 是 0.3 m/s，落在运动里看不出来；换来的是**没有补帧瞬移**：
+/// 一次成簇到达把余量冲到 6 tick，按 10% 快放 0.5 s 拉回去，而不是一帧跳 4 格。
+const TIME_WARP: f32 = 0.1;
+
+/// 余量的死区（tick）。
+///
+/// 快照按 1 tick 离散到达，正常播放时余量本身就会在一个帧步长的范围内摆
+/// （120 Hz 屏上 ±0.5 tick、45 Hz 上 ±0.67 tick）。死区必须比它宽，否则控制器
+/// 会拿自己的量化噪声当输入，每帧改一次速度——那是新的抖动。
+const LAG_DEAD_BAND: f32 = 1.0;
+
+/// 比例增益：余量偏差 2 tick 就走满 [`TIME_WARP`]。
+const LAG_GAIN: f32 = 0.05;
 
 /// 视觉时钟相对最新 tick 允许落后/超前的上限（tick）。
 ///
-/// 时间是**自由奔跑**的：每帧按 `dt * TICK_HZ` 前进，只在越界时被夹回来。
-/// 帧率怎么抖都不影响时间轴本身——这就是它比"按渲染帧对齐"稳的地方。
-const MAX_LAG_TICKS: f32 = 2.0;
+/// 时间**自由奔跑**，正常抖动全靠上面的时间伸缩吸收；只有断档 / 重连这种量级的
+/// 积压才硬夹。阈值给到 10 tick（167 ms）：一次 100 ms 级的断档只用 10% 快放排掉，
+/// 不会为了早几十毫秒追上而让画面跳一格；再长的断档一次拉回——爬几秒钟更难看。
+const MAX_LAG_TICKS: f32 = 10.0;
 
 /// 两份快照的位移超过这个距离（米）就当传送：丢掉历史直接落位。
 const TELEPORT_SNAP_M: f32 = 1.5;
@@ -72,6 +100,32 @@ pub struct PoseSmoothing {
     base: u32,
     /// 视觉时钟，单位是「相对基准的 tick」。`None` = 还没起步。
     cursor: Option<f32>,
+    /// 视觉落后最新快照多少个 tick（缓冲目标）。本地预测端和远端玩家不一样：
+    /// 前者由定步长直接喂，后者要吸收过网抖动（见 [`REMOTE_LAG_TICKS`] / [`LOCAL_LAG_TICKS`]）。
+    lag: f32,
+}
+
+impl PoseSmoothing {
+    /// 远端玩家：按网络抖动的余量走。
+    pub(crate) fn remote() -> Self {
+        Self {
+            lag: REMOTE_LAG_TICKS,
+            ..Self::default()
+        }
+    }
+
+    /// 本地预测端：时间轴由定步长自己喂，不需要抗抖动余量。
+    pub(crate) fn local() -> Self {
+        Self {
+            lag: LOCAL_LAG_TICKS,
+            ..Self::default()
+        }
+    }
+
+    /// 视觉滞后（秒）：诊断面板显示用。
+    pub(crate) fn lag_secs(&self) -> f32 {
+        self.lag / TICK_HZ as f32
+    }
 }
 
 impl Default for PoseSmoothing {
@@ -81,6 +135,8 @@ impl Default for PoseSmoothing {
             len: 0,
             base: u32::MAX,
             cursor: None,
+            // 默认按远端算：宁可多留余量，也别在真网络上一帧一停
+            lag: REMOTE_LAG_TICKS,
         }
     }
 }
@@ -129,9 +185,9 @@ impl PoseSmoothing {
         }
         self.hist[self.len] = Snapshot { rel, pos, yaw };
         self.len += 1;
-        // 时钟第一次起步：落后 LAG 个 tick
+        // 时钟第一次起步：落后 `lag` 个 tick
         if self.cursor.is_none() {
-            self.cursor = Some(rel - LAG_TICKS);
+            self.cursor = Some(rel - self.lag);
         }
     }
 
@@ -175,21 +231,23 @@ impl PoseSmoothing {
         }
     }
 
-    /// 视觉相对最新快照的落后量（秒）。
-    pub(crate) fn lag() -> f32 {
-        LAG_TICKS / TICK_HZ as f32
-    }
-
     /// 本帧视觉该停在哪：时钟按真实时长前进，在 tick 轴上夹逼，再找夹住它的两份快照。
     ///
     /// 没有"相位"、没有"到达时间"——时间轴是服务端 tick，精确整数，间距恒定。
     /// 帧率变化只是采样密度变化：一帧走得远一点，落点仍然是同一条曲线上的点。
+    ///
+    /// 缓冲余量不作为硬夹的触发条件：余量少了就放慢、多了就快放（[`lag_warp`]），
+    /// 让速度误差吃掉几毫米的欠账，而不是让画面停一帧再补回来。
     pub(crate) fn sample(&mut self, dt: f32) -> Option<(Vec3, f32)> {
         let newest = *self.newest()?;
         let latest = newest.rel;
-        let cursor = self.cursor.get_or_insert(latest - LAG_TICKS);
-        *cursor += dt.clamp(0.0, 0.1) * TICK_HZ as f32;
-        // 落后太多（断档后恢复）就夹到一个多 tick，超前太多就夹到最新
+        let lag = self.lag;
+        let cursor = self.cursor.get_or_insert(latest - lag);
+        // 缓冲余量：还剩多少 tick 可以吃。低于目标就放慢等包，高于目标就快放排积压
+        let deficit = latest - *cursor;
+        let scale = 1.0 + lag_warp(deficit, lag);
+        *cursor += dt.clamp(0.0, 0.1) * TICK_HZ as f32 * scale;
+        // 兜底：断档 / 重连这种量级的积压才硬夹（正常抖动全靠上面的时间伸缩）
         *cursor = cursor.clamp(latest - MAX_LAG_TICKS, latest);
 
         let at = *cursor;
@@ -219,6 +277,25 @@ impl PoseSmoothing {
 /// 角度插值走最短一边，避免 ±π 处绕远路。
 fn lerp_yaw(from: f32, to: f32, alpha: f32) -> f32 {
     from + wrap_pi(to - from) * alpha
+}
+
+/// 由缓冲余量算时间伸缩比例（0 表示按真实时长跑）。
+///
+/// 余量在 `lag ± LAG_DEAD_BAND` 内不动手：那一段的摆动是"快照按 tick 离散
+/// 到达"本身的量化噪声，不是网络问题。出了死区才按偏差比例快放/慢放，
+/// 死区外再偏 2 tick 就到 [`TIME_WARP`] 的顶。
+///
+/// 慢放的意义不是"把冻结往后推"——断档时没有包可比，余量照样按实时消耗；
+/// 它保证的是**余量见底的那几帧是放慢而不是停住**，以及成簇到达后的积压
+/// 是渐变回去、不是一帧补好几格。
+fn lag_warp(deficit: f32, lag: f32) -> f32 {
+    let error = deficit - lag;
+    if error.abs() <= LAG_DEAD_BAND {
+        return 0.0;
+    }
+    // 减掉死区宽度再乘增益：跨过死区边界时速度是连续的，不会出现阶跃
+    let trimmed = error - error.signum() * LAG_DEAD_BAND;
+    (trimmed * LAG_GAIN).clamp(-TIME_WARP, TIME_WARP)
 }
 
 /// 所有玩家实体：位置与朝向直接取服务端快照。
@@ -422,10 +499,131 @@ mod tests {
         assert!((after - 0.05).abs() < 0.01, "恢复后步长 {after} 未回到 5 cm");
     }
 
+    /// 服务端 60 Hz 匀速发布，`delay(published)` 给出该快照的额外传输延迟；
+    /// 渲染固定 60 Hz。延迟剖面由调用方保证不制造乱序——真实链路上乱序的包会被
+    /// `push` 按「tick 倒退」丢掉，不会变成停顿。
+    fn run_with_delay(frames: usize, delay: impl Fn(f64) -> f64) -> Vec<f32> {
+        let snap_dt = 1.0 / TICK_HZ as f64;
+        let frame_dt = 1.0 / 60.0;
+        let step = MOVE_SPEED_MPS * snap_dt as f32;
+        let mut smoothing = PoseSmoothing::default();
+        let mut tick = 0u32;
+        let mut shown = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let wall = frame as f64 * frame_dt;
+            loop {
+                let published = tick as f64 * snap_dt;
+                let arrival = published + delay(published);
+                if arrival > wall + 1e-9 {
+                    break;
+                }
+                tick += 1;
+                smoothing.push(tick, Vec3::new(step * tick as f32, 0.0, 0.0), 0.0);
+            }
+            shown.push(smoothing.sample(frame_dt as f32).unwrap().0.x);
+        }
+        shown
+    }
+
+    /// 一段持续 `len` 秒的整体停摆：窗口里的快照全部补到窗口末尾。
+    fn run_with_stall(frames: usize, at: f64, len: f64) -> Vec<f32> {
+        run_with_delay(frames, move |t| {
+            if t >= at && t < at + len {
+                at + len - t
+            } else {
+                0.0
+            }
+        })
+    }
+
+    /// 一次 27 ms 的到达间隔（成簇抖动，不是断网）：旧缓冲（1.25 tick = 20.8 ms）
+    /// 会在这个间隔末尾把时钟顶到最新 tick，出现一帧明显变小甚至停住；
+    /// 2 tick 的缓冲应该整段吃掉，只留几 % 的慢放。
+    #[test]
+    fn a_short_stall_is_absorbed_without_a_stalled_frame() {
+        let ideal = MOVE_SPEED_MPS * (1.0 / TICK_HZ) as f32;
+        // 延迟先涨后落，峰值 20 ms：最大到达间隔 ≈ 16.7 + 10 = 27 ms
+        let bump = |t: f64| 0.020 * (1.0 - ((t - 0.5167) / 0.0333).abs()).clamp(0.0, 1.0);
+        let shown = run_with_delay(200, bump);
+        let (min, max) = spread(&shown, 10);
+        assert!(min > ideal * 0.9, "停摆吃掉了一帧：{min}（理想 {ideal}）");
+        assert!(max < ideal * 1.02, "恢复时抢跑：{max}（理想 {ideal}）");
+    }
+
+    /// 120 ms 的断档：旧实现会把时钟从 `latest - 2` 一帧补到最新（≈5 tick 的瞬移），
+    /// 现在只许用 ±10% 的快放把积压排掉——单帧位移不许超过一格多一点。
+    #[test]
+    fn a_long_stall_recovers_by_draining_not_by_snapping() {
+        let ideal = MOVE_SPEED_MPS * (1.0 / TICK_HZ) as f32;
+        let shown = run_with_stall(300, 0.50, 0.12);
+        let (min, max) = spread(&shown, 10);
+        assert!(min > -1e-5, "断档期间画面倒退：{min}");
+        assert!(
+            max < ideal * 1.15,
+            "断档恢复一帧走了 {max}（一格 {ideal}），等于瞬移"
+        );
+        // 积压排完之后必须回到匀速，不许一直快放
+        let (tail_min, tail_max) = spread(&shown[shown.len() - 40..], 0);
+        assert!(
+            (tail_max - tail_min) < ideal * 0.02,
+            "恢复后仍在快放：{tail_min}..{tail_max}（理想 {ideal}）"
+        );
+    }
+
+    /// 本地预测端的时间轴（定步长自己喂、没有网络抖动）：缓冲要短，也不许因此掉帧。
+    ///
+    /// 这条路径的余量只用来夹住两份快照，多留一格就是白加 16.7 ms 输入延迟。
+    #[test]
+    fn local_timeline_keeps_a_short_buffer() {
+        for fps in [60.0, 75.0, 120.0, 144.0] {
+            let snap_dt = 1.0 / TICK_HZ as f64;
+            let frame_dt = 1.0 / fps;
+            let step = MOVE_SPEED_MPS * snap_dt as f32;
+            let mut smoothing = PoseSmoothing::local();
+            let mut wall = 0.0_f64;
+            let mut next_snap = 0.0_f64;
+            let mut tick = 0u32;
+            let mut prev = 0.0f32;
+            let mut min_step = f32::INFINITY;
+            for frame in 0..200 {
+                while next_snap <= wall + 1e-9 {
+                    tick += 1;
+                    smoothing.push(tick, Vec3::new(step * tick as f32, 0.0, 0.0), 0.0);
+                    next_snap += snap_dt;
+                }
+                let x = smoothing.sample(frame_dt as f32).unwrap().0.x;
+                if frame >= 20 {
+                    min_step = min_step.min(x - prev);
+                }
+                prev = x;
+                wall += frame_dt;
+            }
+            let ideal = MOVE_SPEED_MPS as f32 / fps as f32;
+            assert!(
+                min_step > ideal * 0.6,
+                "{fps} fps 本地视觉有帧几乎没动：{min_step}（理想 {ideal}）"
+            );
+        }
+    }
+
+    /// 时间伸缩只在死区外出手，而且永远不超过 ±10%：画面速度的偏差必须肉眼不可见。
+    #[test]
+    fn time_stretch_never_exceeds_ten_percent() {
+        let lag = REMOTE_LAG_TICKS;
+        for step in -40..=40 {
+            let offset = step as f32 * 0.5;
+            let deficit = lag + offset;
+            let warp = lag_warp(deficit, lag);
+            assert!(warp.abs() <= TIME_WARP + 1e-6, "deficit {deficit} 伸缩 {warp}");
+            if offset.abs() <= LAG_DEAD_BAND {
+                assert!(warp.abs() < 1e-6, "死区里不该出手：{deficit} → {warp}");
+            }
+        }
+    }
+
     /// 同一份快照被渲染帧重复喂进来（120 Hz 屏 / 60 Hz 快照）：不许打断插值。
     #[test]
-    fn duplicate_snapshots_are_ignored() {
-        let dt = 1.0 / 120.0;
+    fn duplicate_snapshots_are_ignored() {        let dt = 1.0 / 120.0;
         let mut smoothing = PoseSmoothing::default();
         let mut shown = Vec::new();
         for frame in 0..120u32 {

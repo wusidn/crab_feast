@@ -669,9 +669,11 @@ fn update_foot_ik_label(
 fn update_foot_ik_status(
     settings: Res<FootIkSettings>,
     scale: Res<DebugTimeScale>,
+    driver: Res<crate::anim::PoseDriver>,
     // 只看本地角色：远端骨架也带 `FootIk`，混在一起读数会随机挑到远端
     ik: Query<&FootIk, Without<crate::anim::FootIkTarget>>,
     facing: Query<(&FacingState, &FacingController)>,
+    looks: Query<(&ChildOf, &crate::anim::VisualYaw), With<crate::anim::AnimModelRoot>>,
     mut labels: Query<&mut Text, With<FootIkStatus>>,
 ) {
     // 转向门控读数：support → 实际顶速。跑动时看这一对数就知道腾空段有没有压住
@@ -693,8 +695,14 @@ fn update_foot_ik_status(
             let [ankle_left, ankle_right] = ik.ankle_deg();
             // 前掌骨折角：抬跟时脚趾要留在地上，这个数应该跟着抬跟一起长
             let [toe_left, toe_right] = ik.toe_bend_deg();
-            // 偏航补偿：踩实期间把脚掌拧回来的角度，顶到 foot_yaw_limit 就是撑不住了
+            // 偏航的分工：前一个是踝扛下来的（顶到 `foot_yaw_limit` 就撑不住了），
+            // 后一个是超出踝的量、改成绕前掌（球）转的角度
             let [yaw_left, yaw_right] = ik.yaw_lock_deg();
+            let [ball_left, ball_right] = ik.ball_pivot_deg();
+            // 踝里还剩多少扭转（度）：分给腿骨之后它该掉到十几度以内。一直在 25°+
+            // 就是「小腿被拧、膝盖外翻」还没治好
+            let [twist_left, twist_right] = ik.ankle_twist_deg();
+            let [legroll_left, legroll_right] = ik.leg_roll_deg();
             let [strength_left, strength_right] = ik.strength();
             // 承重点：踩实后期承重点滑到前掌（「掌」），前期钉踝（「踝」）。
             // 踝角 = 脚掌与小腿的夹角，90 = 站立、蹬地时该到 130~160
@@ -723,8 +731,24 @@ fn update_foot_ik_status(
                 Some((support, speed)) => format!("{support:.2}→{speed:.0}°/s"),
                 None => "-".to_string(),
             };
+            // 混合空间的 yaw 轴：位移方向相对**视觉朝向**偏了几度。转弯时这个数
+            // 一大，腿就切去放横移剪辑（看起来「扭到一个奇怪的角度」），IK 治不了
+            let pose_yaw = driver.last_pose_yaw;
+            // 视觉朝向落后逻辑朝向多少（这一层自己引入的滞后，应当是个位数）
+            // 调试读数：取第一具模型（本地角色），和第一个本体的逻辑朝向比
+            let vision = looks
+                .iter()
+                .next()
+                .zip(facing.iter().next())
+                .map(|((_, look), (state, _))| {
+                    format!(
+                        "{:+.0}°",
+                        crate::input::wrap_pi(look.yaw() - state.yaw).to_degrees()
+                    )
+                })
+                .unwrap_or_else(|| "-".to_string());
             format!(
-                "权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 抬跟 {:.0}%/{:.0}% · 踝角 {:.0}°/{:.0}° · 趾 {:.0}°/{:.0}° · 偏航 {:.0}°/{:.0}° · 转向 {} · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
+                "姿态偏角 {pose_yaw:+.0}° · 视觉差 {vision} · 权重 {:.2} · 支撑 {:.2}/{:.2} · 强度 {:.2}/{:.2} · 承重 {}/{} · 抬跟 {:.0}%/{:.0}% · 踝角 {:.0}°/{:.0}° · 趾 {:.0}°/{:.0}° · 偏航 {:.0}°/{:.0}°（绕球 {:.0}°/{:.0}°） · 踝扭 {:.0}°/{:.0}°（腿滚 {:.0}°/{:.0}°） · 转向 {} · 修正 {:.3}/{:.3} m · 地面 {}/{} · 时间 ×{:.2}",
                 ik.blend(),
                 contact_left,
                 contact_right,
@@ -740,6 +764,12 @@ fn update_foot_ik_status(
                 toe_right,
                 yaw_left,
                 yaw_right,
+                ball_left,
+                ball_right,
+                twist_left,
+                twist_right,
+                legroll_left,
+                legroll_right,
                 turn,
                 left,
                 right,

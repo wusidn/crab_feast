@@ -229,6 +229,13 @@ pub struct FootLock {
     /// 朝向夹紧的剩余强度（0..1），跟 [`FootLock::strength`] 同步：
     /// 少了它，「前掌不穿地」的转动会在抬脚那一帧被整段撤掉，脚掌一帧翻十几度
     presence: f32,
+    /// 「承重点在前掌」的第二个来源：本体偏航超出踝能扛的那段角（0..1，由调用方
+    /// 按 `FootYawLock` 的绕球角度算）。它和 [`Self::roll`]（抬跟）取大 ——
+    /// 哪一个想让承重点落到前掌，锚点就按前掌算，脚就绕球转
+    ball_pin: f32,
+    /// 抬跟进度的**下限**（0..1，由调用方按绕球角度算）：绕球转的时候脚跟必须
+    /// 离地，否则整只脚掌（连脚跟）都贴在地上，绕球转等于在平地上扫一片扇面
+    heel_floor: f32,
 }
 
 impl FootLock {
@@ -253,6 +260,30 @@ impl FootLock {
         self.toe_floor = None;
         self.toe_floor_probed = false;
         self.presence = 0.0;
+        self.ball_pin = 0.0;
+        self.heel_floor = 0.0;
+    }
+
+    /// 由调用方按「本体偏航超出去、需要绕前掌转」的程度设置承重点权重（0..1）：
+    /// 1 = 锚点钉在前掌，脚绕球转；0 = 只钉脚踝。
+    ///
+    /// 和 [`Self::heel_floor`] 一起用：`ball_pin` 决定锚点在哪，`heel_floor`
+    /// 决定脚跟离地多少。两个都由调用方每帧重设，所以它不参与支撑期迟滞
+    pub fn set_ball_pin(&mut self, value: f32) {
+        self.ball_pin = if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// 抬跟进度的下限（0..1）：绕球转的那一段脚跟在离地，见 [`Self::heel_floor`]
+    pub fn set_heel_floor(&mut self, value: f32) {
+        self.heel_floor = if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
     }
 
     /// 腾空（跳跃离空）时立刻放下支撑期攒下的位置残差：这一段脚完全交给
@@ -479,7 +510,7 @@ impl FootLock {
                 }
             }
 
-            self.heel = self.heel.max(from_body).max(from_rise);
+            self.heel = self.heel.max(from_body).max(from_rise).max(self.heel_floor);
             // 承重点只吃前 ROLL_SPAN 段；剩下那段留给脚掌俯仰（调用方按同一个
             // 进度插值），先接过承重点再掰脚掌，前掌才不会被压进地里
             self.roll = smoothstep((self.heel / ROLL_SPAN).clamp(0.0, 1.0));
@@ -490,7 +521,10 @@ impl FootLock {
         // 之后不再改动它 —— 放开的形状只由 `strength` 决定，这样首尾速度才能都是 0
         let anchor = self.anchor.or(old_anchor);
         let toe_vec_now = toe.map(|toe| toe - ankle).unwrap_or(self.toe_vec);
-        let pivot = self.roll * (self.toe_vec - toe_vec_now);
+        // 承重点权重：抬跟（`roll`）和「偏航超出踝的活动范围」(`ball_pin`) 取大。
+        // 前者是脚跟离地 → 承重点滑到前掌；后者是本体转过去而脚还压在地上 →
+        // 只能绕前掌转（绕球转的踝位移被这一项算进去，球就不会被扫走）
+        let pivot = self.roll.max(self.ball_pin) * (self.toe_vec - toe_vec_now);
         let pinned = match anchor {
             Some(anchor) => FootLock::clamp_residual(anchor + pivot - ankle, config),
             None => Vec3::ZERO,
@@ -708,6 +742,63 @@ mod tests {
         let (target, weight) = lock.update(FootContact::ankle_only(moved), 1.0, true, DT, &cfg);
         assert!((target - ankle).length() < 1e-6, "{target:?}");
         assert!((weight - 1.0).abs() < 1e-6);
+    }
+
+    /// 绕前掌（球）转：本体转过去，脚掌跟着绕那颗球转 —— **球不动**，踝绕着它走。
+    ///
+    /// 这是「转身时脚被拽 / 被拧」的正解：真人往右转、右脚做支点，不是拧脚踝，
+    /// 是踩到前掌把脚跟抬起来，整个人绕那颗球转。这里验证数学：
+    /// `ball_pin = 1` 时锚点落在前掌上，修正量 ≈ 0（球没被扫走）；
+    /// `ball_pin = 0` 时锚点还在踝上，踝就被拽出整段弧（旧行为）。
+    #[test]
+    fn ball_pin_keeps_the_toe_in_place_while_the_ankle_orbits() {
+        let cfg = FootLockConfig {
+            engage_secs: 0.0,
+            ..config()
+        };
+        // 踩实：踝在 (0.12, 0, 0)，前掌（球）在踝正前 13cm
+        let ankle = Vec3::new(0.12, 0.0, 0.0);
+        let toe0 = ankle + Vec3::new(0.0, 0.0, 0.13);
+        let contact = |ankle: Vec3, toe: Vec3| FootContact {
+            ankle,
+            toe: Some(toe),
+            toe_drop: 0.0,
+            floor: None,
+            body: None,
+        };
+
+        let yaw = 16.0f32.to_radians();
+        let spin = bevy::math::Quat::from_rotation_y(yaw);
+        // 绕球转 16°：球留在原地，踝绕它转过去
+        let toe_now = toe0;
+        let ankle_now = toe0 + spin * (ankle - toe0);
+
+        for (pin, expect_correction) in [(1.0f32, 0.0f32), (0.0, (ankle_now - ankle).length())] {
+            let mut lock = FootLock::default();
+            let (target, weight) = lock.update(contact(ankle, toe0), 1.0, true, DT, &cfg);
+            assert!((target - ankle).length() < 1e-6);
+            let _ = weight;
+
+            lock.set_ball_pin(pin);
+            let (target, weight) = lock.update(contact(ankle_now, toe_now), 1.0, true, DT, &cfg);
+            let correction = (ankle_now - target).length();
+            assert!(
+                (correction - expect_correction).abs() < 2e-3,
+                "ball_pin={pin} 的修正量 {correction:.4}m，期望 {expect_correction:.4}m"
+            );
+            // 修正量是 0 时本来就不该白解一次 IK（`weight` 归 0 是刻意的）
+            if expect_correction > 1e-3 {
+                assert!((weight - 1.0).abs() < 1e-6, "weight={weight}");
+            }
+            // 两种情况下**球**都在原地：`ball_pin = 0` 时球是被拖着扫过去的
+            let ball_now = target + (toe_now - ankle_now);
+            let ball_drift = (ball_now - toe0).length();
+            if pin > 0.5 {
+                assert!(ball_drift < 2e-3, "球被扫走了 {ball_drift:.4}m");
+            } else {
+                assert!(ball_drift > 2e-2, "旧行为下球本来就该被扫走，实际 {ball_drift:.4}m");
+            }
+        }
     }
 
     #[test]
